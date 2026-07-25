@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git status:*)",
+      "Bash(git log:*)",
+      "Bash(git diff:*)",
+      "Bash(git branch:*)",
+      "Bash(git add:*)",
+      "Bash(grep:*)",
+      "Bash(rg:*)",
+      "Bash(find:*)",
+      "Bash(ls:*)",
+      "Bash(cmake:*)",
+      "Bash(make:*)",
+      "Bash(ctest:*)",
+      "Bash(python3:*)",
+      "Bash(pio:*)",
+      "Bash(platformio:*)"
+    ],
+    "deny": [
+      "Bash(git push:*)",
+      "Bash(dfu-util:*)",
+      "Bash(rm -rf:*)"
+    ]
+  }
+}
