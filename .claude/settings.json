@@ -27,7 +27,14 @@
       "WebFetch(domain:raw.githubusercontent.com)",
       "WebFetch(domain:github.com)",
       "Bash(python3 /tmp/claude-1000/-mnt-D-Works-My-tx16s-remote-ui/95060b9b-a381-4a17-b023-3896458b7d24/scratchpad/jsinfo.py)",
-      "Bash(python3 /tmp/claude-1000/-mnt-D-Works-My-tx16s-remote-ui/95060b9b-a381-4a17-b023-3896458b7d24/scratchpad/axprobe.py)"
+      "Bash(python3 /tmp/claude-1000/-mnt-D-Works-My-tx16s-remote-ui/95060b9b-a381-4a17-b023-3896458b7d24/scratchpad/axprobe.py)",
+      "Bash(ldd upstream/edgetx/build/simu/simu)",
+      "Bash(git -C upstream/edgetx status --short)",
+      "Bash(git -C upstream/edgetx describe --tags)",
+      "Bash(pacman -Q python-lz4)",
+      "Bash(echo \"КОД=$?\")",
+      "Bash(git -C /mnt/D/Works/My/tx16s-remote-ui/upstream/edgetx rev-parse HEAD)",
+      "Bash(python3 -c \"import lz4.block; print\\('lz4 доступний системному python:', lz4.__file__ if hasattr\\(lz4,'__file__'\\) else 'ok'\\)\")"
     ],
     "deny": [
       "Bash(git push:*)",
