@@ -15,11 +15,22 @@
       "Bash(ctest:*)",
       "Bash(python3:*)",
       "Bash(pio:*)",
-      "Bash(platformio:*)"
+      "Bash(platformio:*)",
+      "Bash(ls -la /etc/udev/rules.d/)",
+      "Bash(dfu-util:*)",
+      "Read(//etc/udev/rules.d/**)",
+      "Bash(dfu-util -a 0 -d 0483:df11 -s 0x08000000:2097152 -U /mnt/D/Works/My/tx16s-remote-ui/sd-backups/firmware-original/full-flash-dump.bin)",
+      "Bash(dfu-util -a 0 -d 0483:df11 -s 0x08000000:leave -D /mnt/D/Works/My/tx16s-remote-ui/sd-backups/firmware-original/full-flash-dump.bin)",
+      "Bash(dfu-util -a 0 -d 0483:df11 -s 0x08000000:2097152 -U /mnt/D/Works/My/tx16s-remote-ui/sd-backups/firmware-original/verify-after-flash.bin)",
+      "Bash(python3 /tmp/claude-1000/-mnt-D-Works-My-tx16s-remote-ui/95060b9b-a381-4a17-b023-3896458b7d24/scratchpad/jswatch.py)",
+      "Bash(dfu-util -a 0 -d 0483:df11 -s 0x08000000:2097152 -U /mnt/D/Works/My/tx16s-remote-ui/sd-backups/firmware-original/verify-cycle2.bin)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:github.com)",
+      "Bash(python3 /tmp/claude-1000/-mnt-D-Works-My-tx16s-remote-ui/95060b9b-a381-4a17-b023-3896458b7d24/scratchpad/jsinfo.py)",
+      "Bash(python3 /tmp/claude-1000/-mnt-D-Works-My-tx16s-remote-ui/95060b9b-a381-4a17-b023-3896458b7d24/scratchpad/axprobe.py)"
     ],
     "deny": [
       "Bash(git push:*)",
-      "Bash(dfu-util:*)",
       "Bash(rm -rf:*)"
     ]
   }
