@@ -37,6 +37,10 @@ RULE
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
+✅ **Станом на 2026-07-25 правило вже стоїть і працює.** У системі лежить
+`/etc/udev/rules.d/45-st-dfu.rules` (`MODE="0666"`, `GROUP="uucp"`);
+`dfu-util` читає і пише в пульт без `sudo` — перевірено заливкою.
+
 Варіант суворіший, через групу — на Arch це **`uucp`**, а не `plugdev`:
 
 ```bash
