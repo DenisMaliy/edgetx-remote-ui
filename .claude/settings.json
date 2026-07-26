@@ -50,7 +50,10 @@
       "Bash(/tmp/claude-1000/-mnt-D-Works-My-tx16s-remote-ui/95060b9b-a381-4a17-b023-3896458b7d24/scratchpad/failprobe)",
       "Bash(echo \"КОД ПОВЕРНЕННЯ ПРИ ПРОВАЛІ=$?\")",
       "Bash(sed -n '/TEST\\(SplitAtEveryOffset\\)/,/^}/p' firmware/edgetx-patch/remote_ui/test/test_protocol.cpp)",
-      "Bash(sed -n '/TEST\\(RandomGarbageDoesNotCrash\\)/,/^}/p' firmware/edgetx-patch/remote_ui/test/test_protocol.cpp)"
+      "Bash(sed -n '/TEST\\(RandomGarbageDoesNotCrash\\)/,/^}/p' firmware/edgetx-patch/remote_ui/test/test_protocol.cpp)",
+      "Bash(g++ -std=c++17 -Wall -Wextra -DREMOTE_UI -DREMOTE_UI_STANDALONE -DREMOTE_UI_LCD_W=480 -DREMOTE_UI_LCD_H=272 -I. crc16.cpp protocol.cpp rle16.cpp tile.cpp capture.cpp test/alloc_guard.cpp test/test_crc16.cpp test/test_protocol.cpp test/test_rle16.cpp test/test_capture.cpp test/test_main.cpp -o ../../../build/remote_ui-tests-nosan)",
+      "Bash(echo \"код виходу компілятора: $?\")",
+      "Bash(git -C /mnt/D/Works/My/tx16s-remote-ui status --short firmware/edgetx-patch/remote_ui/test/)"
     ],
     "deny": [
       "Bash(git push:*)",
