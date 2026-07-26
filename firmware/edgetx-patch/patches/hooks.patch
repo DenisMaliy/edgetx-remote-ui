@@ -22,6 +22,54 @@ index a89c178..0cd7f2e 100644
  if(POWER_LED_BLUE)
    add_definitions(-DPOWER_LED_BLUE)
  endif()
+diff --git a/radio/src/gui/colorlcd/LvglWrapper.cpp b/radio/src/gui/colorlcd/LvglWrapper.cpp
+index f169abd..4541c6a 100644
+--- a/radio/src/gui/colorlcd/LvglWrapper.cpp
++++ b/radio/src/gui/colorlcd/LvglWrapper.cpp
+@@ -29,6 +29,10 @@
+ #include "view_main.h"
+ #include "keyboard_base.h"
+ 
++#if defined(REMOTE_UI)
++#include "remote_ui/remote_ui.h"
++#endif
++
+ LvglWrapper* LvglWrapper::_instance = nullptr;
+ 
+ static lv_indev_drv_t touchDriver;
+@@ -180,6 +184,22 @@ extern "C" void touchDriverRead(lv_indev_drv_t *drv, lv_indev_data_t *data)
+ #if defined(HARDWARE_TOUCH)
+   static lv_indev_data_t touch_data_backup;
+ 
++#if defined(REMOTE_UI)
++  // До фізичного сенсора й до перевірки підсвітки: інакше клієнт не розбудив
++  // би пульт зі згаслим екраном (docs/05-hooks.md, пункт 7).
++  {
++    int16_t rx, ry;
++    bool rpressed;
++    if (remoteUiPopTouch(&rx, &ry, &rpressed)) {
++      data->point.x = rx;
++      data->point.y = ry;
++      data->state = rpressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
++      reset_inactivity();
++      return;
++    }
++  }
++#endif
++
+   if(!touchPanelEventOccured()) {
+     memcpy(data, &touch_data_backup, sizeof(lv_indev_data_t));
+     return;
+@@ -261,6 +281,9 @@ static void rotaryDriverRead(lv_indev_drv_t *drv, lv_indev_data_t *data)
+   static uint32_t lastDt = 0;
+ 
+   rotenc_t newPos = rotaryEncoderGetValue();
++#if defined(REMOTE_UI)
++  newPos += remoteUiGetEncoderOffset();
++#endif
+   rotenc_t diff = newPos - prevPos;
+ 
+   data->enc_diff = (int16_t)diff;
 diff --git a/radio/src/gui/colorlcd/lcd.cpp b/radio/src/gui/colorlcd/lcd.cpp
 index e554305..a6378ef 100644
 --- a/radio/src/gui/colorlcd/lcd.cpp
@@ -48,3 +96,30 @@ index e554305..a6378ef 100644
  #if !defined(LCD_VERTICAL_INVERT) || defined(RADIO_F16)
  #if defined(RADIO_F16)
    if (hardwareOptions.pcbrev > 0)
+diff --git a/radio/src/keys.cpp b/radio/src/keys.cpp
+index af4a93f..3a03e3b 100644
+--- a/radio/src/keys.cpp
++++ b/radio/src/keys.cpp
+@@ -32,6 +32,10 @@
+ #include "edgetx.h"
+ #endif
+ 
++#if defined(REMOTE_UI) && !defined(BOOT)
++#include "remote_ui/remote_ui.h"
++#endif
++
+ // long key press minimum duration (x10ms),
+ // must be less than KEY_REPEAT_DELAY
+ #define KEY_LONG_DELAY              32
+@@ -491,6 +495,11 @@ bool keysPollingCycle()
+   trims_input = READ_TRIMS();
+ #endif
+ 
++#if defined(REMOTE_UI) && !defined(BOOT)
++  keys_input |= remoteUiGetKeys();
++  trims_input |= remoteUiGetTrims();
++#endif
++
+   for (int i = 0; i < MAX_KEYS; i++) {
+     event_t evt = keys[i].input(keys_input & (1 << i));
+     if (evt) {
