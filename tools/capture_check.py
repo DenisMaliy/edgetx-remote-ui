@@ -9,6 +9,7 @@
 разів стиснуто, скільки плиток пішло сирими, скільки вийшло кадрів за секунду.
 
 Залежностей немає — PNG пишеться через zlib зі стандартної бібліотеки.
+Розбір протоколу спільний із тестовим клієнтом: `tools/remote_ui_proto.py`.
 
     tools/capture_check.py --out docs/img/capture.png
     tools/capture_check.py --seconds 10 --stats-only
@@ -16,128 +17,29 @@
 
 import argparse
 import binascii
+import os
 import socket
 import struct
 import sys
 import time
 import zlib
 
-MARKER = b"\xE7\x7E"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-PKT_HELLO = 0x01
-PKT_TILE = 0x02
-PKT_FRAME_END = 0x03
-PKT_STATE = 0x04
-PKT_LOG = 0x05
-PKT_REFRESH = 0x84
-PKT_PING = 0x86
-
-TILE_METHOD_RAW = 0
-TILE_METHOD_RLE16 = 1
-
-MAX_PAYLOAD = 4096
-DEFAULT_PORT = 7616
-
-
-def crc16_ccitt_false(data: bytes) -> int:
-    """CRC-16/CCITT-FALSE: поліном 0x1021, початок 0xFFFF, без рефлексії."""
-    crc = 0xFFFF
-    for byte in data:
-        crc ^= byte << 8
-        for _ in range(8):
-            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
-    return crc
-
-
-def encode_frame(ptype: int, payload: bytes = b"") -> bytes:
-    body = bytes([ptype]) + struct.pack("<H", len(payload)) + payload
-    return MARKER + body + struct.pack("<H", crc16_ccitt_false(body))
-
-
-class Decoder:
-    """Потоковий розбір кадрів. Дзеркало remote_ui::Decoder, тільки на Python."""
-
-    def __init__(self):
-        self.buf = bytearray()
-        self.crc_errors = 0
-
-    def feed(self, data: bytes):
-        self.buf.extend(data)
-        while True:
-            start = self.buf.find(MARKER)
-            if start < 0:
-                # Маркера немає: лишаємо останній байт — раптом він половина маркера.
-                del self.buf[: max(0, len(self.buf) - 1)]
-                return
-            if start:
-                del self.buf[:start]
-            if len(self.buf) < 7:
-                return
-            ptype = self.buf[2]
-            length = self.buf[3] | (self.buf[4] << 8)
-            if length > MAX_PAYLOAD:
-                del self.buf[:5]
-                self.crc_errors += 1
-                continue
-            total = 7 + length
-            if len(self.buf) < total:
-                return
-            body = bytes(self.buf[2 : 5 + length])
-            got = self.buf[5 + length] | (self.buf[6 + length] << 8)
-            payload = bytes(self.buf[5 : 5 + length])
-            del self.buf[:total]
-            if got == crc16_ccitt_false(body):
-                yield ptype, payload
-            else:
-                self.crc_errors += 1
-
-
-def parse_hello(payload: bytes) -> dict:
-    version, width, height, pixfmt, flags, trims, keymask, nkeys = struct.unpack_from(
-        "<BHHBBBIB", payload, 0
-    )
-    pos = 13
-    keys = []
-    for _ in range(nkeys):
-        if pos + 17 > len(payload):
-            break
-        code = payload[pos]
-        name = payload[pos + 1 : pos + 17].split(b"\0")[0].decode("utf-8", "replace")
-        keys.append((code, name))
-        pos += 17
-    target = payload[pos : pos + 32].split(b"\0")[0].decode("utf-8", "replace")
-    pos += 32
-    fw = payload[pos : pos + 16].split(b"\0")[0].decode("utf-8", "replace")
-    return {
-        "version": version,
-        "width": width,
-        "height": height,
-        "pixfmt": pixfmt,
-        "flags": flags,
-        "trims": trims,
-        "keymask": keymask,
-        "keys": keys,
-        "target": target,
-        "fw": fw,
-    }
-
-
-def rle16_decode(data: bytes, want: int):
-    """Повертає список пікселів або None, якщо потік битий.
-
-    Саме None, а не виняток: цей скрипт — доказ, що захоплення працює, і
-    падати з трасуванням через одну зіпсуту плитку він не має. Пропущену
-    плитку видно в попередженні, а решта кадру лишається придатною.
-    """
-    if len(data) % 3:
-        return None
-    out = []
-    for i in range(0, len(data), 3):
-        count = data[i]
-        if count == 0:
-            return None
-        out.extend([data[i + 1] | (data[i + 2] << 8)] * count)
-    return out if len(out) == want else None
+from remote_ui_proto import (  # noqa: E402
+    DEFAULT_TCP_PORT as DEFAULT_PORT,
+    PKT_FRAME_END,
+    PKT_HELLO,
+    PKT_LOG,
+    PKT_REFRESH,
+    PKT_TILE,
+    TILE_METHOD_RAW,
+    TILE_METHOD_RLE16,
+    Decoder,
+    encode_frame,
+    parse_hello,
+    rle16_decode,
+)
 
 
 class Frame:
