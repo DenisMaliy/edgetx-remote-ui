@@ -20,16 +20,16 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import remote_ui_proto as proto  # noqa: E402
-from test_client import Link, Session, tile_rgb  # noqa: E402
+from test_client import Input, Link, Session, tile_rgb  # noqa: E402
 
 
-def hello_payload(width, height, keys=(), target="X10", fw="2.12.2-remoteui"):
+def hello_payload(width, height, keys=(), target="X10", fw="2.12.2-remoteui", flags=0x03):
     """Синтетичний HELLO — щоб тести не залежали від запущеного симулятора."""
     out = bytearray()
     out.append(1)
     out += struct.pack("<HH", width, height)
     out.append(proto.HELLO_PIXFMT_RGB565)
-    out.append(0x03)  # сенсор + енкодер
+    out.append(flags)  # типово сенсор + енкодер
     out.append(6)  # тримерів
     out += struct.pack("<I", 0xFF)
     out.append(len(keys))
@@ -431,6 +431,220 @@ class Transports(unittest.TestCase):
 
         where, _ = proto.make_connector(parser.parse_args(["--serial", "/dev/ttyUSB0"]))
         self.assertEqual(where, "serial /dev/ttyUSB0 @ 921600")
+
+
+class InputPackets(unittest.TestCase):
+    """Байти пакетів вводу. Розкладка полів — з docs/03-protocol.md."""
+
+    def decode_one(self, frame):
+        packets = list(proto.Decoder().feed(frame))
+        self.assertEqual(len(packets), 1)
+        return packets[0]
+
+    def test_key_packet(self):
+        ptype, payload = self.decode_one(proto.encode_key(13, True))
+        self.assertEqual(ptype, proto.PKT_KEY)
+        self.assertEqual(payload, bytes([13, 1]))
+
+        _, payload = self.decode_one(proto.encode_key(13, False))
+        self.assertEqual(payload, bytes([13, 0]))
+
+    def test_encoder_packet_is_signed(self):
+        ptype, payload = self.decode_one(proto.encode_enc(-1))
+        self.assertEqual(ptype, proto.PKT_ENC)
+        self.assertEqual(payload, b"\xFF")  # int8, -1
+
+        _, payload = self.decode_one(proto.encode_enc(1))
+        self.assertEqual(payload, b"\x01")
+
+    def test_touch_packet(self):
+        ptype, payload = self.decode_one(proto.encode_touch(proto.TOUCH_DOWN, 480, 271))
+        self.assertEqual(ptype, proto.PKT_TOUCH)
+        self.assertEqual(payload, struct.pack("<BHH", 0, 480, 271))
+
+    def test_trim_packet(self):
+        ptype, payload = self.decode_one(proto.encode_trim(5, True))
+        self.assertEqual(ptype, proto.PKT_TRIM)
+        self.assertEqual(payload, bytes([5, 1]))
+
+
+class FakeRoot:
+    """Заміна tk.Tk для тестів вводу: тільки відкладені виклики."""
+
+    def __init__(self):
+        self.jobs = {}
+        self.seq = 0
+
+    def after(self, _ms, fn):
+        self.seq += 1
+        self.jobs[self.seq] = fn
+        return self.seq
+
+    def after_cancel(self, job):
+        self.jobs.pop(job, None)
+
+    def run_pending(self):
+        """Наче минув час: виконує все відкладене."""
+        for job in sorted(self.jobs):
+            self.jobs.pop(job)()
+
+
+class FakeEvent:
+    def __init__(self, keysym="", num=0, delta=0):
+        self.keysym = keysym
+        self.num = num
+        self.delta = delta
+
+
+class FakeLink:
+    def __init__(self):
+        self.sent = {"key": 0, "enc": 0, "touch": 0}
+        self.frames = []
+
+    def send(self, frame, kind):
+        self.frames.append((kind, frame))
+        self.sent[kind] += 1
+
+    def packets(self):
+        out = []
+        for _kind, frame in self.frames:
+            out.extend(proto.Decoder().feed(frame))
+        return out
+
+
+class InputLayout(unittest.TestCase):
+    """Розкладка будується з HELLO, а не зі списку в коді."""
+
+    def make(self, keys, flags=0x03):
+        root, link = FakeRoot(), FakeLink()
+        inp = Input(root, link)
+        inp.sync(proto.parse_hello(hello_payload(480, 272, keys=keys, flags=flags)))
+        return root, link, inp
+
+    def test_codes_come_from_hello(self):
+        # Ті самі мітки, що віддає TX16S, але з навмисно іншими кодами: клієнт
+        # має взяти саме те, що назвав пульт.
+        _root, link, inp = self.make([(41, "RTN"), (42, "Enter"), (43, "SYS")])
+
+        inp.on_key_press(FakeEvent(keysym="Escape"))
+        inp.on_key_press(FakeEvent(keysym="Return"))
+        inp.on_key_press(FakeEvent(keysym="s"))
+
+        self.assertEqual(
+            [p for p in link.packets()],
+            [(proto.PKT_KEY, bytes([41, 1])),
+             (proto.PKT_KEY, bytes([42, 1])),
+             (proto.PKT_KEY, bytes([43, 1]))],
+        )
+
+    def test_unknown_label_gets_spare_key(self):
+        _root, link, inp = self.make([(9, "WEIRD")])
+        inp.on_key_press(FakeEvent(keysym="F1"))
+        self.assertEqual(link.packets(), [(proto.PKT_KEY, bytes([9, 1]))])
+
+    def test_press_and_release(self):
+        root, link, inp = self.make([(1, "RTN")])
+
+        inp.on_key_press(FakeEvent(keysym="Escape"))
+        inp.on_key_release(FakeEvent(keysym="Escape"))
+        root.run_pending()  # затримка на автоповтор минула
+
+        self.assertEqual(
+            link.packets(),
+            [(proto.PKT_KEY, bytes([1, 1])), (proto.PKT_KEY, bytes([1, 0]))],
+        )
+
+    # X11 на утримуваній клавіші шле пари «відпущено-натиснуто». Пульт має
+    # бачити одне довге натискання, інакше довгих натискань не буде взагалі.
+    def test_autorepeat_does_not_release_the_key(self):
+        root, link, inp = self.make([(1, "RTN")])
+
+        inp.on_key_press(FakeEvent(keysym="Escape"))
+        for _ in range(5):  # автоповтор
+            inp.on_key_release(FakeEvent(keysym="Escape"))
+            inp.on_key_press(FakeEvent(keysym="Escape"))
+        self.assertEqual(link.packets(), [(proto.PKT_KEY, bytes([1, 1]))])
+
+        # І лише справжнє відпускання доходить до пульта.
+        inp.on_key_release(FakeEvent(keysym="Escape"))
+        root.run_pending()
+        self.assertEqual(
+            link.packets(),
+            [(proto.PKT_KEY, bytes([1, 1])), (proto.PKT_KEY, bytes([1, 0]))],
+        )
+
+    # Втрата фокуса й вихід не мають лишати нічого натиснутим. Прошивка
+    # відпустила б сама за тишею, але це остання перешкода, а не спосіб роботи.
+    def test_release_all_lets_go_of_everything(self):
+        root, link, inp = self.make([(1, "RTN"), (2, "Enter")])
+
+        inp.on_key_press(FakeEvent(keysym="Escape"))
+        inp.on_key_press(FakeEvent(keysym="Return"))
+        inp.touch(proto.TOUCH_DOWN, (10, 20))
+        link.frames.clear()
+
+        inp.release_all()
+        root.run_pending()
+
+        got = link.packets()
+        self.assertIn((proto.PKT_KEY, bytes([1, 0])), got)
+        self.assertIn((proto.PKT_KEY, bytes([2, 0])), got)
+        self.assertIn((proto.PKT_TOUCH, struct.pack("<BHH", proto.TOUCH_UP, 10, 20)), got)
+
+    def test_arrows_drive_encoder_when_radio_has_no_up_down(self):
+        _root, link, inp = self.make([(1, "RTN")])
+
+        inp.on_key_press(FakeEvent(keysym="Down"))
+        inp.on_key_press(FakeEvent(keysym="Up"))
+        self.assertEqual(
+            link.packets(),
+            [(proto.PKT_ENC, b"\x01"), (proto.PKT_ENC, b"\xFF")],
+        )
+
+    def test_arrows_stay_keys_when_radio_has_them(self):
+        _root, link, inp = self.make([(5, "UP"), (6, "DOWN")])
+
+        inp.on_key_press(FakeEvent(keysym="Down"))
+        self.assertEqual(link.packets(), [(proto.PKT_KEY, bytes([6, 1]))])
+
+    def test_wheel_turns_the_encoder(self):
+        _root, link, inp = self.make([(1, "RTN")])
+
+        inp.on_wheel(FakeEvent(num=5))
+        inp.on_wheel(FakeEvent(num=4))
+        self.assertEqual(
+            link.packets(),
+            [(proto.PKT_ENC, b"\x01"), (proto.PKT_ENC, b"\xFF")],
+        )
+
+    def test_no_touch_no_touch_packets(self):
+        # Пульт без сенсора: миша не має слати нічого.
+        _root, link, inp = self.make([(1, "RTN")], flags=0x02)
+        inp.touch(proto.TOUCH_DOWN, (10, 20))
+        inp.touch(proto.TOUCH_UP, (10, 20))
+        self.assertEqual(link.packets(), [])
+
+    def test_move_without_press_is_not_sent(self):
+        _root, link, inp = self.make([(1, "RTN")])
+        inp.touch(proto.TOUCH_MOVE, (10, 20))
+        self.assertEqual(link.packets(), [])
+
+    def test_drag_sends_only_real_movement(self):
+        _root, link, inp = self.make([(1, "RTN")])
+
+        inp.touch(proto.TOUCH_DOWN, (10, 20))
+        inp.touch(proto.TOUCH_MOVE, (10, 20))  # на місці — пульту байдуже
+        inp.touch(proto.TOUCH_MOVE, (11, 21))
+        inp.touch(proto.TOUCH_UP, (11, 21))
+
+        self.assertEqual(
+            link.packets(),
+            [
+                (proto.PKT_TOUCH, struct.pack("<BHH", proto.TOUCH_DOWN, 10, 20)),
+                (proto.PKT_TOUCH, struct.pack("<BHH", proto.TOUCH_MOVE, 11, 21)),
+                (proto.PKT_TOUCH, struct.pack("<BHH", proto.TOUCH_UP, 11, 21)),
+            ],
+        )
 
 
 if __name__ == "__main__":

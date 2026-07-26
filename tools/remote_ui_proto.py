@@ -38,6 +38,11 @@ PKT_PING = 0x86
 TILE_METHOD_RAW = 0
 TILE_METHOD_RLE16 = 1
 
+# Події сенсора в пакеті TOUCH.
+TOUCH_DOWN = 0
+TOUCH_MOVE = 1
+TOUCH_UP = 2
+
 HELLO_PIXFMT_RGB565 = 1
 HELLO_PIXFMT_MONO1 = 2
 
@@ -53,8 +58,21 @@ DEFAULT_BAUD = 921600
 # для TCP і для UART.
 SILENCE_RESET_S = 0.100
 
-# Періодичність PING і стеля мовчання пульта — з docs/03-protocol.md.
-PING_PERIOD_S = 2.0
+# Періодичність PING і стеля мовчання пульта.
+#
+# ⚠️ 0.25 с, а не 2 с зі специфікації, і це не дрібниця. PING — єдиний доказ
+# того, що клієнт живий, а прошивка на цьому доказі тримає **емульований ввід**:
+# після 1000 мс тиші вона відпускає всі клавіші сама (INPUT_RELEASE_TIMEOUT_MS
+# в input.h). Тобто клієнт, який мовчить довше за секунду, не просто вважається
+# відсутнім — у нього під пальцем розтискається клавіша.
+#
+# Чотири PING на тайм-аут дають запас: щоб ввід відпустився помилково, має
+# зникнути чотири пакети поспіль. Ціна — 4 пакети HELLO на секунду у зворотний
+# бік, менше за тисячу байтів, тобто близько 1% від 921600 бод.
+#
+# Розбіжність зі специфікацією описана в результаті задачі 0007: число в
+# docs/03-protocol.md уточнює асистент.
+PING_PERIOD_S = 0.25
 PING_TIMEOUT_S = 5.0
 
 
@@ -74,6 +92,32 @@ def encode_frame(ptype: int, payload: bytes = b"") -> bytes:
         raise ValueError(f"payload {len(payload)} Б понад стелю {MAX_PAYLOAD}")
     body = bytes([ptype]) + struct.pack("<H", len(payload)) + payload
     return MARKER + body + struct.pack("<H", crc16_ccitt_false(body))
+
+
+# --- Пакети вводу (клієнт -> пульт) ---------------------------------------
+#
+# Окремі функції, а не «зібрати руками на місці»: два інструменти вже колись
+# розійшлися в дрібницях, і саме тому весь протокол живе в одному модулі.
+
+
+def encode_key(code: int, pressed: bool) -> bytes:
+    """KEY: код клавіші з EnumKeys і стан."""
+    return encode_frame(PKT_KEY, bytes([code & 0xFF, 1 if pressed else 0]))
+
+
+def encode_enc(steps: int) -> bytes:
+    """ENC: зсув енкодера, знаковий байт."""
+    return encode_frame(PKT_ENC, struct.pack("<b", max(-128, min(127, steps))))
+
+
+def encode_touch(event: int, x: int, y: int) -> bytes:
+    """TOUCH: подія (DOWN/MOVE/UP) і точка."""
+    return encode_frame(PKT_TOUCH, struct.pack("<BHH", event & 0xFF, x & 0xFFFF, y & 0xFFFF))
+
+
+def encode_trim(index: int, pressed: bool) -> bytes:
+    """TRIM: номер напрямку тримера і стан."""
+    return encode_frame(PKT_TRIM, bytes([index & 0xFF, 1 if pressed else 0]))
 
 
 class Decoder:
@@ -284,17 +328,22 @@ def add_transport_args(parser):
     )
 
 
-def make_connector(args):
+def make_connector(args, poll: float = 0.05):
     """Повертає (опис, функція-з'єднувач).
 
     З'єднувач створює **новий** транспорт на кожен виклик: клієнт має право
     перепідключатись скільки завгодно разів.
+
+    `poll` — скільки труба чекає на дані, перш ніж віддати «тиша». Це ще й
+    стеля затримки на **передачу**: цикл клієнта віддає накопичений ввід одразу
+    після читання, тож інструмент, яким керують, просить тут малого числа, а
+    той, що лише дивиться, — звичайного.
     """
     if args.serial:
         device, baud = args.serial, args.baud
-        return f"serial {device} @ {baud}", lambda: SerialTransport(device, baud)
+        return f"serial {device} @ {baud}", lambda: SerialTransport(device, baud, poll)
 
     host, _, port = args.tcp.rpartition(":")
     host = host or "127.0.0.1"
     port = int(port)
-    return f"tcp {host}:{port}", lambda: TcpTransport(host, port)
+    return f"tcp {host}:{port}", lambda: TcpTransport(host, port, poll=poll)

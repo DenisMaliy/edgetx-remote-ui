@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Тестовий клієнт Remote UI: вікно з екраном пульта живцем.
+"""Тестовий клієнт Remote UI: вікно з екраном пульта живцем і керування ним.
 
 Діагностичний інструмент етапу 1, не продукт. Справжній клієнт буде в
 браузері (етап 2). Тут задача одна: бачити те, що зараз на екрані пульта, і
 бачити це **в русі** — блимання, рвані кадри, накопичення затримки видно
-тільки так, знімок їх не показує.
+тільки так, знімок їх не показує. Тепер ще й керувати: клавіатура, колесо
+миші й миша по картинці.
 
 Розмір, формат і назви клавіш беруться з пакета `HELLO`. Жодного числа про
 конкретний пульт у коді немає: коли на кроці 1.7 з'явиться симулятор іншої
-цілі, клієнт підхопить його без правок.
+цілі, клієнт підхопить його без правок — розкладка клавіш теж будується з
+того, що назвав пульт.
 
 Запуск (симулятор має бути зібраний із `-DREMOTE_UI=ON`):
 
@@ -20,12 +22,11 @@
 Залежності: стандартна бібліотека (`tkinter` — пакет `tk` на Arch:
 `sudo pacman -S tk`). `pyserial` потрібен лише для `--serial`:
 `sudo pacman -S python-pyserial`.
-
-Вводу тут немає навмисно — клавіші, енкодер і сенсор це крок 1.6.
 """
 
 import argparse
 import os
+import queue
 import struct
 import sys
 import threading
@@ -48,12 +49,22 @@ from remote_ui_proto import (  # noqa: E402
     SILENCE_RESET_S,
     TILE_METHOD_RAW,
     TILE_METHOD_RLE16,
+    TOUCH_DOWN,
+    TOUCH_MOVE,
+    TOUCH_UP,
     Decoder,
     add_transport_args,
+    encode_enc,
     encode_frame,
+    encode_key,
+    encode_touch,
     make_connector,
     parse_hello,
 )
+
+# Прапорці в HELLO.
+HELLO_FLAG_TOUCH = 0x01
+HELLO_FLAG_ENCODER = 0x02
 
 # --- Пікселі --------------------------------------------------------------
 
@@ -234,6 +245,235 @@ class Session:
             self._show()
 
 
+# --- Ввід -----------------------------------------------------------------
+
+
+# Мітка клавіші (приходить у HELLO) -> клавіша клавіатури ПК (keysym tkinter).
+#
+# Це зручність клієнта, а не опис заліза. Перелік клавіш пульта приходить від
+# самого пульта; мітка, якої тут немає, отримає вільну F-клавішу. Тому на
+# іншому пульті клієнт не «не знає клавіш», а просто розкладе їх інакше.
+LABEL_TO_KEYSYM = {
+    "RTN": "Escape",
+    "EXIT": "Escape",
+    "ENTER": "Return",
+    "MENU": "F1",
+    "SYS": "s",
+    "MDL": "m",
+    "TELE": "t",
+    "PAGE<": "Prior",
+    "PGUP": "Prior",
+    "PAGE>": "Next",
+    "PGDN": "Next",
+    "UP": "Up",
+    "DOWN": "Down",
+    "LEFT": "Left",
+    "RIGHT": "Right",
+    "+": "plus",
+    "PLUS": "plus",
+    "-": "minus",
+    "MINUS": "minus",
+    "SHIFT": "Shift_L",
+    "BIND": "b",
+}
+
+# Для міток, яких немає в таблиці вище.
+SPARE_KEYSYMS = [f"F{i}" for i in range(1, 13)]
+
+# Як показувати клавішу ПК людині.
+KEYSYM_SHORT = {
+    "Escape": "Esc",
+    "Return": "Enter",
+    "Prior": "PgUp",
+    "Next": "PgDn",
+    "Up": "↑",
+    "Down": "↓",
+    "Left": "←",
+    "Right": "→",
+    "plus": "+",
+    "minus": "-",
+    "Shift_L": "Shift",
+}
+
+
+class Input:
+    """Клавіатура й миша -> пакети протоколу.
+
+    Розкладка будується з `HELLO`. Жодного коду клавіші тут не прибито:
+    клієнт бере пари «код + мітка» від пульта і сам вирішує, яку клавішу ПК
+    на що повісити.
+    """
+
+    # Скільки чекати, перш ніж повірити у відпускання клавіші.
+    #
+    # X11 на утримуваній клавіші шле не «натиснуто й тримається», а пари
+    # «відпущено — натиснуто» з частотою автоповтору (близько 30 мс). Без цієї
+    # затримки довге натискання розсипалось би на десяток коротких — тобто
+    # рівно те, що ми хочемо довести працюючим, ламав би сам клієнт.
+    REPEAT_GRACE_MS = 60
+
+    def __init__(self, root: tk.Misc, link):
+        self.root = root
+        self.link = link
+
+        self.signature = None  # за чим помічаємо, що HELLO описав інший пульт
+        self.keysym_to_code = {}
+        self.keysym_to_enc = {}
+        self.layout_text = "розкладки ще немає — чекаю HELLO"
+        self.has_touch = False
+        self.has_encoder = False
+
+        self.held = {}  # keysym -> код клавіші, яку пульт вважає натиснутою
+        self.pending_release = {}  # keysym -> ідентифікатор відкладеного after
+        self.touch_down = False
+        self.touch_last = None
+
+    # --- Розкладка ---------------------------------------------------------
+
+    def sync(self, hello) -> None:
+        """Перебудовує розкладку, якщо пульт назвався інакше.
+
+        Викликається з потоку вікна на кожному кадрі опитування: `HELLO`
+        приходить у потоці зв'язку, і будувати розкладку там означало б
+        читати її з двох потоків.
+        """
+        if hello is None:
+            return
+        signature = (tuple(hello["keys"]), hello["flags"], hello["target"])
+        if signature == self.signature:
+            return
+
+        self.signature = signature
+        self.has_touch = bool(hello["flags"] & HELLO_FLAG_TOUCH)
+        self.has_encoder = bool(hello["flags"] & HELLO_FLAG_ENCODER)
+
+        self.release_all()
+        self.keysym_to_code = {}
+        self.keysym_to_enc = {}
+
+        spare = list(SPARE_KEYSYMS)
+        shown = []
+        for code, label in hello["keys"]:
+            keysym = LABEL_TO_KEYSYM.get(label.upper())
+            if keysym is None or keysym in self.keysym_to_code:
+                keysym = spare.pop(0) if spare else None
+            if keysym is None:
+                continue  # клавіш більше, ніж вільних місць на клавіатурі
+            self.keysym_to_code[keysym] = code
+            shown.append(f"{label}={KEYSYM_SHORT.get(keysym, keysym)}")
+
+        # Стрілки віддаємо енкодеру, тільки якщо пульт не має власних клавіш
+        # «вгору/вниз»: інакше ми відібрали б у нього справжні клавіші.
+        if self.has_encoder:
+            if "Up" not in self.keysym_to_code and "Down" not in self.keysym_to_code:
+                self.keysym_to_enc = {"Up": -1, "Down": 1}
+                shown.append("енкодер=колесо,↑↓")
+            else:
+                shown.append("енкодер=колесо")
+        if self.has_touch:
+            shown.append("дотик=миша")
+
+        self.layout_text = "  ".join(shown)
+        print("Розкладка з HELLO:", self.layout_text, file=sys.stderr)
+
+    # --- Клавіатура --------------------------------------------------------
+
+    def on_key_press(self, event) -> None:
+        keysym = event.keysym
+
+        # Автоповтор X11: «відпущено» вже прилетіло, і зараз ми бачимо його
+        # пару. Скасовуємо відкладене відпускання — клавішу насправді тримають.
+        job = self.pending_release.pop(keysym, None)
+        if job is not None:
+            self.root.after_cancel(job)
+            return
+
+        if keysym in self.held:
+            return  # уже натиснута, повторний пакет пульту не потрібен
+
+        step = self.keysym_to_enc.get(keysym)
+        if step is not None:
+            self.encoder(step)
+            return
+
+        code = self.keysym_to_code.get(keysym)
+        if code is None:
+            return
+        self.held[keysym] = code
+        self.link.send(encode_key(code, True), "key")
+
+    def on_key_release(self, event) -> None:
+        keysym = event.keysym
+        if keysym not in self.held:
+            return
+        job = self.pending_release.pop(keysym, None)
+        if job is not None:
+            self.root.after_cancel(job)
+        self.pending_release[keysym] = self.root.after(
+            self.REPEAT_GRACE_MS, lambda k=keysym: self._release_now(k)
+        )
+
+    def _release_now(self, keysym: str) -> None:
+        self.pending_release.pop(keysym, None)
+        code = self.held.pop(keysym, None)
+        if code is not None:
+            self.link.send(encode_key(code, False), "key")
+
+    def release_all(self) -> None:
+        """Відпустити все. Вікно втратило фокус, розкладка змінилась, вихід.
+
+        Пульт відпустив би сам — за тишею в каналі, — але робити це вчасно й
+        зі свого боку правильніше: тайм-аут прошивки це остання перешкода, а
+        не спосіб керування.
+        """
+        for job in self.pending_release.values():
+            self.root.after_cancel(job)
+        self.pending_release.clear()
+
+        for keysym in list(self.held):
+            code = self.held.pop(keysym)
+            self.link.send(encode_key(code, False), "key")
+
+        if self.touch_down:
+            self.touch_down = False
+            x, y = self.touch_last or (0, 0)
+            self.link.send(encode_touch(TOUCH_UP, x, y), "touch")
+
+    # --- Енкодер -----------------------------------------------------------
+
+    def encoder(self, steps: int) -> None:
+        if not self.has_encoder or steps == 0:
+            return
+        self.link.send(encode_enc(steps), "enc")
+
+    def on_wheel(self, event) -> None:
+        # X11 віддає колесо кнопками 4 і 5, решта світу — подією з delta.
+        if event.num == 4:
+            steps = -1
+        elif event.num == 5:
+            steps = 1
+        else:
+            steps = -1 if getattr(event, "delta", 0) > 0 else 1
+        self.encoder(steps)
+
+    # --- Сенсор ------------------------------------------------------------
+
+    def touch(self, kind: int, point) -> None:
+        if not self.has_touch or point is None:
+            return
+        x, y = point
+        if kind == TOUCH_MOVE and (not self.touch_down or point == self.touch_last):
+            return  # рух без натиску або на місці — пульту нема чого сказати
+        if kind == TOUCH_DOWN:
+            self.touch_down = True
+        elif kind == TOUCH_UP:
+            if not self.touch_down:
+                return
+            self.touch_down = False
+        self.touch_last = point
+        self.link.send(encode_touch(kind, x, y), "touch")
+
+
 class Link(threading.Thread):
     """Труба, PING і перепідключення. Живе у власному потоці.
 
@@ -259,6 +499,21 @@ class Link(threading.Thread):
         self.oversized = 0
         self.drops = 0  # скільки разів рвався зв'язок
 
+        # Ввід кладеться в чергу, а не пишеться в сокет із потоку вікна: труба
+        # одна, і два потоки, що пишуть у неї одночасно, рано чи пізно
+        # переплетуть половинки кадрів.
+        self.outbox = queue.Queue(maxsize=512)
+        self.sent = {"key": 0, "enc": 0, "touch": 0}
+        self.outbox_dropped = 0
+
+    def send(self, frame: bytes, kind: str) -> None:
+        """Кладе кадр вводу в чергу передачі. Викликається потоком вікна."""
+        try:
+            self.outbox.put_nowait(frame)
+            self.sent[kind] += 1
+        except queue.Full:
+            self.outbox_dropped += 1
+
     def run(self):
         while not self.stop.is_set():
             try:
@@ -273,10 +528,32 @@ class Link(threading.Thread):
             finally:
                 transport.close()
 
+    def _drain_outbox(self, transport) -> bool:
+        """Віддає накопичений ввід. False — труба обірвалась."""
+        while True:
+            try:
+                frame = self.outbox.get_nowait()
+            except queue.Empty:
+                return True
+            try:
+                transport.send(frame)
+            except OSError as exc:
+                self.status = f"розрив на передачі: {exc}"
+                self.drops += 1
+                return False
+
     def _serve(self, transport):
         decoder = self.decoder
         decoder.reset()
         session = self.session
+
+        # Черга від попереднього з'єднання нікого не стосується: пульт уже
+        # відпустив усе, що там могло лежати натиснутим.
+        while not self.outbox.empty():
+            try:
+                self.outbox.get_nowait()
+            except queue.Empty:
+                break
 
         # Порядок вітання важливий: спершу PING, і лише отримавши у відповідь
         # HELLO — REFRESH. До HELLO клієнт не знає розміру екрана, і плитки
@@ -316,6 +593,10 @@ class Link(threading.Thread):
 
             session.flush_stale(now)
 
+            # Ввід іде першим: людина чекає на реакцію, а не на статистику.
+            if not self._drain_outbox(transport):
+                return
+
             if not refresh_sent and session.hello_count != hello_mark:
                 # Пульт назвався — тепер є куди класти пікселі.
                 try:
@@ -354,7 +635,12 @@ class Window:
         self.root = tk.Tk()
         self.root.title(title)
         self.root.configure(bg="#101010")
-        self.canvas = tk.Label(self.root, bg="#101010", text="очікую HELLO…", fg="#909090")
+        # Ані рамки, ані відступів: координати миші в цьому віджеті мають бути
+        # координатами картинки, поділеними на масштаб, і нічим іншим.
+        self.canvas = tk.Label(
+            self.root, bg="#101010", text="очікую HELLO…", fg="#909090",
+            bd=0, padx=0, pady=0, highlightthickness=0,
+        )
         self.canvas.pack()
         self.stats = tk.Label(
             self.root, font=("monospace", 9), justify="left", anchor="w",
@@ -368,6 +654,7 @@ class Window:
         self.skipped = 0  # кадри, які застаріли, доки вікно малювало попередній
 
         self.link = None
+        self.input = None
         self.shown = 0
         self.window_started = time.monotonic()
         self.window_shown = 0
@@ -375,7 +662,7 @@ class Window:
         self.window_frames = 0
         self.lag_ms = 0.0
         self.lag_max_ms = 0.0
-        self.line = ("", "")
+        self.line = ("", "", "")
 
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -388,16 +675,76 @@ class Window:
             self.pending = (ppm, time.monotonic())
 
     def close(self):
+        if self.input:
+            self.input.release_all()
         if self.link:
             self.link.stop.set()
         self.root.quit()
 
     def run(self, link: Link):
         self.link = link
+        self.input = Input(self.root, link)
+        self._bind_input()
         self.root.after(self.POLL_MS, self._tick)
         self.root.mainloop()
 
+    # --- Ввід ---------------------------------------------------------------
+
+    def _bind_input(self):
+        inp = self.input
+
+        self.root.bind("<KeyPress>", inp.on_key_press)
+        self.root.bind("<KeyRelease>", inp.on_key_release)
+
+        # Колесо: X11 віддає його кнопками 4 і 5, решта світу — <MouseWheel>.
+        for sequence in ("<Button-4>", "<Button-5>", "<MouseWheel>"):
+            self.root.bind(sequence, inp.on_wheel)
+
+        self.canvas.bind("<ButtonPress-1>", self._on_touch_down)
+        self.canvas.bind("<B1-Motion>", self._on_touch_move)
+        self.canvas.bind("<ButtonRelease-1>", self._on_touch_up)
+
+        # Вікно втратило фокус — клавіатура більше не наша, і те, що людина
+        # тримала, треба відпустити самим, не чекаючи тайм-ауту прошивки.
+        self.root.bind("<FocusOut>", lambda _event: inp.release_all())
+
+        self.root.focus_set()
+
+    def _point(self, event):
+        """Координати миші -> піксель екрана пульта, обрізаний по межах.
+
+        Саме обрізаний, а не відкинутий: якщо палець виїхав за картинку,
+        відпускання все одно має дійти, інакше дотик лишиться натиснутим.
+        """
+        session = self.link.session if self.link else None
+        screen = session.screen if session else None
+        if screen is None:
+            return None
+        x = max(0, min(screen.w - 1, int(event.x) // self.scale))
+        y = max(0, min(screen.h - 1, int(event.y) // self.scale))
+        return (x, y)
+
+    def _on_touch_down(self, event):
+        self.root.focus_set()  # клік по картинці не має забирати клавіатуру
+        session = self.link.session if self.link else None
+        screen = session.screen if session else None
+        if screen is None:
+            return
+        if not (0 <= event.x < screen.w * self.scale and
+                0 <= event.y < screen.h * self.scale):
+            return  # натиск повз картинку пульта не стосується
+        self.input.touch(TOUCH_DOWN, self._point(event))
+
+    def _on_touch_move(self, event):
+        self.input.touch(TOUCH_MOVE, self._point(event))
+
+    def _on_touch_up(self, event):
+        self.input.touch(TOUCH_UP, self._point(event))
+
     def _tick(self):
+        if self.input is not None and self.link is not None:
+            self.input.sync(self.link.session.hello)
+
         with self.lock:
             item, self.pending = self.pending, None
 
@@ -432,6 +779,7 @@ class Window:
                 if hello
                 else "HELLO ще не прийшов"
             )
+            sent = link.sent
             self.line = (
                 f"{head}   {link.status}",
                 f"кадрів/с {fps_shown:4.1f} (прийнято {fps_got:4.1f})   "
@@ -441,6 +789,9 @@ class Window:
                 f"биті плитки {session.bad_tiles}  "
                 f"без FRAME_END {session.forced}  "
                 f"застарілі {self.skipped}  розриви {link.drops}",
+                f"надіслано: клавіш {sent['key']:4d}  енкодер {sent['enc']:4d}  "
+                f"дотик {sent['touch']:5d}  черга не влізла {link.outbox_dropped}"
+                f"   |   {self.input.layout_text if self.input else ''}",
             )
             self.window_started = now
             self.window_shown = 0
@@ -455,7 +806,9 @@ def main() -> int:
     ap.add_argument("--scale", type=int, default=1, help="ціле збільшення картинки")
     args = ap.parse_args()
 
-    where, connect = make_connector(args)
+    # 5 мс, а не типові 50: цим вікном ще й керують, і кожна мілісекунда тут
+    # додається до затримки «натиснув -> побачив».
+    where, connect = make_connector(args, poll=0.005)
 
     window = Window(f"Remote UI — {where}", max(1, args.scale))
     link = Link(connect, window.submit)
