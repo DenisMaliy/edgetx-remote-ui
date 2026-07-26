@@ -1,0 +1,50 @@
+diff --git a/radio/src/CMakeLists.txt b/radio/src/CMakeLists.txt
+index a89c178..0cd7f2e 100644
+--- a/radio/src/CMakeLists.txt
++++ b/radio/src/CMakeLists.txt
+@@ -61,6 +61,7 @@ else()
+ endif()
+ option(AUDIO "Enable audio" ON)
+ option(EXFAT "Enable exFAT filesystem support in FatFs" OFF)
++option(REMOTE_UI "Remote UI over serial" OFF)
+ 
+ if(NATIVE_BUILD)
+   option(ALL_LANGUAGES "Enable runtime language selection" ON)
+@@ -515,6 +516,11 @@ if(USBJ_EX)
+   )
+ endif()
+ 
++if(REMOTE_UI)
++  add_subdirectory(remote_ui)
++  add_definitions(-DREMOTE_UI)
++endif()
++
+ if(POWER_LED_BLUE)
+   add_definitions(-DPOWER_LED_BLUE)
+ endif()
+diff --git a/radio/src/gui/colorlcd/lcd.cpp b/radio/src/gui/colorlcd/lcd.cpp
+index e554305..a6378ef 100644
+--- a/radio/src/gui/colorlcd/lcd.cpp
++++ b/radio/src/gui/colorlcd/lcd.cpp
+@@ -29,6 +29,9 @@
+ #if !LV_USE_GPU_STM32_DMA2D && !defined(SIMU)
+ #include "dma2d.h"
+ #endif
++#if defined(REMOTE_UI)
++#include "remote_ui/remote_ui.h"
++#endif
+ 
+ #if LV_MEM_CUSTOM == 0
+ char LVGL_MEM_BUFFER[LV_MEM_SIZE] __SDRAM __ALIGNED(16);
+@@ -71,6 +74,11 @@ static lv_disp_drv_t* refr_disp = nullptr;
+ static void flushLcd(lv_disp_drv_t* disp_drv, const lv_area_t* area,
+                      lv_color_t* color_p)
+ {
++#if defined(REMOTE_UI)
++  remoteUiOnFlush(area->x1, area->y1, area->x2, area->y2,
++                  (const uint16_t*)color_p, lv_disp_flush_is_last(disp_drv));
++#endif
++
+ #if !defined(LCD_VERTICAL_INVERT) || defined(RADIO_F16)
+ #if defined(RADIO_F16)
+   if (hardwareOptions.pcbrev > 0)
