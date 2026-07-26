@@ -170,10 +170,21 @@ class Client:
                 if ptype == proto.PKT_HELLO and self.hello is None:
                     self.hello = proto.parse_hello(payload)
 
-    def greet(self, timeout=5.0):
-        self.t.send(proto.encode_frame(proto.PKT_PING))
+    def greet(self, timeout=5.0, retry=0.5):
+        """⚠️ `PING` повторюється, а не шлеться один раз.
+
+        Пульт мовчить у порожній канал, доки не почує клієнта: привітальний
+        пакет — єдина подія, яка запускає розмову. Загубився (пульт ще
+        вантажиться, завада на дроті) — і чекати можна вічно, а виглядатиме
+        це як несправний міст.
+        """
         end = time.monotonic() + timeout
+        next_ping = 0.0
         while self.hello is None and time.monotonic() < end:
+            now = time.monotonic()
+            if now >= next_ping:
+                self.send(proto.encode_frame(proto.PKT_PING))
+                next_ping = now + retry
             time.sleep(0.02)
         return self.hello
 

@@ -120,11 +120,23 @@ class Probe {
     }
   }
 
-  /** Рукостискання рівно за протоколом: першим говорить клієнт. */
-  async handshake(timeoutMs = 3000) {
-    this.send(P.encodeFrame(P.PKT_PING));
+  /**
+   * Рукостискання рівно за протоколом: першим говорить клієнт.
+   *
+   * ⚠️ `PING` повторюється, а не шлеться один раз. Пульт мовчить у порожній
+   * канал, доки не почує клієнта, тож привітальний пакет — єдина подія, яка
+   * взагалі запускає розмову; загубився він — і чекати можна вічно.
+   */
+  async handshake(timeoutMs = 4000, retryMs = 500) {
     const until = Date.now() + timeoutMs;
-    while (!this.hello && Date.now() < until) await sleep(20);
+    let nextPing = 0;
+    while (!this.hello && Date.now() < until) {
+      if (Date.now() >= nextPing) {
+        this.send(P.encodeFrame(P.PKT_PING));
+        nextPing = Date.now() + retryMs;
+      }
+      await sleep(20);
+    }
     if (!this.hello) return false;
     this.send(P.encodeFrame(P.PKT_REFRESH));
     return true;

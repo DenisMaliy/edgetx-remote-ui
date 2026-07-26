@@ -14,6 +14,9 @@ const P = RemoteUI;
 
 const RECONNECT_MS = 1000;
 
+/** Як часто повторювати вітальний `PING`, доки пульт не відповів `HELLO`. */
+const GREET_RETRY_MS = 500;
+
 // ------------------------------------------------------------- малювання ---
 
 const canvas = document.getElementById('screen');
@@ -88,7 +91,7 @@ const decoder = new P.Decoder();
 const mirror = new P.InputMirror();
 
 let lastHelloAt = 0;
-let holdTimer = null, pingTimer = null, reconnectTimer = null;
+let holdTimer = null, pingTimer = null, greetTimer = null, reconnectTimer = null;
 
 function veil(text) {
   const el = document.getElementById('veil');
@@ -124,10 +127,7 @@ function connect() {
     veil('вітаюсь із пультом…');
     chip('link', 'канал є', 'warn');
     lastHelloAt = performance.now();
-
-    // ⚠️ Над послідовним портом першим завжди говорить клієнт: пульт мовчить
-    // у порожній канал, доки не почує PING (docs/03-protocol.md).
-    send(P.encodeFrame(P.PKT_PING));
+    startGreeting();
   };
 
   ws.onmessage = (ev) => decoder.feed(new Uint8Array(ev.data), onPacket);
@@ -153,6 +153,38 @@ function scheduleReconnect() {
 function stopTimers() {
   clearInterval(holdTimer); holdTimer = null;
   clearInterval(pingTimer); pingTimer = null;
+  clearInterval(greetTimer); greetTimer = null;
+}
+
+/**
+ * Вітання, яке повторюється, доки пульт не відповість.
+ *
+ * ⚠️ Одного `PING` замало, і це не педантизм. Над послідовним портом пульт
+ * мовчить у порожній канал, доки не почує клієнта, — тобто **єдиний**
+ * привітальний пакет є єдиною подією, яка взагалі запускає розмову. Якщо він
+ * загубиться (пульт ще вантажиться, завада на дроті, побитий CRC), клієнт
+ * чекатиме вічно, показуючи «вітаюсь із пультом…», і виглядатиме це як
+ * несправний міст.
+ *
+ * Ціна повтору — 7 байтів раз на пів секунди, і лише доки не прийшов `HELLO`.
+ */
+function startGreeting() {
+  let tries = 0;
+  const beat = () => {
+    if (hello) { clearInterval(greetTimer); greetTimer = null; return; }
+    tries++;
+    send(P.encodeFrame(P.PKT_PING));
+
+    // Через кілька спроб перестаємо бути ввічливими й кажемо, де шукати.
+    if (tries === 6) {
+      veil('пульт не відповідає — перевір дроти й живлення');
+      chip('link', 'пульт мовчить', 'bad');
+    }
+  };
+
+  clearInterval(greetTimer);
+  greetTimer = setInterval(beat, GREET_RETRY_MS);
+  beat();   // перший — одразу, без очікування
 }
 
 function onPacket(type, payload) {
