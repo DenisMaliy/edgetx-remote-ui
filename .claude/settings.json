@@ -62,7 +62,9 @@
       "Bash(ps -eo pid,etime,pcpu,comm,args --sort=-pcpu)",
       "Bash(git -C upstream/edgetx diff --stat)",
       "Bash(g++ -std=c++17 -Wall -Wextra -fsanitize=address,undefined -DREMOTE_UI -DREMOTE_UI_STANDALONE -DREMOTE_UI_LCD_W=480 -DREMOTE_UI_LCD_H=272 -I. crc16.cpp protocol.cpp rle16.cpp tile.cpp capture.cpp input.cpp test/alloc_guard.cpp test/test_crc16.cpp test/test_protocol.cpp test/test_rle16.cpp test/test_capture.cpp test/test_input.cpp test/test_main.cpp -o ../../../build/remote_ui-tests)",
-      "Bash(python3 tools/proto_test.py)"
+      "Bash(python3 tools/proto_test.py)",
+      "Bash(sed -i 's/^- \\\\*\\\\*Статус:\\\\*\\\\* нова$/- **Статус:** прийнято 2026-07-26/' tasks/0008-input-state-and-encoder.md)",
+      "Bash(sed -i 's#| \\\\[0008\\\\]\\(0008-input-state-and-encoder.md\\) | Повний стан вводу в протоколі, прискорення енкодера | 1→2 | нова |#| [0008]\\(0008-input-state-and-encoder.md\\) | Повний стан вводу в протоколі, прискорення енкодера | 1→2 | прийнято |#' tasks/INDEX.md)"
     ],
     "deny": [
       "Bash(git push:*)",
