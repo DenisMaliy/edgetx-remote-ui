@@ -14,3 +14,11 @@ sd-backups/
 
 # imgui пише розкладку вікна симулятора в поточний каталог
 imgui.ini
+
+# ESP-IDF: друга тека збірки (під C3) і згенерований sdkconfig.
+# Джерело правди — sdkconfig.defaults*, вони в git.
+firmware/esp32/build-c3/
+firmware/esp32/sdkconfig
+firmware/esp32/sdkconfig.c3
+firmware/esp32/sdkconfig.old
+firmware/esp32/sdkconfig.c3.old

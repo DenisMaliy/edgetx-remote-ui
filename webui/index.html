@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<!--
+  Клієнт TX16S Remote UI.
+
+  Лежить у прошивці моста і віддається ним же: телефон під'єднаний до точки
+  доступу пульта, інтернету там немає. Тому — жодного CDN, жодних зовнішніх
+  шрифтів і жодної збірки.
+
+  ⚠️ Нуль жорстко зашитої специфіки пульта. Роздільність, перелік клавіш і
+  наявність сенсора приходять у пакеті HELLO. Літерал 480 у коді = помилка.
+-->
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#101418">
+<title>TX16S Remote UI</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="screen-wrap">
+  <!-- Розмір полотна виставляється з HELLO, а не тут. -->
+  <canvas id="screen" width="16" height="9"></canvas>
+  <div id="veil"><span id="veil-text">під'єднуюсь…</span></div>
+</div>
+
+<div id="bar">
+  <span id="link" class="chip">—</span>
+  <span id="fps" class="chip">—</span>
+  <span id="radio" class="chip">—</span>
+  <button id="btn-refresh" type="button">Оновити</button>
+  <button id="btn-info" type="button">Стан</button>
+</div>
+
+<div id="info" hidden></div>
+
+<!-- Протокол окремо від оформлення: proto.js прогоняється тестами під node
+     (`node webui/proto_test.js`) тими самими еталонними векторами, що й
+     реалізації на C++ і Python. -->
+<script src="proto.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
