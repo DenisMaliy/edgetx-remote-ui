@@ -37,6 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from remote_ui_proto import (  # noqa: E402
     HELLO_PIXFMT_RGB565,
+    INPUT_STATE_PERIOD_S,
     PING_PERIOD_S,
     PING_TIMEOUT_S,
     PKT_FRAME_END,
@@ -53,6 +54,7 @@ from remote_ui_proto import (  # noqa: E402
     TOUCH_MOVE,
     TOUCH_UP,
     Decoder,
+    InputMirror,
     add_transport_args,
     encode_enc,
     encode_frame,
@@ -400,7 +402,7 @@ class Input:
         if code is None:
             return
         self.held[keysym] = code
-        self.link.send(encode_key(code, True), "key")
+        self.link.send_key(code, True)
 
     def on_key_release(self, event) -> None:
         keysym = event.keysym
@@ -417,7 +419,7 @@ class Input:
         self.pending_release.pop(keysym, None)
         code = self.held.pop(keysym, None)
         if code is not None:
-            self.link.send(encode_key(code, False), "key")
+            self.link.send_key(code, False)
 
     def release_all(self) -> None:
         """Відпустити все. Вікно втратило фокус, розкладка змінилась, вихід.
@@ -432,19 +434,19 @@ class Input:
 
         for keysym in list(self.held):
             code = self.held.pop(keysym)
-            self.link.send(encode_key(code, False), "key")
+            self.link.send_key(code, False)
 
         if self.touch_down:
             self.touch_down = False
             x, y = self.touch_last or (0, 0)
-            self.link.send(encode_touch(TOUCH_UP, x, y), "touch")
+            self.link.send_touch(TOUCH_UP, x, y)
 
     # --- Енкодер -----------------------------------------------------------
 
     def encoder(self, steps: int) -> None:
         if not self.has_encoder or steps == 0:
             return
-        self.link.send(encode_enc(steps), "enc")
+        self.link.send_enc(steps)
 
     def on_wheel(self, event) -> None:
         # X11 віддає колесо кнопками 4 і 5, решта світу — подією з delta.
@@ -471,7 +473,7 @@ class Input:
                 return
             self.touch_down = False
         self.touch_last = point
-        self.link.send(encode_touch(kind, x, y), "touch")
+        self.link.send_touch(kind, x, y)
 
 
 class Link(threading.Thread):
@@ -503,8 +505,12 @@ class Link(threading.Thread):
         # одна, і два потоки, що пишуть у неї одночасно, рано чи пізно
         # переплетуть половинки кадрів.
         self.outbox = queue.Queue(maxsize=512)
-        self.sent = {"key": 0, "enc": 0, "touch": 0}
+        self.sent = {"key": 0, "enc": 0, "touch": 0, "state": 0}
         self.outbox_dropped = 0
+
+        # Рівень вводу, який ми періодично повторюємо пульту. Пише потік вікна,
+        # читає цей потік — звідси замок усередині InputMirror.
+        self.mirror = InputMirror()
 
     def send(self, frame: bytes, kind: str) -> None:
         """Кладе кадр вводу в чергу передачі. Викликається потоком вікна."""
@@ -513,6 +519,23 @@ class Link(threading.Thread):
             self.sent[kind] += 1
         except queue.Full:
             self.outbox_dropped += 1
+
+    # Переходи йдуть через ці три обгортки, а не через send() напряму: рівень
+    # має оновитись **до** відправлення переходу, інакше INPUT_STATE, зібраний
+    # на мілісекунду пізніше, суперечив би щойно надісланому пакету.
+
+    def send_key(self, code: int, pressed: bool) -> None:
+        self.mirror.key(code, pressed)
+        self.send(encode_key(code, pressed), "key")
+
+    def send_touch(self, kind: int, x: int, y: int) -> None:
+        self.mirror.touch(kind, x, y)
+        self.send(encode_touch(kind, x, y), "touch")
+
+    def send_enc(self, steps: int) -> None:
+        # Енкодера в дзеркалі немає: він накопичувальний, і рівня в нього
+        # просто не існує (docs/03-protocol.md, правило 5).
+        self.send(encode_enc(steps), "enc")
 
     def run(self):
         while not self.stop.is_set():
@@ -555,6 +578,11 @@ class Link(threading.Thread):
             except queue.Empty:
                 break
 
+        # Разом із чергою чиститься й рівень: пульт при розриві відпустив усе,
+        # і наше дзеркало має погодитись із ним, а не переконувати його, що
+        # клавіша досі натиснута.
+        self.mirror.clear()
+
         # Порядок вітання важливий: спершу PING, і лише отримавши у відповідь
         # HELLO — REFRESH. До HELLO клієнт не знає розміру екрана, і плитки
         # йому нікуди класти: він їх викине.
@@ -569,6 +597,7 @@ class Link(threading.Thread):
         now = time.monotonic()
         session.hello_at = now
         last_ping = now
+        last_state = now
         last_rx = now
 
         while not self.stop.is_set():
@@ -596,6 +625,21 @@ class Link(threading.Thread):
             # Ввід іде першим: людина чекає на реакцію, а не на статистику.
             if not self._drain_outbox(transport):
                 return
+
+            # ⚠️ Повний стан вводу — безумовно, а не «поки щось утримується».
+            # Саме цей пакет тримає ввід натиснутим (тайм-аут прошивки 1000 мс
+            # рахує тишу від нього, а не від PING) і саме він лікує втрачене
+            # «відпущено». Лікувальний пакет надходить від клієнта, який вважає,
+            # що не утримує нічого, — тому й безумовно.
+            if now - last_state >= INPUT_STATE_PERIOD_S:
+                try:
+                    transport.send(self.mirror.encode())
+                except OSError as exc:
+                    self.status = f"розрив на передачі: {exc}"
+                    self.drops += 1
+                    return
+                self.sent["state"] += 1
+                last_state = now
 
             if not refresh_sent and session.hello_count != hello_mark:
                 # Пульт назвався — тепер є куди класти пікселі.
@@ -790,7 +834,8 @@ class Window:
                 f"без FRAME_END {session.forced}  "
                 f"застарілі {self.skipped}  розриви {link.drops}",
                 f"надіслано: клавіш {sent['key']:4d}  енкодер {sent['enc']:4d}  "
-                f"дотик {sent['touch']:5d}  черга не влізла {link.outbox_dropped}"
+                f"дотик {sent['touch']:5d}  стан {sent['state']:4d}  "
+                f"черга не влізла {link.outbox_dropped}"
                 f"   |   {self.input.layout_text if self.input else ''}",
             )
             self.window_started = now

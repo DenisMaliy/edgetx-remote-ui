@@ -60,6 +60,10 @@ constexpr uint32_t SILENCE_RESET_MS = 100;
 // проти 60 кадрів, і водночас не крутить процесор даремно.
 constexpr uint32_t IDLE_SLEEP_US = 2000;
 
+// Пауза перед повторною спробою запису, коли сокет не приймає байтів. Ціна
+// однієї ітерації, зате цикл не з'їдає ядро на неблокувальному сокеті.
+constexpr uint32_t WRITE_RETRY_SLEEP_US = 500;
+
 // Скільки байтів забирати з сокета за раз.
 constexpr size_t RX_CHUNK = 512;
 
@@ -112,6 +116,12 @@ bool writeAll(int fd, const uint8_t* data, size_t len)
       continue;
     }
     if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+      if (errno != EINTR) {
+        // Сокет блокувальний, тому сюди не дійде; але варто комусь зробити
+        // його неблокувальним — і цикл без паузи з'їв би ядро цілком. Коротка
+        // пауза коштує затримки в одну ітерацію й рятує від цього назавжди.
+        usleep(WRITE_RETRY_SLEEP_US);
+      }
       continue;
     }
     return false;
@@ -135,40 +145,21 @@ void onPacket(uint8_t type, const uint8_t* payload, size_t length, void* context
   const uint32_t now = nowMs();
   InputState& input = inputState();
 
-  // Будь-який пакет із правильним CRC доводить, що клієнт живий, — навіть
-  // невідомий нам тип. Саме ця позначка тримає емульований ввід натиснутим:
-  // щойно вона застаріє, читач відпустить усе сам (input.h).
-  input.onAnyPacket(now);
+  // ⚠️ Позначку «клієнт живий» ставлять **тільки** пакети, що несуть ввід, і
+  // ставить її сам розбір усередині applyInputPacket. Раніше вона стояла тут,
+  // до switch, тобто тайм-аут відсувало будь-що — включно з PING, REFRESH і
+  // невідомими типами.
+  //
+  // Чому це змінено (docs/03-protocol.md, «Тайм-аут відпускання»): на етапі 2
+  // між телефоном і пультом стоїть міст ESP32. Він власний посередник і цілком
+  // може слати PING після того, як телефон від'єднався. При старому правилі
+  // клавіша, утримувана в мить розриву Wi-Fi, лишилась би натиснутою назавжди —
+  // і людина цього не побачила б, бо екрана немає.
+  if (applyInputPacket(input, type, payload, length, now)) {
+    return;  // ввід застосовано; відповіді такі пакети не породжують
+  }
 
   switch (type) {
-    case PKT_KEY:
-      if (length >= 2) {
-        input.onKey(payload[0], payload[1] != 0, now);
-      }
-      break;
-
-    case PKT_ENC:
-      if (length >= 1) {
-        input.onEncoder(static_cast<int8_t>(payload[0]), now);
-      }
-      break;
-
-    case PKT_TOUCH:
-      if (length >= 5) {
-        const int16_t x =
-            static_cast<int16_t>(payload[1] | (payload[2] << 8));
-        const int16_t y =
-            static_cast<int16_t>(payload[3] | (payload[4] << 8));
-        input.onTouch(payload[0], x, y, now);
-      }
-      break;
-
-    case PKT_TRIM:
-      if (length >= 2) {
-        input.onTrim(payload[0], payload[1] != 0, now);
-      }
-      break;
-
     case PKT_REFRESH:
       captureMarkAllDirty();
       // Кадр обов'язково закриється FRAME_END, навіть якщо LVGL відтоді нічого
@@ -186,7 +177,9 @@ void onPacket(uint8_t type, const uint8_t* payload, size_t length, void* context
       break;
     }
 
-    // Невідомий тип — мовчки повз, як вимагає правило сумісності.
+    // Невідомий тип — мовчки повз, як вимагає правило сумісності. Сюди ж
+    // потрапляє й пакет вводу з обрізаним вантажем: applyInputPacket відмовив,
+    // а робити з ним більше нема чого.
     default:
       break;
   }

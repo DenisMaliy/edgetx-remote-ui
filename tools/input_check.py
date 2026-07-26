@@ -7,12 +7,22 @@
 самий протокол, але дії описані рядком, кожен крок вимірюється, а результат
 лягає у PNG.
 
-Заразом це наскрізна перевірка безпеки: крок `drop` рве з'єднання, **не
-відпустивши клавішу**, і далі видно, чи пульт лишився натискати щось сам.
+Заразом це наскрізна перевірка безпеки, і рубежів тут три, різних за природою:
+
+    drop        обрив з'єднання, нічого не відпустивши;
+    silence     труба ціла, але клієнт замовк — ловить тайм-аут;
+    keylost     ⚠️ труба ціла, клієнт живий і шле далі, зникає рівно **один**
+                пакет «відпущено». Тайм-аут такого не ловить за побудовою —
+                ловить лише періодичний повтор рівня (INPUT_STATE, задача 0008).
 
     tools/input_check.py --steps "shot:00-start,key:MDL,shot:01-model"
     tools/input_check.py --steps "hold:PAGE>:1500,shot:02-repeat"
     tools/input_check.py --steps "press:ENTER,drop,wait:2000,shot:03-after-drop"
+
+Проба на точкову втрату — той самий сценарій двічі, тим самим файлом:
+
+    tools/input_check.py --no-input-state --steps "keylost:PAGE>:300:2000,shot:a"
+    tools/input_check.py                  --steps "keylost:PAGE>:300:2000,shot:b"
 
 Кроки (через кому, зліва направо):
 
@@ -20,11 +30,18 @@
     press:МІТКА        натиснути й не відпускати
     release:МІТКА      відпустити
     hold:МІТКА:МС      натиснути, потримати МС, відпустити
+    keylost:МІТКА:УТР:СТЕЖ   натиснути, потримати УТР мс, «відпустити» так, що
+                       пакет губиться, і СТЕЖ мс дивитись, чи пульт замовк
+    trimlost:І:УТР:СТЕЖ      те саме для тримера — ⚠️ саме він придатний як
+                       доказ: у нього автоповтор видно числом на екрані,
+                       а клавіші сторінок автоповтору не мають зовсім
     enc:±N             N клацань енкодера
     tap:X/Y            дотик: натиск і відпускання в точці
+    taplost:X/Y:УТР:СТЕЖ     те саме, що keylost, але для дотику
     swipe:X1/Y1/X2/Y2  дотик із протягуванням
-    wait:МС            просто зачекати (PING іде далі)
+    wait:МС            просто зачекати (періодика клієнта йде далі)
     shot:НАЗВА         зберегти поточний кадр у PNG
+    silence:МС         замовкнути при цілій трубі
     drop               обірвати з'єднання, нічого не відпускаючи
     connect            під'єднатись знову
 
@@ -43,6 +60,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from capture_check import Frame, write_png  # noqa: E402
 from remote_ui_proto import (  # noqa: E402
     DEFAULT_TCP_PORT,
+    INPUT_STATE_PERIOD_S,
+    InputMirror,
     PING_PERIOD_S,
     PKT_FRAME_END,
     PKT_HELLO,
@@ -69,12 +88,19 @@ from remote_ui_proto import (  # noqa: E402
 class Radio:
     """З'єднання з пультом: шле дії, збирає кадри, міряє час реакції."""
 
-    def __init__(self, host: str, port: int, quiet: float = 0.25):
+    def __init__(self, host: str, port: int, quiet: float = 0.25,
+                 input_state: bool = True):
         self.host = host
         self.port = port
         # Скільки тиші означає «пульт домалював». Кадри в русі йдуть один за
         # одним, тому чекати треба не першого FRAME_END, а паузи після нього.
         self.quiet = quiet
+
+        # Чи повторювати повний стан вводу. Вимикається прапорцем, щоб «до» і
+        # «після» знімались тим самим виконуваним файлом і тим самим сценарієм
+        # — інакше порівняння нечесне.
+        self.input_state = input_state
+        self.mirror = InputMirror()
 
         self.sock = None
         self.dec = Decoder()
@@ -82,6 +108,7 @@ class Radio:
         self.frame = None
         self.frames = 0
         self.last_ping = 0.0
+        self.last_state = 0.0
         self.log = []
 
     # --- Труба -------------------------------------------------------------
@@ -90,6 +117,9 @@ class Radio:
         self.sock = socket.create_connection((self.host, self.port), timeout=5.0)
         self.sock.settimeout(0.01)
         self.dec.reset()
+        # Пульт при розриві відпустив усе — дзеркало має погодитись із ним, а не
+        # переконувати його, що клавіша досі натиснута.
+        self.mirror.clear()
         self.send(encode_frame(PKT_PING))
         self.pump(0.3)
         if self.hello is None:
@@ -108,11 +138,54 @@ class Radio:
             raise RuntimeError("немає з'єднання")
         self.sock.sendall(data)
 
-    def ping_if_due(self):
+    def keepalive_if_due(self):
+        """Періодика клієнта: повний стан вводу і, значно рідше, PING."""
         now = time.monotonic()
+
+        if now - self.last_state >= INPUT_STATE_PERIOD_S:
+            if self.input_state:
+                self.send(self.mirror.encode())
+            else:
+                # ⚠️ Режим «як було до INPUT_STATE», і він мусить лишатись
+                # чесним. Просто замовкнути не можна: прошивка відпускає ввід за
+                # тишею, і залипання, яке ми хочемо показати, сховалось би за
+                # тайм-аутом — вийшло б, що вади немає.
+                #
+                # Тому шлемо порожнє клацання енкодера: за правилами прошивки
+                # це пакет, що несе ввід, тобто зв'язок доведено живий, але
+                # рівня він не повторює. Саме та ситуація, заради якої
+                # INPUT_STATE і з'явився: жива труба, живий клієнт, загублене
+                # «відпущено».
+                self.send(encode_enc(0))
+            self.last_state = now
+
+        # PING лишається перевіркою живого **пульта** — у відповідь іде HELLO.
+        # Ввід на ньому більше не тримається (docs/03-protocol.md).
         if now - self.last_ping >= PING_PERIOD_S:
             self.send(encode_frame(PKT_PING))
             self.last_ping = now
+
+    # --- Ввід: дзеркало оновлюється **до** відправлення переходу ------------
+
+    def key(self, code: int, pressed: bool, lose: bool = False):
+        """`lose=True` — клієнт вважає, що надіслав, а на дріт нічого не пішло.
+
+        Це і є точкова втрата одного пакета при живому зв'язку: не обрив, не
+        тиша, а рівно один зниклий кадр — те, що тайм-аут спіймати не може.
+        """
+        self.mirror.key(code, pressed)
+        if not lose:
+            self.send(encode_key(code, pressed))
+
+    def trim(self, index: int, pressed: bool, lose: bool = False):
+        self.mirror.trim(index, pressed)
+        if not lose:
+            self.send(encode_trim(index, pressed))
+
+    def touch(self, event: int, x: int, y: int, lose: bool = False):
+        self.mirror.touch(event, x, y)
+        if not lose:
+            self.send(encode_touch(event, x, y))
 
     # --- Кадри -------------------------------------------------------------
 
@@ -129,7 +202,7 @@ class Radio:
                 time.sleep(0.005)
                 continue
             if ping:
-                self.ping_if_due()
+                self.keepalive_if_due()
             try:
                 data = self.sock.recv(65536)
             except TimeoutError:
@@ -198,6 +271,23 @@ class Radio:
         self.settle()
         return latency
 
+    def watch(self, seconds: float):
+        """Стежить, скільки пульт ще малює. Повертає (кадрів, останній кадр, мс).
+
+        Це і є вимірювання залипання. Відпущена клавіша означає, що пульт
+        замовк майже одразу; залипла — що автоповтор EdgeTX жене далі й кадри
+        не припиняються до кінця вікна спостереження.
+        """
+        started = time.monotonic()
+        frames_before = self.frames
+        last_frame_at = started
+        while time.monotonic() - started < seconds:
+            before = self.frames
+            self.pump(0.01)
+            if self.frames != before:
+                last_frame_at = time.monotonic()
+        return self.frames - frames_before, (last_frame_at - started) * 1000
+
     # --- Дії ---------------------------------------------------------------
 
     def key_code(self, label: str) -> int:
@@ -226,18 +316,18 @@ def run_steps(radio: Radio, steps, outdir: str, report):
 
         elif name == "key":
             code = radio.key_code(arg)
-            ms = radio.react(lambda c=code: (radio.send(encode_key(c, True)),
-                                             radio.send(encode_key(c, False))))
+            ms = radio.react(lambda c=code: (radio.key(c, True),
+                                             radio.key(c, False)))
             report.append(f"  {arg:<8} натиснуто й відпущено, реакція {ms:5.1f} мс")
 
         elif name == "press":
             code = radio.key_code(arg)
-            ms = radio.react(lambda c=code: radio.send(encode_key(c, True)))
+            ms = radio.react(lambda c=code: radio.key(c, True))
             report.append(f"  {arg:<8} натиснуто (тримаю), реакція {ms:5.1f} мс")
 
         elif name == "release":
             code = radio.key_code(arg)
-            radio.send(encode_key(code, False))
+            radio.key(code, False)
             radio.settle()
             report.append(f"  {arg:<8} відпущено")
 
@@ -246,9 +336,9 @@ def run_steps(radio: Radio, steps, outdir: str, report):
             code = radio.key_code(label)
             hold_ms = float(ms_text or 1000)
             frames_before = radio.frames
-            radio.send(encode_key(code, True))
+            radio.key(code, True)
             radio.pump(hold_ms / 1000.0)
-            radio.send(encode_key(code, False))
+            radio.key(code, False)
             radio.settle()
             report.append(
                 f"  {label:<8} утримано {hold_ms:.0f} мс, кадрів за цей час "
@@ -258,7 +348,7 @@ def run_steps(radio: Radio, steps, outdir: str, report):
         elif name == "trimpress":
             # Натиснути й **не** відпускати. Для перевірки безпеки: далі йде
             # `drop`, і пульт має відпустити тример сам.
-            radio.send(encode_trim(int(arg), True))
+            radio.trim(int(arg), True)
             radio.settle()
             report.append(f"  тример {arg} натиснуто (тримаю)")
 
@@ -269,9 +359,9 @@ def run_steps(radio: Radio, steps, outdir: str, report):
             index = int(index_text)
             hold_ms = float(ms_text or 800)
             frames_before = radio.frames
-            radio.send(encode_trim(index, True))
+            radio.trim(index, True)
             radio.pump(hold_ms / 1000.0)
-            radio.send(encode_trim(index, False))
+            radio.trim(index, False)
             radio.settle()
             report.append(
                 f"  тример {index} утримано {hold_ms:.0f} мс, кадрів "
@@ -279,31 +369,110 @@ def run_steps(radio: Radio, steps, outdir: str, report):
             )
 
         elif name == "enc":
-            steps_n = int(arg)
+            # `enc:±N` — по одному клацанню, чекаючи перемальовки між ними.
+            # `enc:±N:ГАП` — черга клацань через ГАП мс, без очікування. Другий
+            # вид потрібен, щоб перевірити **прискорення**: EdgeTX рахує його з
+            # проміжку між клацаннями, тож повільне й швидке обертання мають
+            # давати різний крок. Однакова відповідь на обидва темпи — це вада,
+            # яку й лікує частина 2 задачі 0008.
+            steps_text, _, gap_text = arg.partition(":")
+            steps_n = int(steps_text)
             direction = 1 if steps_n > 0 else -1
-            ms = radio.react(lambda: radio.send(encode_enc(direction)))
-            for _ in range(abs(steps_n) - 1):
-                radio.send(encode_enc(direction))
+
+            if gap_text:
+                gap_s = float(gap_text) / 1000.0
+                frames_before = radio.frames
+                for _ in range(abs(steps_n)):
+                    radio.send(encode_enc(direction))
+                    radio.pump(gap_s)
                 radio.settle()
-            report.append(f"  енкодер  {steps_n:+d}, реакція {ms:5.1f} мс")
+                report.append(
+                    f"  енкодер  {steps_n:+d} чергою через {gap_text} мс, "
+                    f"кадрів {radio.frames - frames_before}"
+                )
+            else:
+                ms = radio.react(lambda: radio.send(encode_enc(direction)))
+                for _ in range(abs(steps_n) - 1):
+                    radio.send(encode_enc(direction))
+                    radio.settle()
+                report.append(f"  енкодер  {steps_n:+d}, реакція {ms:5.1f} мс")
 
         elif name == "tap":
             x, y = (int(v) for v in arg.split("/"))
-            ms = radio.react(lambda: (radio.send(encode_touch(TOUCH_DOWN, x, y)),
-                                      radio.send(encode_touch(TOUCH_UP, x, y))))
+            ms = radio.react(lambda: (radio.touch(TOUCH_DOWN, x, y),
+                                      radio.touch(TOUCH_UP, x, y)))
             report.append(f"  дотик    {x},{y}, реакція {ms:5.1f} мс")
 
         elif name == "swipe":
             x1, y1, x2, y2 = (int(v) for v in arg.split("/"))
-            radio.send(encode_touch(TOUCH_DOWN, x1, y1))
+            radio.touch(TOUCH_DOWN, x1, y1)
             for i in range(1, 9):
-                radio.send(encode_touch(TOUCH_MOVE,
-                                        x1 + (x2 - x1) * i // 8,
-                                        y1 + (y2 - y1) * i // 8))
+                radio.touch(TOUCH_MOVE,
+                            x1 + (x2 - x1) * i // 8,
+                            y1 + (y2 - y1) * i // 8)
                 radio.pump(0.02)
-            radio.send(encode_touch(TOUCH_UP, x2, y2))
+            radio.touch(TOUCH_UP, x2, y2)
             radio.settle()
             report.append(f"  протяг   {x1},{y1} -> {x2},{y2}")
+
+        # --- Проба на точкову втрату одного пакета -------------------------
+        #
+        # Головний доказ задачі 0008. Не обрив і не тиша: труба ціла, клієнт
+        # живий і шле далі, зникає рівно один кадр — «відпущено». Тайм-аут
+        # такого не ловить за побудовою, ловить лише повтор рівня.
+
+        elif name == "keylost":
+            label, _, rest = arg.partition(":")
+            hold_text, _, watch_text = rest.partition(":")
+            code = radio.key_code(label)
+            hold_ms = float(hold_text or 300)
+            watch_ms = float(watch_text or 2000)
+
+            radio.key(code, True)
+            radio.pump(hold_ms / 1000.0)
+            radio.key(code, False, lose=True)  # клієнт вважає, що відпустив
+            frames, last_ms = radio.watch(watch_ms / 1000.0)
+            report.append(
+                f"  ⚠️ {label:<8} «відпущено» ВТРАЧЕНО. За {watch_ms:.0f} мс "
+                f"після втрати: кадрів {frames}, останній на {last_ms:.0f} мс"
+            )
+
+        elif name == "trimlost":
+            # Тример — єдиний орган на TX16S, де залипання видно **числом**:
+            # поки напрямок утримується, EdgeTX сам жене значення далі й
+            # перемальовує екран. Клавіші сторінок автоповтору не мають, тому
+            # на них залипання нічим себе не виявляє — і проба на них показала б
+            # «нуль кадрів» однаково в обох режимах, тобто не показала б нічого.
+            index_text, _, rest = arg.partition(":")
+            hold_text, _, watch_text = rest.partition(":")
+            index = int(index_text)
+            hold_ms = float(hold_text or 400)
+            watch_ms = float(watch_text or 3000)
+
+            radio.trim(index, True)
+            radio.pump(hold_ms / 1000.0)
+            radio.trim(index, False, lose=True)
+            frames, last_ms = radio.watch(watch_ms / 1000.0)
+            report.append(
+                f"  ⚠️ тример {index} «відпущено» ВТРАЧЕНО. За {watch_ms:.0f} мс "
+                f"після втрати: кадрів {frames}, останній на {last_ms:.0f} мс"
+            )
+
+        elif name == "taplost":
+            point, _, rest = arg.partition(":")
+            hold_text, _, watch_text = rest.partition(":")
+            x, y = (int(v) for v in point.split("/"))
+            hold_ms = float(hold_text or 300)
+            watch_ms = float(watch_text or 2000)
+
+            radio.touch(TOUCH_DOWN, x, y)
+            radio.pump(hold_ms / 1000.0)
+            radio.touch(TOUCH_UP, x, y, lose=True)
+            frames, last_ms = radio.watch(watch_ms / 1000.0)
+            report.append(
+                f"  ⚠️ дотик {x},{y} «відпущено» ВТРАЧЕНО. За {watch_ms:.0f} мс "
+                f"після втрати: кадрів {frames}, останній на {last_ms:.0f} мс"
+            )
 
         elif name == "wait":
             radio.pump(float(arg) / 1000.0)
@@ -323,8 +492,22 @@ def run_steps(radio: Radio, steps, outdir: str, report):
             )
 
         elif name == "silence":
-            radio.pump(float(arg) / 1000.0, ping=False)
-            report.append(f"  ⚠️ мовчання {arg} мс при цілій трубі")
+            # ⚠️ Мовчить **усе**, включно з INPUT_STATE: інакше проба
+            # перевіряла б сама себе, а не тайм-аут.
+            ms = float(arg)
+            started = time.monotonic()
+            frames_before = radio.frames
+            last_frame_at = started
+            while time.monotonic() - started < ms / 1000.0:
+                before = radio.frames
+                radio.pump(0.01, ping=False)
+                if radio.frames != before:
+                    last_frame_at = time.monotonic()
+            report.append(
+                f"  ⚠️ мовчання {ms:.0f} мс при цілій трубі: кадрів "
+                f"{radio.frames - frames_before}, останній на "
+                f"{(last_frame_at - started) * 1000:.0f} мс"
+            )
 
         elif name == "drop":
             radio.drop()
@@ -344,17 +527,23 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=DEFAULT_TCP_PORT)
     ap.add_argument("--out", default="docs/img/input", help="куди класти знімки")
     ap.add_argument("--steps", required=True, help="кроки через кому")
+    ap.add_argument(
+        "--no-input-state",
+        action="store_true",
+        help="не повторювати повний стан вводу — знімок поведінки «як було до 0008»",
+    )
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
 
-    radio = Radio(args.host, args.port)
+    radio = Radio(args.host, args.port, input_state=not args.no_input_state)
     radio.connect()
 
     hello = radio.hello
     report = [
         f"Пульт: {hello['target']} {hello['fw']}  {hello['width']}x{hello['height']}",
         "Клавіші: " + ", ".join(f"{name}({code})" for code, name in hello["keys"]),
+        f"Повтор стану вводу: {'так, раз на 250 мс' if radio.input_state else 'ВИМКНЕНО'}",
         "",
     ]
 

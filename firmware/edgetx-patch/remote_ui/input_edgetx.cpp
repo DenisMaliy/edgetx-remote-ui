@@ -42,6 +42,27 @@ int32_t remoteUiGetEncoderOffset()
   return remote_ui::inputState().encoderOffset();
 }
 
+void remoteUiAddEncoderDt(volatile uint32_t* rotencDt)
+{
+  if (rotencDt == nullptr) {
+    return;
+  }
+
+  const uint32_t pending = remote_ui::inputState().takeEncoderDtMs();
+
+  // ⚠️ Порожній випадок виходить **до** запису, і це головне в цій функції.
+  // `rotencDt` пише ще й переривання енкодера (`rotaryEncoderCheck()`,
+  // rotary_encoder_driver.cpp), а «прочитати-додати-записати» звідси йде з
+  // задачі. Не чіпаючи лічильник, поки віддаленого клацання немає, ми лишаємо
+  // фізичну ручку рівно такою, якою вона була без Remote UI: без клієнта
+  // жодного запису не відбувається взагалі.
+  if (pending == 0) {
+    return;
+  }
+
+  *rotencDt += pending;
+}
+
 bool remoteUiPopTouch(int16_t* x, int16_t* y, bool* pressed)
 {
   if (x == nullptr || y == nullptr || pressed == nullptr) {

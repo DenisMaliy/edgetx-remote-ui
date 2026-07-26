@@ -68,6 +68,7 @@ enum PacketType : uint8_t {
   PKT_REFRESH = 0x84,
   PKT_TRIM = 0x85,
   PKT_PING = 0x86,
+  PKT_INPUT_STATE = 0x87,
 
   // Зарезервовано під файлові операції (наступні етапи)
   PKT_FILE_LIST = 0x90,

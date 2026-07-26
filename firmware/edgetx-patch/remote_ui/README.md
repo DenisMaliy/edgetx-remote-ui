@@ -22,7 +22,7 @@ CRC — CRC-16/CCITT-FALSE по `TYPE + LEN + PAYLOAD` (маркер і сам C
 | `rle16.h` / `rle16.cpp` | стиснення RLE16 і зворотне перетворення для тестів |
 | `tile.h` / `tile.cpp` | PAYLOAD пакета `TILE`, вибір «сире чи стиснуте» |
 | `capture.h` / `capture.cpp` | тіньовий кадр, бітова карта брудних плиток, сам гачок |
-| `input.h` / `input.cpp` | емульований ввід: клавіші, тримери, енкодер, сенсор і **тайм-аут відпускання** |
+| `input.h` / `input.cpp` | емульований ввід: клавіші, тримери, енкодер, сенсор, **тайм-аут відпускання**, повний стан (`0x87`) і розбір пакетів вводу |
 | `input_edgetx.cpp` | прив'язка вводу до EdgeTX: годинник, `keysGetSupported()`, кількість тримерів |
 | `hello.h` / `hello.cpp` | пакет `HELLO`: опис заліза, взятий з API EdgeTX |
 | `transport_simu.cpp` | TCP замість UART — тільки для симулятора (`#if defined(SIMU)`) |
@@ -45,17 +45,26 @@ LVGL -> flushLcd() -> remoteUiOnFlush()        задача menusTask, найн�
 Ввід іде назустріч і в інший бік підмішується не в інтерфейс, а в **драйвери**:
 
 ```
-TCP/UART -> Decoder -> InputState (клавіші, тримери, енкодер, сенсор)
+TCP/UART -> Decoder -> applyInputPacket -> InputState (клавіші, тримери,
+                                            енкодер, сенсор)
                             |
         keysPollingCycle() -+-> keys_input |= remoteUiGetKeys()      10 мс
         rotaryDriverRead() -+-> newPos     += remoteUiGetEncoderOffset()
+                            +-> remoteUiAddEncoderDt(&rotencDt)
         touchDriverRead()  -+-> remoteUiPopTouch()                   LVGL
 ```
 
 Тому довге натискання, автоповтор і прискорення енкодера рахує сам EdgeTX —
-ми їх не програмуємо. І тому ж **тиша в каналі відпускає все сама**: перевіряє
-це той бік, який ввід читає, тож навіть мертвий потік транспорту не лишить
-клавішу натиснутою.
+ми їх не програмуємо. Прискоренню, щоправда, треба підказати час: воно
+рахується з проміжку між клацаннями, і без нашого `remoteUiAddEncoderDt()`
+EdgeTX вважав би, що ручку крутять нескінченно швидко.
+
+І тому ж **тиша в каналі відпускає все сама**: перевіряє це той бік, який ввід
+читає, тож навіть мертвий потік транспорту не лишить клавішу натиснутою.
+⚠️ Відсувають тайм-аут лише пакети, що **несуть ввід** — `KEY`, `ENC`,
+`TOUCH`, `TRIM`, `INPUT_STATE`. `PING` і `REFRESH` його не відсувають: міст
+ESP32 — власний посередник і може слати `PING` після того, як телефон
+від'єднався.
 
 Гачок не стискає й не передає нічого: він працює в задачі, яку мікшер витісняє
 будь-коли. Черга — це бітова карта фіксованого розміру, тому переповнитись і
@@ -115,7 +124,11 @@ g++ -std=c++17 -Wall -Wextra \
 
 Стан на 2026-07-26 (g++ 16.1.1, `-fsanitize=address,undefined`):
 
-- тестів — **70**, пройдено 70;
+- тестів — **95**, пройдено 95;
+- ті самі 95 проходять на 480×272, 320×240, 800×480 і **212×64** — координати
+  в тестах сенсора виводяться з `SCREEN_W`/`SCREEN_H`, а не пишуться числами,
+  інакше на низькому екрані вони обрізались би по межі й тест падав би не
+  через код;
 - час прогону — **≈0.04 с**;
 - код повернення — **0** (успіх), **1** — якщо провалилась хоч одна перевірка;
 - виділень динамічної пам'яті в захищених зонах — **1**, і це навмисне
@@ -171,7 +184,22 @@ g++ -std=c++17 -Wall -Wextra \
 | ⚠️ `InputSilenceReleasesKeys`, `…Trims`, `…Touch` | **тиша в каналі відпускає все сама**, без жодного пакета |
 | ⚠️ `InputDisconnectReleasesKeysAndTrims`, `…Touch`, `InputDisconnectBeatsLatch` | розрив відпускає все **негайно**, не чекаючи тайм-ауту |
 | ⚠️ `InputReconnectReleasesTouchOfPreviousClient`, `InputReconnectDropsUnseenTouch` | новий клієнт не успадковує натиснуте попереднім |
-| `InputPingKeepsKeyHeld` | будь-який пакет (навіть PING) тримає ввід живим — інакше довге натискання розпадалось би |
+| ⚠️ `InputStateDoesNotEatUnreadKeyLatch`, `…TrimLatch` | **повтор стану не з'їдає защіпнутого натискання**, якого читач ще не забрав |
+| ⚠️ `InputStateDoesNotSwallowUnreadTouchDown` | те саме для сенсора: непрочитаний натиск не стирається рівнем |
+| ⚠️ `InputStateReleasesTouchWhenProducerSeesTimeoutFirst`, `InputTouchUpReleasesWhenProducerSeesTimeoutFirst` | **писар побачив тайм-аут раніше за читача** — найгірший порядок подій; без епохи дотик залипав би назавжди |
+| `InputStateTouchWorksAfterProducerTimeout` | і після того розчищення наступний дотик доходить як звичайний |
+| `InputStateHealsStuckKey`, `InputStateHealsStuckTouch` | **втрачене «відпущено» лікується за один період** — те, чого тайм-аут не ловить |
+| `InputStateRaisesMissedPress`, `InputStateSynthesisesTouchDown` | втрачене «натиснуто» рівень теж лікує |
+| `InputStateIsIdempotent` | той самий пакет двічі не додає ні засувки, ні переходу — тому номера послідовності в ньому й немає |
+| `InputStateReleaseUsesLastKnownPoint` | синтетичне відпускання бере останню відому точку, а не координати пакета |
+| `InputStateLevelActsAsMove`, `InputStateLevelAddsNoExtraTransition` | рівень «унизу» лікує втрачений `MOVE` і при цьому переходом не стає |
+| `InputStateLeavesEncoderAlone` | енкодера пакет не чіпає: рівень замість накопичення дав би фантомний оберт |
+| ⚠️ `InputStateShortPayloadIsIgnored` | обрізаний пакет не застосовується **і тайм-аут не відсуває** |
+| `InputStateLongPayloadAppliesHead` | пакет від новішого клієнта: перші 13 байтів беруться, хвіст ігнорується |
+| ⚠️ `InputPingDoesNotHoldInput` | **PING ввід не тримає** — тайм-аут відсувають лише пакети, що несуть ввід |
+| `InputStateKeepsKeyHeld` | а `INPUT_STATE` тримає: він і є годинником тайм-ауту |
+| `InputEncoderReportsTimeBetweenClicks`, `InputEncoderDtSurvivesDisconnect` | час між клацаннями для прискорення ручки; перше клацання після паузи — чисте |
+| `InputEncoderZeroStepStillProvesClientAlive` | `ENC:0` нічого не рухає, але доводить, що клієнт живий (на цьому тримається проба на точкову втрату) |
 | `InputShortPressSurvivesBetweenPolls` | натискання коротше за 10 мс не губиться між опитуваннями клавіш |
 | `InputIgnoresKeyOutsideMask` | код клавіші поза маскою відкидається, а не псує сусідні біти |
 | `InputTouchTapIsNotLost`, `InputTouchHoldsPressBetweenPolls` | тик і довге натискання доходять обидва |
@@ -195,6 +223,8 @@ tools/patch-update.sh    # зняти правлені в upstream гачки н
 У чужих файлах — п'ять вставок, усі під `REMOTE_UI`: підключення бібліотеки в
 `radio/src/CMakeLists.txt`, `remoteUiOnFlush()` на початку `flushLcd()`,
 дві маски в `keysPollingCycle()` і два гачки вводу в `LvglWrapper.cpp`.
-Разом 46 доданих рядків. Перелік дозволених місць — пункти 5, 6, 7 і 8 з
+Разом 47 доданих рядків (47-й — `remoteUiAddEncoderDt(&rotencDt)` у
+`rotaryDriverRead()`, без нього прискорення енкодера застигає на максимумі).
+Перелік дозволених місць — пункти 5, 6, 7 і 8 з
 [`docs/05-hooks.md`](../../../docs/05-hooks.md); `patch-update.sh` не дасть
 знятися патчу, у якому є щось поза цим переліком.

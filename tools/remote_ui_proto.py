@@ -17,6 +17,7 @@
 
 import socket
 import struct
+import threading
 
 MARKER = b"\xE7\x7E"
 
@@ -34,6 +35,7 @@ PKT_TOUCH = 0x83
 PKT_REFRESH = 0x84
 PKT_TRIM = 0x85
 PKT_PING = 0x86
+PKT_INPUT_STATE = 0x87
 
 TILE_METHOD_RAW = 0
 TILE_METHOD_RLE16 = 1
@@ -60,20 +62,23 @@ SILENCE_RESET_S = 0.100
 
 # Періодичність PING і стеля мовчання пульта.
 #
-# ⚠️ 0.25 с, а не 2 с зі специфікації, і це не дрібниця. PING — єдиний доказ
-# того, що клієнт живий, а прошивка на цьому доказі тримає **емульований ввід**:
-# після 1000 мс тиші вона відпускає всі клавіші сама (INPUT_RELEASE_TIMEOUT_MS
-# в input.h). Тобто клієнт, який мовчить довше за секунду, не просто вважається
-# відсутнім — у нього під пальцем розтискається клавіша.
-#
-# Чотири PING на тайм-аут дають запас: щоб ввід відпустився помилково, має
-# зникнути чотири пакети поспіль. Ціна — 4 пакети HELLO на секунду у зворотний
-# бік, менше за тисячу байтів, тобто близько 1% від 921600 бод.
-#
-# Розбіжність зі специфікацією описана в результаті задачі 0007: число в
-# docs/03-protocol.md уточнює асистент.
-PING_PERIOD_S = 0.25
+# PING — перевірка живого **пульта**, і більше нічого: у відповідь приходить
+# HELLO. Утримання вводу на ньому не тримається, тому 2 с достатньо.
+PING_PERIOD_S = 2.0
 PING_TIMEOUT_S = 5.0
+
+# Періодичність INPUT_STATE — повного стану вводу.
+#
+# ⚠️ Безумовна, а не «поки щось утримується», і це головна неочевидність
+# протоколу. Лікувальний пакет надходить саме від клієнта, який вважає, що не
+# утримує **нічого**: «відпущено» він уже надіслав, воно й загубилось. Тобто
+# періодичність, прив'язана до «щось утримується», лікувала б рівно ті випадки,
+# яких не буває.
+#
+# Прошивка відпускає ввід після INPUT_RELEASE_TIMEOUT_MS (1000 мс) без
+# INPUT_STATE, тож 0.25 с — це чотири пропущені періоди запасу. Два числа
+# пов'язані й міняються тільки разом (docs/03-protocol.md).
+INPUT_STATE_PERIOD_S = 0.25
 
 
 def crc16_ccitt_false(data: bytes) -> int:
@@ -118,6 +123,92 @@ def encode_touch(event: int, x: int, y: int) -> bytes:
 def encode_trim(index: int, pressed: bool) -> bytes:
     """TRIM: номер напрямку тримера і стан."""
     return encode_frame(PKT_TRIM, bytes([index & 0xFF, 1 if pressed else 0]))
+
+
+def encode_input_state(keys: int, trims: int, touch_down: bool, x: int, y: int) -> bytes:
+    """INPUT_STATE: повний стан вводу — рівень, а не перехід.
+
+    13 байтів: маска клавіш (4), маска напрямків тримерів (4), прапорці
+    дотику (1), x і y (по 2), усе little-endian.
+
+    Енкодера тут немає навмисно: він накопичувальний, і заміщення накопичувача
+    рівнем дало б фантомний оберт назад (docs/03-protocol.md, правило 5).
+
+    Координати при touch_down=False пульт не читає взагалі, але кладемо туди
+    останню відому точку — так у журналі видно, де палець був востаннє.
+    """
+    return encode_frame(
+        PKT_INPUT_STATE,
+        struct.pack(
+            "<IIBHH",
+            keys & 0xFFFFFFFF,
+            trims & 0xFFFFFFFF,
+            1 if touch_down else 0,
+            x & 0xFFFF,
+            y & 0xFFFF,
+        ),
+    )
+
+
+class InputMirror:
+    """Дзеркало власного вводу клієнта — джерело для INPUT_STATE.
+
+    Живе в спільному модулі, а не в кожному інструменті окремо: рівень, який
+    розійшовся з надісланими переходами, — це рівно та вада, яку INPUT_STATE і
+    має лікувати, тож двох реалізацій тут бути не повинно.
+
+    ⚠️ Порядок обов'язковий: спершу оновити дзеркало, потім слати перехід.
+    Тоді стан на дроті ніколи не суперечить раніше надісланому переходу.
+    Пульт від дотримання цього правила не залежить, але з ним поведінка
+    передбачувана.
+
+    Замок потрібен, бо в тестовому клієнті дзеркало пише потік вікна, а читає
+    потік труби. Без нього пакет міг би зібратись із нової маски клавіш і
+    старого стану дотику — рівно та розбіжність, яку INPUT_STATE лікує.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.keys = 0
+        self.trims = 0
+        self.touch_down = False
+        self.x = 0
+        self.y = 0
+
+    def key(self, code: int, pressed: bool) -> None:
+        if code >= 32:
+            return  # у 32-бітову маску не влазить — пульт таку клавішу теж відкине
+        bit = 1 << code
+        with self.lock:
+            self.keys = self.keys | bit if pressed else self.keys & ~bit
+
+    def trim(self, index: int, pressed: bool) -> None:
+        if index >= 32:
+            return
+        bit = 1 << index
+        with self.lock:
+            self.trims = self.trims | bit if pressed else self.trims & ~bit
+
+    def touch(self, event: int, x: int, y: int) -> None:
+        with self.lock:
+            self.x, self.y = x, y
+            if event == TOUCH_DOWN:
+                self.touch_down = True
+            elif event == TOUCH_UP:
+                self.touch_down = False
+            # MOVE лише пересуває точку — рівень від нього не змінюється.
+
+    def clear(self) -> None:
+        """Відпустити все у дзеркалі. Втратили вікно, рвемо з'єднання, виходимо."""
+        with self.lock:
+            self.keys = 0
+            self.trims = 0
+            self.touch_down = False
+
+    def encode(self) -> bytes:
+        """Пакет будується в момент відправлення, а не зі знятого раніше знімка."""
+        with self.lock:
+            return encode_input_state(self.keys, self.trims, self.touch_down, self.x, self.y)
 
 
 class Decoder:

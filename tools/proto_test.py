@@ -70,6 +70,14 @@ class GoldenVectors(unittest.TestCase):
             bytes.fromhex("E77E010100AAE4D1"),
         )
 
+    def test_input_state(self):
+        # Той самий вектор розбирає C++ (test_input.cpp): Python кодує — пульт
+        # застосовує. Стан: клавіша 4, напрямок тримера 1, палець у (100, 200).
+        self.assertEqual(
+            proto.encode_input_state(1 << 4, 1 << 1, True, 100, 200),
+            bytes.fromhex("E77E870D001000000002000000016400C800B36E"),
+        )
+
     def test_crc_of_check_string(self):
         # Класичний вектор CRC-16/CCITT-FALSE: "123456789" -> 0x29B1.
         self.assertEqual(proto.crc16_ccitt_false(b"123456789"), 0x29B1)
@@ -77,6 +85,12 @@ class GoldenVectors(unittest.TestCase):
     def test_constants_match_spec(self):
         self.assertEqual(proto.MAX_PAYLOAD, 4096)
         self.assertEqual(proto.FRAME_OVERHEAD, 7)
+
+    def test_periods_match_spec(self):
+        # Поріг відпускання в прошивці — 1000 мс, тобто чотири пропущені
+        # періоди INPUT_STATE. Числа пов'язані й міняються тільки разом.
+        self.assertEqual(proto.INPUT_STATE_PERIOD_S, 0.25)
+        self.assertEqual(proto.PING_PERIOD_S, 2.0)
 
 
 class Framing(unittest.TestCase):
@@ -467,6 +481,141 @@ class InputPackets(unittest.TestCase):
         self.assertEqual(ptype, proto.PKT_TRIM)
         self.assertEqual(payload, bytes([5, 1]))
 
+    def test_input_state_packet(self):
+        ptype, payload = self.decode_one(
+            proto.encode_input_state(0xDEADBEEF, 0x0000FFFF, True, 479, 271)
+        )
+        self.assertEqual(ptype, proto.PKT_INPUT_STATE)
+        self.assertEqual(len(payload), 13)
+        self.assertEqual(payload, struct.pack("<IIBHH", 0xDEADBEEF, 0x0000FFFF, 1, 479, 271))
+
+    def test_input_state_flag_is_bit0_only(self):
+        # Решта бітів прапорцевого байта зарезервована й має йти нулями.
+        _, payload = self.decode_one(proto.encode_input_state(0, 0, False, 0, 0))
+        self.assertEqual(payload[8], 0)
+        _, payload = self.decode_one(proto.encode_input_state(0, 0, True, 0, 0))
+        self.assertEqual(payload[8], 1)
+
+
+class InputMirrorState(unittest.TestCase):
+    """Дзеркало вводу клієнта — джерело рівня для INPUT_STATE."""
+
+    def unpack(self, mirror):
+        packets = list(proto.Decoder().feed(mirror.encode()))
+        keys, trims, flags, x, y = struct.unpack("<IIBHH", packets[0][1])
+        return keys, trims, bool(flags & 1), x, y
+
+    def test_keys_and_trims_are_levels(self):
+        m = proto.InputMirror()
+        m.key(4, True)
+        m.key(7, True)
+        m.trim(1, True)
+        keys, trims, _, _, _ = self.unpack(m)
+        self.assertEqual(keys, (1 << 4) | (1 << 7))
+        self.assertEqual(trims, 1 << 1)
+
+        m.key(4, False)
+        keys, _, _, _, _ = self.unpack(m)
+        self.assertEqual(keys, 1 << 7)
+
+    def test_key_out_of_mask_is_dropped(self):
+        # Пульт клавіші >= 32 теж відкидає — дзеркало не має розходитись із ним.
+        m = proto.InputMirror()
+        m.key(32, True)
+        self.assertEqual(self.unpack(m)[0], 0)
+
+    def test_touch_level_follows_down_and_up(self):
+        m = proto.InputMirror()
+        m.touch(proto.TOUCH_DOWN, 10, 20)
+        _, _, down, x, y = self.unpack(m)
+        self.assertTrue(down)
+        self.assertEqual((x, y), (10, 20))
+
+        m.touch(proto.TOUCH_UP, 10, 20)
+        self.assertFalse(self.unpack(m)[2])
+
+    def test_move_shifts_the_point_but_not_the_level(self):
+        m = proto.InputMirror()
+        m.touch(proto.TOUCH_DOWN, 10, 20)
+        m.touch(proto.TOUCH_MOVE, 30, 40)
+        _, _, down, x, y = self.unpack(m)
+        self.assertTrue(down)
+        self.assertEqual((x, y), (30, 40))
+
+
+class LostPacketProbe(unittest.TestCase):
+    """Механіка проби на точкову втрату (`tools/input_check.py`).
+
+    Інструмент доказу сам має бути доведений: якщо `lose=True` насправді шле
+    пакет або, навпаки, не оновлює дзеркало, проба показуватиме що завгодно,
+    тільки не те, що написано у звіті.
+    """
+
+    def make(self, **kw):
+        import input_check
+
+        radio = input_check.Radio.__new__(input_check.Radio)
+        radio.mirror = proto.InputMirror()
+        radio.wire = []
+        radio.send = radio.wire.append
+        radio.input_state = kw.get("input_state", True)
+        radio.last_ping = radio.last_state = 0.0
+        return radio
+
+    def packets(self, radio):
+        out = []
+        for frame in radio.wire:
+            out.extend(proto.Decoder().feed(frame))
+        return out
+
+    def test_lost_release_never_reaches_the_wire(self):
+        radio = self.make()
+        radio.key(4, True)
+        radio.key(4, False, lose=True)
+
+        # На дроті лише «натиснуто» — «відпущено» зникло, як і задумано.
+        self.assertEqual(self.packets(radio), [(proto.PKT_KEY, bytes([4, 1]))])
+
+    def test_lost_release_still_clears_the_mirror(self):
+        # Клієнт **вважає**, що відпустив. Саме тому наступний INPUT_STATE
+        # лікує залипання: він каже правду про намір клієнта.
+        radio = self.make()
+        radio.key(4, True)
+        self.assertEqual(radio.mirror.keys, 1 << 4)
+
+        radio.key(4, False, lose=True)
+        self.assertEqual(radio.mirror.keys, 0)
+
+    def test_lost_touch_release_clears_the_level(self):
+        radio = self.make()
+        radio.touch(proto.TOUCH_DOWN, 10, 20)
+        radio.touch(proto.TOUCH_UP, 10, 20, lose=True)
+
+        self.assertEqual(self.packets(radio),
+                         [(proto.PKT_TOUCH, struct.pack("<BHH", proto.TOUCH_DOWN, 10, 20))])
+        self.assertFalse(radio.mirror.touch_down)
+
+    def test_keepalive_sends_state_when_enabled(self):
+        radio = self.make(input_state=True)
+        radio.key(4, True)
+        radio.wire.clear()
+        radio.keepalive_if_due()
+
+        types = [p[0] for p in self.packets(radio)]
+        self.assertIn(proto.PKT_INPUT_STATE, types)
+
+    def test_keepalive_without_state_still_proves_the_client_alive(self):
+        # ⚠️ Режим «як було до 0008» не сміє просто мовчати: прошивка відпускає
+        # ввід за тишею, і залипання, яке проба показує, сховалось би за
+        # тайм-аутом. Тому йде пакет, що несе ввід, але рівня не повторює.
+        radio = self.make(input_state=False)
+        radio.wire.clear()
+        radio.keepalive_if_due()
+
+        types = [p[0] for p in self.packets(radio)]
+        self.assertNotIn(proto.PKT_INPUT_STATE, types)
+        self.assertIn(proto.PKT_ENC, types)
+
 
 class FakeRoot:
     """Заміна tk.Tk для тестів вводу: тільки відкладені виклики."""
@@ -497,13 +646,39 @@ class FakeEvent:
 
 
 class FakeLink:
+    """Заміна Link. Повторює його обгортки разом із дзеркалом вводу.
+
+    Дзеркало тут не декорація: рівень, що розійшовся з надісланими переходами,
+    — це рівно та вада, яку INPUT_STATE має лікувати, а не породжувати. Тому
+    фальшива труба тримає його так само, як справжня, і тести можуть на нього
+    дивитись.
+    """
+
     def __init__(self):
-        self.sent = {"key": 0, "enc": 0, "touch": 0}
+        self.sent = {"key": 0, "enc": 0, "touch": 0, "state": 0}
         self.frames = []
+        self.mirror = proto.InputMirror()
 
     def send(self, frame, kind):
         self.frames.append((kind, frame))
         self.sent[kind] += 1
+
+    def send_key(self, code, pressed):
+        self.mirror.key(code, pressed)
+        self.send(proto.encode_key(code, pressed), "key")
+
+    def send_touch(self, kind, x, y):
+        self.mirror.touch(kind, x, y)
+        self.send(proto.encode_touch(kind, x, y), "touch")
+
+    def send_enc(self, steps):
+        self.send(proto.encode_enc(steps), "enc")
+
+    def state(self):
+        """Рівень, який пішов би наступним INPUT_STATE."""
+        packets = list(proto.Decoder().feed(self.mirror.encode()))
+        keys, trims, flags, x, y = struct.unpack("<IIBHH", packets[0][1])
+        return keys, trims, bool(flags & 1), x, y
 
     def packets(self):
         out = []
@@ -590,6 +765,64 @@ class InputLayout(unittest.TestCase):
         self.assertIn((proto.PKT_KEY, bytes([1, 0])), got)
         self.assertIn((proto.PKT_KEY, bytes([2, 0])), got)
         self.assertIn((proto.PKT_TOUCH, struct.pack("<BHH", proto.TOUCH_UP, 10, 20)), got)
+
+    # --- Рівень не має розходитись із переходами -------------------------
+    #
+    # INPUT_STATE лікує втрачений пакет тільки доти, доки сам каже правду.
+    # Дзеркало, що розійшлося з надісланими переходами, перетворює лікування на
+    # джерело хвороби: воно періодично відтискатиме те, що людина тримає.
+
+    def test_level_follows_press_and_release(self):
+        root, link, inp = self.make([(1, "RTN"), (2, "Enter")])
+
+        inp.on_key_press(FakeEvent(keysym="Escape"))
+        self.assertEqual(link.state()[0], 1 << 1)
+
+        inp.on_key_press(FakeEvent(keysym="Return"))
+        self.assertEqual(link.state()[0], (1 << 1) | (1 << 2))
+
+        inp.on_key_release(FakeEvent(keysym="Escape"))
+        root.run_pending()
+        self.assertEqual(link.state()[0], 1 << 2)
+
+    def test_autorepeat_does_not_dent_the_level(self):
+        # Пари «відпущено-натиснуто» від X11 пульту не йдуть — і рівень вони
+        # теж не сміють просідати, інакше повтор стану відпустив би клавішу
+        # під пальцем.
+        root, link, inp = self.make([(1, "RTN")])
+
+        inp.on_key_press(FakeEvent(keysym="Escape"))
+        for _ in range(5):
+            inp.on_key_release(FakeEvent(keysym="Escape"))
+            inp.on_key_press(FakeEvent(keysym="Escape"))
+            self.assertEqual(link.state()[0], 1 << 1)
+
+    def test_level_empty_after_release_all(self):
+        root, link, inp = self.make([(1, "RTN"), (2, "Enter")])
+
+        inp.on_key_press(FakeEvent(keysym="Escape"))
+        inp.on_key_press(FakeEvent(keysym="Return"))
+        inp.touch(proto.TOUCH_DOWN, (10, 20))
+        self.assertEqual(link.state()[0], (1 << 1) | (1 << 2))
+        self.assertTrue(link.state()[2])
+
+        inp.release_all()
+        root.run_pending()
+
+        keys, trims, down, _, _ = link.state()
+        self.assertEqual((keys, trims, down), (0, 0, False))
+
+    def test_level_tracks_drag_point(self):
+        root, link, inp = self.make([(1, "RTN")])
+
+        inp.touch(proto.TOUCH_DOWN, (10, 20))
+        inp.touch(proto.TOUCH_MOVE, (30, 40))
+        _, _, down, x, y = link.state()
+        self.assertTrue(down)
+        self.assertEqual((x, y), (30, 40))
+
+        inp.touch(proto.TOUCH_UP, (30, 40))
+        self.assertFalse(link.state()[2])
 
     def test_arrows_drive_encoder_when_radio_has_no_up_down(self):
         _root, link, inp = self.make([(1, "RTN")])
