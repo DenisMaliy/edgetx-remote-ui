@@ -22,6 +22,20 @@ index a89c178..0cd7f2e 100644
  if(POWER_LED_BLUE)
    add_definitions(-DPOWER_LED_BLUE)
  endif()
+diff --git a/radio/src/dataconstants.h b/radio/src/dataconstants.h
+index 372e38c..6b4f0c6 100644
+--- a/radio/src/dataconstants.h
++++ b/radio/src/dataconstants.h
+@@ -258,6 +258,9 @@ enum UartModes {
+   UART_MODE_DEBUG,
+   UART_MODE_SPACEMOUSE,
+   UART_MODE_EXT_MODULE,
++#if defined(REMOTE_UI)
++  UART_MODE_REMOTE_UI,
++#endif
+   UART_MODE_COUNT SKIP,
+   UART_MODE_MAX SKIP = UART_MODE_COUNT-1
+ };
 diff --git a/radio/src/gui/colorlcd/LvglWrapper.cpp b/radio/src/gui/colorlcd/LvglWrapper.cpp
 index f169abd..41a3948 100644
 --- a/radio/src/gui/colorlcd/LvglWrapper.cpp
@@ -97,6 +111,27 @@ index e554305..a6378ef 100644
  #if !defined(LCD_VERTICAL_INVERT) || defined(RADIO_F16)
  #if defined(RADIO_F16)
    if (hardwareOptions.pcbrev > 0)
+diff --git a/radio/src/gui/gui_common.cpp b/radio/src/gui/gui_common.cpp
+index b71f9c3..01f22d1 100644
+--- a/radio/src/gui/gui_common.cpp
++++ b/radio/src/gui/gui_common.cpp
+@@ -541,6 +541,16 @@ bool isSerialModeAvailable(uint8_t port_nr, int mode)
+     return false;
+ #endif
+ 
++#if defined(REMOTE_UI)
++  // Прямий доступ до пам'яті на передачу є лише в AUX1; VCP наш транспорт
++  // поки не вміє (docs/05-hooks.md, пункт 4).
++#if !defined(AUX_SERIAL_DMA_TX)
++  if (mode == UART_MODE_REMOTE_UI) return false;
++#else
++  if (mode == UART_MODE_REMOTE_UI && port_nr != SP_AUX1) return false;
++#endif
++#endif
++
+ #if !defined(AUX_SERIAL_DMA_TX) || defined(EXTMODULE_USART)
+   if (mode == UART_MODE_EXT_MODULE)
+     return false;
 diff --git a/radio/src/keys.cpp b/radio/src/keys.cpp
 index af4a93f..3a03e3b 100644
 --- a/radio/src/keys.cpp
@@ -124,3 +159,79 @@ index af4a93f..3a03e3b 100644
    for (int i = 0; i < MAX_KEYS; i++) {
      event_t evt = keys[i].input(keys_input & (1 << i));
      if (evt) {
+diff --git a/radio/src/serial.cpp b/radio/src/serial.cpp
+index 1f09287..3050440 100644
+--- a/radio/src/serial.cpp
++++ b/radio/src/serial.cpp
+@@ -50,6 +50,10 @@
+   #include "thirdparty/Segger/SEGGER/SEGGER_RTT.h"
+ #endif
+ 
++#if defined(REMOTE_UI) && !defined(BOOT)
++  #include "remote_ui/remote_ui.h"
++#endif
++
+ #define PRINTF_BUFFER_SIZE    128
+ 
+ static void (*dbg_serial_putc)(void*, uint8_t) = nullptr;
+@@ -277,6 +281,13 @@ static void serialSetCallBacks(int mode, void* ctx, const etx_serial_port_t* por
+     break;
+ #endif
+ 
++#if defined(REMOTE_UI)
++  case UART_MODE_REMOTE_UI:
++    // ctx == nullptr — це від'єднання (порт іде під інший режим).
++    remoteUiSetSerialDriver(ctx, drv, port);
++    break;
++#endif
++
+ #endif
+   }
+ }
+@@ -346,6 +357,13 @@ static void serialSetupPort(int mode, etx_serial_init& params)
+     break;
+ #endif
+ 
++#if defined(REMOTE_UI)
++  case UART_MODE_REMOTE_UI:
++    params.baudrate = REMOTE_UI_BAUDRATE;
++    params.direction = ETX_Dir_TX_RX;
++    break;
++#endif
++
+ #endif // BOOT
+   }
+ }
+diff --git a/radio/src/storage/yaml/yaml_datastructs_funcs.cpp b/radio/src/storage/yaml/yaml_datastructs_funcs.cpp
+index 0e00393..2f3c708 100644
+--- a/radio/src/storage/yaml/yaml_datastructs_funcs.cpp
++++ b/radio/src/storage/yaml/yaml_datastructs_funcs.cpp
+@@ -2592,6 +2592,9 @@ static const struct YamlIdStr enum_UartModes[] = {
+   {  UART_MODE_DEBUG, "DEBUG"  },
+   {  UART_MODE_SPACEMOUSE, "SPACEMOUSE"  },
+   {  UART_MODE_EXT_MODULE, "EXT_MODULE"  },
++#if defined(REMOTE_UI)
++  {  UART_MODE_REMOTE_UI, "REMOTE_UI"  },
++#endif
+   {  0, NULL  }
+ };
+ 
+diff --git a/radio/src/translations/translation_def.h b/radio/src/translations/translation_def.h
+index 9de4cd7..1399eb5 100644
+--- a/radio/src/translations/translation_def.h
++++ b/radio/src/translations/translation_def.h
+@@ -129,7 +129,14 @@
+ 
+ #define TR_VCELLINDEX               SA11(TR_VCELLINDEX)
+ 
++#if defined(REMOTE_UI)
++// Рядок лежить тут, а не в i18n/*.h: інакше довелося б додати його в 19 мовних
++// файлів, тоді як docs/05-hooks.md вимагає мінімум англійську.
++#define TR_AUX_SERIAL_MODES_12      "Remote UI"
++#define TR_AUX_SERIAL_MODES         SA12(TR_AUX_SERIAL_MODES)
++#else
+ #define TR_AUX_SERIAL_MODES         SA11(TR_AUX_SERIAL_MODES)
++#endif
+ 
+ #define TR_VFORMULAS                SA9(TR_VFORMULAS)
+ #define TR_FS_COLOR_LIST            SA9(TR_FS_COLOR_LIST)

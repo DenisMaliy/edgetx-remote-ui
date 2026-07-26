@@ -20,10 +20,15 @@ PATCH="$REPO/firmware/edgetx-patch/patches/hooks.patch"
 # Закритий перелік файлів, які нам дозволено чіпати (docs/05-hooks.md).
 # Розширювати його можна лише разом із документом — і не мовчки.
 ALLOWED=(
-  "radio/src/CMakeLists.txt"                   # пункт 8: збірка
-  "radio/src/gui/colorlcd/lcd.cpp"             # пункт 5: захоплення екрана
-  "radio/src/keys.cpp"                         # пункт 6: клавіші й тримери
-  "radio/src/gui/colorlcd/LvglWrapper.cpp"     # пункт 7: енкодер і сенсор
+  "radio/src/dataconstants.h"                            # пункт 1: режим порту
+  "radio/src/storage/yaml/yaml_datastructs_funcs.cpp"    # пункт 2: назва в YAML
+  "radio/src/serial.cpp"                                 # пункт 3: драйвер і швидкість
+  "radio/src/gui/gui_common.cpp"                         # пункт 4: доступність режиму
+  "radio/src/gui/colorlcd/lcd.cpp"                       # пункт 5: захоплення екрана
+  "radio/src/keys.cpp"                                   # пункт 6: клавіші й тримери
+  "radio/src/gui/colorlcd/LvglWrapper.cpp"               # пункт 7: енкодер і сенсор
+  "radio/src/CMakeLists.txt"                             # пункт 8: збірка
+  "radio/src/translations/translation_def.h"             # пункт 9: назва режиму
 )
 
 if [ ! -d "$UPSTREAM/.git" ]; then
