@@ -50,6 +50,28 @@ std::atomic<uint32_t> s_dirty[DIRTY_WORDS];
 
 std::atomic<uint32_t> s_frameCount;
 
+// Чи тіньовий кадр уже придатний до читання.
+//
+// Секція `.sdram` оголошена як NOLOAD (`linker/stm32f429_sdram/extra_sections.ld`),
+// тобто, на відміну від `.bss`, при старті її ніхто не обнуляє: на пульті
+// тіньовий кадр починає життя зі сміття від попереднього вмикання. Чистимо його
+// при першому ж флеші.
+//
+// ⚠️ Наскільки вузьке вікно «транспорт уже є, кадру ще немає» — звірено з кодом
+// EdgeTX, а не припущено. На звичайному шляху його немає взагалі: `edgeTxInit()`
+// викликає `startSplash()` (`edgetx.cpp:1413`), а заставка домальовується
+// негайно, і лише потім, на рядку 1520, іде `initSerialPorts()`. Тобто перший
+// флеш стається ще до того, як наша задача взагалі з'явиться.
+//
+// Вікно відкривається, коли заставку пропущено, а це два випадки:
+// `UNEXPECTED_SHUTDOWN()` (увімкнення після падіння) і `OPENTX_START_NO_SPLASH`
+// (симулятор). Обидва рідкісні, обидва справжні — тому запобіжник лишається.
+//
+// Пише прапорець лише гачок, читає — і гачок, і транспорт. `release`/`acquire`
+// тут не для порядку: вони гарантують, що «прапорець піднято» означає
+// «memset уже завершився», а не «memset почався».
+std::atomic<bool> s_shadowReady{false};
+
 // Місце, з якого починається наступний обхід. Читає й пише лише транспорт,
 // тому звичайна змінна.
 uint32_t s_scanCursor;
@@ -77,17 +99,16 @@ inline void markTile(int index)
 void captureOnFlush(int x1, int y1, int x2, int y2, const uint16_t* pixels,
                     bool isLast)
 {
-  // Секція `.sdram` оголошена як NOLOAD, тобто, на відміну від `.bss`, при
-  // старті її ніхто не обнуляє: на пульті тіньовий кадр почав би життя зі
-  // сміття, і клієнт, підключений під час завантаження, побачив би «сніг» у
-  // ще не перемальованих плитках. Чистимо один раз, при першому ж флеші —
-  // тобто до того, як хоч одна плитка стане брудною і зможе піти на дріт.
+  // Чистимо тіньовий кадр один раз, при першому ж флеші — тобто до того, як
+  // хоч одна плитка стане брудною і зможе піти на дріт. Чому це потрібно й
+  // чому прапорець атомарний — біля його оголошення.
   //
-  // Прапорець звичайний, не atomic: його читає й пише лише гачок.
-  static bool s_shadowCleared = false;
-  if (!s_shadowCleared) {
-    s_shadowCleared = true;
+  // ⚠️ Порядок обов'язковий: спершу memset, **потім** прапорець. Навпаки
+  // транспорт міг би побачити «готово» посеред очищення й віддати клієнту
+  // напівочищений кадр.
+  if (!s_shadowReady.load(std::memory_order_relaxed)) {
     memset(s_shadow, 0, sizeof(s_shadow));
+    s_shadowReady.store(true, std::memory_order_release);
   }
 
   if (pixels != nullptr && x2 >= x1 && y2 >= y1) {
@@ -191,11 +212,25 @@ void captureReturnTile(const TileRef& tile)
   markTile((tile.y / TILE_SIDE) * TILES_X + (tile.x / TILE_SIDE));
 }
 
-void captureMarkAllDirty()
+bool captureMarkAllDirty()
 {
+  // ⚠️ До першого флешу показувати нічого: у тіньовому кадрі лежить те, що
+  // лишилось у пам'яті від попереднього вмикання. Позначити плитки брудними
+  // означало б віддати це клієнту як картинку.
+  //
+  // Чистити кадр звідси було б гірше: це memset на 261 КБ, і з цього контексту
+  // він накладався б на memcpy гачка. Тому просто відмовляємо — і кажемо про це
+  // викликачеві, щоб той повторив спробу. Без цього REFRESH, який прийшов
+  // надто рано, зник би без сліду разом із обіцяним FRAME_END.
+  if (!s_shadowReady.load(std::memory_order_acquire)) {
+    return false;
+  }
+
   for (int i = 0; i < TILE_COUNT; ++i) {
     markTile(i);
   }
+
+  return true;
 }
 
 uint32_t captureFrameCount()
@@ -215,7 +250,7 @@ uint32_t captureDirtyCount()
   return count;
 }
 
-void captureReset()
+void captureReset(bool shadowReady)
 {
   for (size_t i = 0; i < DIRTY_WORDS; ++i) {
     s_dirty[i].store(0, std::memory_order_relaxed);
@@ -223,6 +258,12 @@ void captureReset()
   s_frameCount.store(0, std::memory_order_relaxed);
   s_scanCursor = 0;
   memset(s_shadow, 0, sizeof(s_shadow));
+
+  // Кадр щойно обнулено — тобто типово він придатний до читання, навіть якщо
+  // флешу ще не було. Інакше тести, які бруднять екран без гачка, дивились би
+  // на порожню карту. `false` передає той один тест, що перевіряє поведінку до
+  // першого флешу.
+  s_shadowReady.store(shadowReady, std::memory_order_release);
 }
 
 }  // namespace remote_ui

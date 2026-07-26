@@ -97,6 +97,12 @@ size_t buildHello(uint8_t* out, size_t outSize)
   flags |= HELLO_FLAG_ENCODER;
 #endif
   // Файлові операції — наступні етапи, біт поки нуль.
+
+  // ⚠️ Безумовно, без жодного `#if`. Прошивка, зібрана з цим файлом, розуміє
+  // `INPUT_STATE` завжди: розбір лежить в `applyInputPacket()`, тобто в тому
+  // самому дереві. Умова тут означала б, що біт може збрехати.
+  flags |= HELLO_FLAG_INPUT_STATE;
+
   w.u8(flags);
 
   w.u8(keysGetMaxTrims());

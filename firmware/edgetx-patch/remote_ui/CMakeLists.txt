@@ -25,8 +25,14 @@ set(SRC ${SRC}
   remote_ui/rle16.cpp
   remote_ui/tile.cpp
   remote_ui/transport_simu.cpp
+  remote_ui/transport_uart.cpp
   PARENT_SCOPE
 )
+
+# Обидва транспорти лежать у списку завжди, а вибирає між ними препроцесор:
+# `transport_simu.cpp` — під `SIMU`, `transport_uart.cpp` — без нього. Умова в
+# CMake виглядала б чистіше, але тут же й брехала б: той самий список `SRC`
+# збирає і симулятор, і прошивку, і в ньому немає місця, де `SIMU` вже відоме.
 
 # Прапорець REMOTE_UI ставить викликач (`add_definitions(-DREMOTE_UI)` поряд із
 # `add_subdirectory`). Без нього вміст усіх наших .cpp вимикається препроцесором

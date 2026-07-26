@@ -16,6 +16,21 @@
 
 #include <stdint.h>
 
+// Єдині чужі заголовки, які сюди потрапляють, і лише заради типів драйвера й
+// порту в гачку 3. Обидва — листя: `hal/serial_driver.h` містить тільки
+// <stdint.h> і <stdbool.h>, `hal/serial_port.h` — його самого. Нічого за собою
+// вони не тягнуть, зокрема ані LVGL, ані GUI.
+//
+// Взяти замість нього `const void*` було б дешевше на один рядок і дорожче на
+// втрачену перевірку типу рівно в тому місці, де переплутати вказівник
+// найлегше: у чужому файлі, посеред switch на десять гілок.
+//
+// Тестам на ПК EdgeTX недоступний, а транспорт на залізі в них і не входить.
+#if !defined(REMOTE_UI_STANDALONE)
+#include "hal/serial_driver.h"
+#include "hal/serial_port.h"
+#endif
+
 // Гачок захоплення екрана.
 //
 // Викликається з `flushLcd()` (`radio/src/gui/colorlcd/lcd.cpp`), на самому
@@ -103,3 +118,39 @@ void remoteUiAddEncoderDt(volatile uint32_t* rotencDt);
 // Типи LVGL сюди не потрапляють навмисно (те саме рішення, що й для гачка
 // захоплення): розбір `lv_indev_data_t` лишається в чужому файлі.
 bool remoteUiPopTouch(int16_t* x, int16_t* y, bool* pressed);
+
+// --- Транспорт на залізі ----------------------------------------------------
+
+#if !defined(REMOTE_UI_STANDALONE)
+
+// Швидкість каналу, гачок 3 (`serialSetupPort()` у `radio/src/serial.cpp`):
+//   params.baudrate = REMOTE_UI_BAUDRATE;
+//
+// 921600 бод — ADR-0003. Число живе тут, а не в чужому файлі, бо його мусять
+// знати обидва боки, і в нас воно одне на всі транспорти.
+#define REMOTE_UI_BAUDRATE 921600
+// Другий рядок того самого гачка — `params.direction = ETX_Dir_TX_RX;`.
+// За замовчуванням `serialInit()` ставить лише `ETX_Dir_TX`, і без цього рядка
+// пульт говорив би, але не чув.
+
+// Гачок 3, `serialSetCallBacks()` у `radio/src/serial.cpp`:
+//   case UART_MODE_REMOTE_UI: remoteUiSetSerialDriver(ctx, drv, port); break;
+//
+// ⚠️ `ctx == nullptr` означає **від'єднання**: EdgeTX перемикає порт на інший
+// режим і саме так гасить попередній. Тоді транспорт відпускає весь
+// емульований ввід і перестає передавати.
+//
+// ⚠️ `port` передається не для повноти. Транспорт відмовляється працювати на
+// будь-якому порту, крім AUX1, — і робить це **сам**, бо `isSerialModeAvailable()`
+// (гачок 4) бачить лише меню, а `initSerialPorts()` бере режим прямо з
+// `radio.yml` без перевірок. У проєкті, де `radio.yml` правлять наосліп, це не
+// теорія: `mode: REMOTE_UI` під `AUX2` доїхав би сюди, а там немає прямого
+// доступу до пам'яті на передачу, і драйвер мовчки викидав би байти.
+//
+// Транспорт крутиться у **власній задачі**, яку створює цей виклик — не в
+// menusTask і не в службовій задачі таймерів. Чому саме так — на початку
+// transport_uart.cpp.
+void remoteUiSetSerialDriver(void* ctx, const etx_serial_driver_t* drv,
+                             const etx_serial_port_t* port);
+
+#endif  // !REMOTE_UI_STANDALONE

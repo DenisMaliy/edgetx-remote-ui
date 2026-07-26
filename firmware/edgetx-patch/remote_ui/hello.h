@@ -21,6 +21,16 @@ constexpr uint8_t HELLO_FLAG_TOUCH = 0x01;
 constexpr uint8_t HELLO_FLAG_ENCODER = 0x02;
 constexpr uint8_t HELLO_FLAG_FILE_OPS = 0x04;
 
+// Біт3: прошивка розуміє пакет `0x87 INPUT_STATE`.
+//
+// ⚠️ Це не властивість заліза, а версія прошивки, тому біт не має жодного
+// `#if`: код, який його виставляє, і код, який застосовує `INPUT_STATE`,
+// зібрані з одного дерева. Нуль означає стару прошивку — таку, де правило
+// «тайм-аут відсувають лише пакети, що несуть ввід» ще не діє, і де ввід
+// доводиться утримувати `PING`-ами (docs/03-protocol.md, розділ «Як клієнт
+// дізнається, що прошивка це вміє»).
+constexpr uint8_t HELLO_FLAG_INPUT_STATE = 0x08;
+
 // Формати пікселя.
 constexpr uint8_t HELLO_PIXFMT_RGB565 = 1;
 constexpr uint8_t HELLO_PIXFMT_MONO1 = 2;

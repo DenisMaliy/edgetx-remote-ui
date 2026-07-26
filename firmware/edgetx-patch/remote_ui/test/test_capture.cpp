@@ -304,3 +304,28 @@ TEST(CaptureRefusesSmallDestination)
   CHECK(!captureTakeTile(tile, nullptr, TILE_MAX_PIXELS));
   CHECK_EQ(captureDirtyCount(), TILE_COUNT);
 }
+
+TEST(CaptureMarkAllDirtyRefusesBeforeFirstFlush)
+{
+  // ⚠️ Стан «гачок жодного разу не викликався» — не екзотика: на пульті
+  // тіньовий кадр лежить у SDRAM, а її секція оголошена NOLOAD і при старті не
+  // обнуляється. Позначити плитки брудними до першого флешу означало б віддати
+  // клієнту сміття від попереднього вмикання як картинку.
+  captureReset(/*shadowReady=*/false);
+
+  CHECK(!captureMarkAllDirty());
+  CHECK_EQ(captureDirtyCount(), 0u);
+
+  TileRef tile;
+  CHECK(!captureTakeTile(tile, g_tileBuf, TILE_MAX_PIXELS));
+
+  // Перший же флеш робить кадр придатним — і далі все як завжди.
+  const uint16_t px = 0x1234;
+  captureOnFlush(0, 0, 0, 0, &px, false);
+
+  CHECK(captureMarkAllDirty());
+  CHECK_EQ(captureDirtyCount(), static_cast<uint32_t>(TILE_COUNT));
+
+  // Наступний виклик повторно вже нічого не блокує.
+  CHECK(captureMarkAllDirty());
+}

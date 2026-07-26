@@ -39,6 +39,7 @@
 #include "input.h"
 #include "os/time.h"  // time_get_ms — той самий годинник, що й у читача вводу
 #include "protocol.h"
+#include "remote_ui.h"  // etx_serial_driver_t для гачка 3
 #include "tile.h"
 
 namespace remote_ui {
@@ -92,11 +93,17 @@ std::atomic<int> s_clientFd{-1};
 // Виставляється при вивантаженні бібліотеки — див. Stopper наприкінці файлу.
 std::atomic<bool> s_stop{false};
 
-// Прийшов REFRESH — кадр треба закрити FRAME_END, навіть якщо LVGL відтоді
-// нічого не малював (docs/03-protocol.md, уточнення 2026-07-26). Прапорець
-// ставить розбір пакета й знімає цикл передачі, обидва в цьому ж потоці, тому
-// атомарність тут ні до чого.
-bool s_refreshPending = false;
+// Скільки плиток пішло від останнього FRAME_END. Правило закриття кадру —
+// спільне з transport_uart.cpp, пояснення там же; коротко: закриваємо, коли
+// карта брудних плиток спорожніла або LVGL закрив свій кадр, і лише якщо від
+// минулого FRAME_END справді щось поїхало.
+//
+// Живе в цьому ж потоці, тому атомарність тут ні до чого.
+uint32_t s_tilesSinceFrameEnd = 0;
+
+// REFRESH прийшов, коли тіньового кадру ще не було. Повторюємо, доки не
+// застосується: протокол обіцяє, що REFRESH завершується FRAME_END.
+bool s_refreshDeferred = false;
 
 // Час береться з EdgeTX, а не з clock_gettime, і це не дрібниця: тайм-аут
 // відпускання вводу порівнює позначку, поставлену **тут**, із часом, який
@@ -161,11 +168,12 @@ void onPacket(uint8_t type, const uint8_t* payload, size_t length, void* context
 
   switch (type) {
     case PKT_REFRESH:
-      captureMarkAllDirty();
-      // Кадр обов'язково закриється FRAME_END, навіть якщо LVGL відтоді нічого
-      // не малював. Інакше клієнт, що під'єднався до нерухомого екрана, дістав
-      // би всі плитки й не показав нічого — найтиповіший випадок у житті.
-      s_refreshPending = true;
+      // Кадр закриється FRAME_END сам, коли всі позначені плитки поїдуть, — за
+      // правилом «карта спорожніла» в циклі передачі. Відмова буває одна:
+      // тіньового кадру ще немає; тоді запит відкладається, а не зникає.
+      if (!captureMarkAllDirty()) {
+        s_refreshDeferred = true;
+      }
       break;
 
     case PKT_PING: {
@@ -190,7 +198,8 @@ void serveClient(int fd)
 {
   s_clientFd.store(fd, std::memory_order_relaxed);
   s_decoder.reset();
-  s_refreshPending = false;
+  s_tilesSinceFrameEnd = 0;
+  s_refreshDeferred = false;
 
   // Новий клієнт не відповідає за те, що встиг натиснути попередній.
   inputState().onDisconnect();
@@ -208,10 +217,16 @@ void serveClient(int fd)
     return;
   }
 
-  // Новий клієнт не бачив нічого — віддаємо йому весь екран.
-  captureMarkAllDirty();
+  // Новий клієнт не бачив нічого — віддаємо йому весь екран. Якщо тіньового
+  // кадру ще немає, запит відкладається до першого флешу.
+  if (!captureMarkAllDirty()) {
+    s_refreshDeferred = true;
+  }
 
-  uint32_t lastFrameSent = captureFrameCount() - 1;
+  // Без «мінус один»: перший же прохід віддасть весь екран, спорожнить карту й
+  // тим закриє кадр. Раніше різниця в одиницю була потрібна саме для цього
+  // першого FRAME_END; тепер його дає правило «карта спорожніла».
+  uint32_t lastFrameSent = captureFrameCount();
   uint32_t lastRxMs = nowMs();
   bool alive = true;
 
@@ -244,18 +259,24 @@ void serveClient(int fd)
     // Лічильник кадрів знімається **до** порції плиток: інакше кадр, який
     // завершився вже під час відправлення, порахувався б відправленим, а
     // частина його плиток лишилася б у карті до наступної зміни екрана.
+    // Відкладений REFRESH: щойно тіньовий кадр з'явився, застосовуємо його.
+    if (s_refreshDeferred && captureMarkAllDirty()) {
+      s_refreshDeferred = false;
+    }
+
     const uint32_t framesBefore = captureFrameCount();
 
-    // Запит на повний кадр знімається тут, до плиток: усе, що REFRESH позначив
-    // брудним, піде саме цим проходом (карта вміщає TILE_COUNT плиток, і
-    // стільки ж їх дозволено віддати за прохід), а FRAME_END закриє кадр нижче.
-    const bool refreshRequested = s_refreshPending;
-    s_refreshPending = false;
+    // `drained` — чи карта брудних плиток спорожніла саме цим проходом.
+    bool drained = false;
 
     int sentTiles = 0;
     TileRef tile;
-    while (sentTiles < TILE_COUNT &&
-           captureTakeTile(tile, s_tilePixels, TILE_MAX_PIXELS)) {
+    while (sentTiles < TILE_COUNT) {
+      if (!captureTakeTile(tile, s_tilePixels, TILE_MAX_PIXELS)) {
+        drained = true;
+        break;
+      }
+
       const size_t payloadLen =
           encodeTilePayload(tile, s_tilePixels, s_payload, sizeof(s_payload));
 
@@ -281,19 +302,38 @@ void serveClient(int fd)
       break;
     }
 
-    // FRAME_END не чекає, доки карта спорожніє. Поки людина крутить меню,
-    // брудні плитки з'являються швидше, ніж ідуть, і прив'язка «кінець кадру =
-    // черга порожня» означала б застиглу картинку саме в русі: клієнт малює в
-    // позаекранний буфер і показує його лише на FRAME_END.
+    // Цикл міг вийти й за лічильником — тоді карта вже порожня, але `drained`
+    // цього не побачив, і кадр закрився б на прохід пізніше.
+    if (!drained && captureDirtyCount() == 0) {
+      drained = true;
+    }
+
+    s_tilesSinceFrameEnd += static_cast<uint32_t>(sentTiles);
+
+    // ⚠️ Дві причини закрити кадр, і потрібна будь-яка з них — але тільки якщо
+    // від минулого FRAME_END справді щось поїхало.
     //
-    // На REFRESH кадр закривається завжди, незалежно від лічильника: пульт,
-    // що стоїть на нерухомому екрані, кадрів не породжує, а клієнт має
-    // показати те, що йому щойно надіслали.
-    if (framesBefore != lastFrameSent || refreshRequested) {
+    // 1. **Карта спорожніла**: усе, що ми знали про зміни, лежить на дроті.
+    //    Саме ця причина закриває кадр після REFRESH — на нерухомому екрані
+    //    лічильник кадрів не рухається взагалі.
+    // 2. **LVGL закрив кадр**: причина «в русі». Поки людина крутить меню,
+    //    брудні плитки з'являються швидше, ніж ідуть, карта не порожніє
+    //    ніколи, і без цієї гілки картинка застигла б саме тоді, коли має
+    //    рухатись.
+    //
+    // 3. **Плиток пішло на цілий екран** — запобіжник від клієнта, що шле
+    //    REFRESH частіше, ніж карта порожніє.
+    //
+    // Правило дослівно те саме, що в transport_uart.cpp: транспорти не мають
+    // права розходитись у тому, коли клієнту показувати кадр.
+    if (s_tilesSinceFrameEnd > 0 &&
+        (drained || framesBefore != lastFrameSent ||
+         s_tilesSinceFrameEnd >= static_cast<uint32_t>(TILE_COUNT))) {
       if (!sendPacket(fd, PKT_FRAME_END, nullptr, 0)) {
         break;
       }
       lastFrameSent = framesBefore;
+      s_tilesSinceFrameEnd = 0;
     }
 
     if (sentTiles == 0) {
@@ -434,5 +474,27 @@ __attribute__((destructor)) void remoteUiTransportStop()
 }  // namespace
 
 }  // namespace remote_ui
+
+// --- Гачок 3 в симуляторі ---------------------------------------------------
+//
+// Порту AUX1 тут не існує: транспорт їде в TCP і піднімається сам. Але
+// посилання на цю функцію є в `serial.cpp`, тобто в обох збірках, — тож без неї
+// симулятор просто не злінкувався б.
+//
+// Це не заглушка «щоб компілювалось». Завдяки їй режим порту **видно в
+// симуляторі**: його можна вибрати, зберегти й перевірити, що в `radio.yml`
+// з'явився рядок `mode: REMOTE_UI` і що він читається назад. Тобто вся
+// YAML-частина гачків 1 і 2 перевіряється без пульта.
+void remoteUiSetSerialDriver(void* ctx, const etx_serial_driver_t* drv,
+                             const etx_serial_port_t* port)
+{
+  (void)drv;
+  (void)port;
+
+  fprintf(stderr,
+          "Remote UI: порт переведено в режим Remote UI (%s). У симуляторі це "
+          "нічого не змінює — картинка й ввід ідуть у TCP.\n",
+          (ctx != nullptr) ? "увімкнено" : "вимкнено");
+}
 
 #endif  // REMOTE_UI && SIMU
