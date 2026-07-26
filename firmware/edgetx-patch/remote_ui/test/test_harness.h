@@ -28,7 +28,7 @@
 namespace test_harness {
 
 // Стеля кількості тестів. Перевищення видно в підсумку, мовчки не губиться.
-constexpr int MAX_TESTS = 64;
+constexpr int MAX_TESTS = 128;
 
 struct TestEntry {
   const char* name;

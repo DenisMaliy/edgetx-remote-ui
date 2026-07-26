@@ -19,6 +19,8 @@ set(SRC ${SRC}
   remote_ui/capture.cpp
   remote_ui/crc16.cpp
   remote_ui/hello.cpp
+  remote_ui/input.cpp
+  remote_ui/input_edgetx.cpp
   remote_ui/protocol.cpp
   remote_ui/rle16.cpp
   remote_ui/tile.cpp

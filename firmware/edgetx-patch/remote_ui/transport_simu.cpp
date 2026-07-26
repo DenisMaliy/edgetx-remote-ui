@@ -30,13 +30,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <time.h>
 #include <unistd.h>
 
 #include "capture.h"
 #include "geometry.h"
 #include "hal/key_driver.h"  // MAX_KEYS — розмір буфера HELLO
 #include "hello.h"
+#include "input.h"
+#include "os/time.h"  // time_get_ms — той самий годинник, що й у читача вводу
 #include "protocol.h"
 #include "tile.h"
 
@@ -87,12 +88,17 @@ std::atomic<int> s_clientFd{-1};
 // Виставляється при вивантаженні бібліотеки — див. Stopper наприкінці файлу.
 std::atomic<bool> s_stop{false};
 
-uint32_t monotonicMs()
-{
-  timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return static_cast<uint32_t>(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
-}
+// Прийшов REFRESH — кадр треба закрити FRAME_END, навіть якщо LVGL відтоді
+// нічого не малював (docs/03-protocol.md, уточнення 2026-07-26). Прапорець
+// ставить розбір пакета й знімає цикл передачі, обидва в цьому ж потоці, тому
+// атомарність тут ні до чого.
+bool s_refreshPending = false;
+
+// Час береться з EdgeTX, а не з clock_gettime, і це не дрібниця: тайм-аут
+// відпускання вводу порівнює позначку, поставлену **тут**, із часом, який
+// читає задача пульта (input_edgetx.cpp). Два різні годинники дали б різницю,
+// що не означає нічого.
+uint32_t nowMs() { return time_get_ms(); }
 
 // Пише все або повідомляє про розрив. Запис блокувальний навмисно: коли
 // клієнт не встигає читати, гальмувати має цей потік, а не пульт.
@@ -124,13 +130,51 @@ bool sendPacket(int fd, uint8_t type, const uint8_t* payload, size_t len)
 
 void onPacket(uint8_t type, const uint8_t* payload, size_t length, void* context)
 {
-  (void)payload;
-  (void)length;
   (void)context;
 
+  const uint32_t now = nowMs();
+  InputState& input = inputState();
+
+  // Будь-який пакет із правильним CRC доводить, що клієнт живий, — навіть
+  // невідомий нам тип. Саме ця позначка тримає емульований ввід натиснутим:
+  // щойно вона застаріє, читач відпустить усе сам (input.h).
+  input.onAnyPacket(now);
+
   switch (type) {
+    case PKT_KEY:
+      if (length >= 2) {
+        input.onKey(payload[0], payload[1] != 0, now);
+      }
+      break;
+
+    case PKT_ENC:
+      if (length >= 1) {
+        input.onEncoder(static_cast<int8_t>(payload[0]), now);
+      }
+      break;
+
+    case PKT_TOUCH:
+      if (length >= 5) {
+        const int16_t x =
+            static_cast<int16_t>(payload[1] | (payload[2] << 8));
+        const int16_t y =
+            static_cast<int16_t>(payload[3] | (payload[4] << 8));
+        input.onTouch(payload[0], x, y, now);
+      }
+      break;
+
+    case PKT_TRIM:
+      if (length >= 2) {
+        input.onTrim(payload[0], payload[1] != 0, now);
+      }
+      break;
+
     case PKT_REFRESH:
       captureMarkAllDirty();
+      // Кадр обов'язково закриється FRAME_END, навіть якщо LVGL відтоді нічого
+      // не малював. Інакше клієнт, що під'єднався до нерухомого екрана, дістав
+      // би всі плитки й не показав нічого — найтиповіший випадок у житті.
+      s_refreshPending = true;
       break;
 
     case PKT_PING: {
@@ -142,8 +186,7 @@ void onPacket(uint8_t type, const uint8_t* payload, size_t length, void* context
       break;
     }
 
-    // KEY / ENC / TOUCH — це крок 1.6 (емуляція вводу), окрема задача.
-    // Правило сумісності вимагає мовчки ігнорувати те, чого ми ще не вміємо.
+    // Невідомий тип — мовчки повз, як вимагає правило сумісності.
     default:
       break;
   }
@@ -154,6 +197,10 @@ void serveClient(int fd)
 {
   s_clientFd.store(fd, std::memory_order_relaxed);
   s_decoder.reset();
+  s_refreshPending = false;
+
+  // Новий клієнт не відповідає за те, що встиг натиснути попередній.
+  inputState().onDisconnect();
 
   const size_t helloLen = buildHello(s_helloPayload, sizeof(s_helloPayload));
   if (helloLen == 0) {
@@ -172,7 +219,7 @@ void serveClient(int fd)
   captureMarkAllDirty();
 
   uint32_t lastFrameSent = captureFrameCount() - 1;
-  uint32_t lastRxMs = monotonicMs();
+  uint32_t lastRxMs = nowMs();
   bool alive = true;
 
   while (alive && !s_stop.load(std::memory_order_relaxed)) {
@@ -190,13 +237,13 @@ void serveClient(int fd)
         }
       } else {
         s_decoder.feed(rx, static_cast<size_t>(n), onPacket, nullptr);
-        lastRxMs = monotonicMs();
+        lastRxMs = nowMs();
       }
-    } else if (monotonicMs() - lastRxMs > SILENCE_RESET_MS) {
+    } else if (nowMs() - lastRxMs > SILENCE_RESET_MS) {
       // Тиша: якщо декодувальник завис посеред обірваного кадру, звільняємо
       // його. Коли він і так на початку, скид нічого не змінює.
       s_decoder.reset();
-      lastRxMs = monotonicMs();
+      lastRxMs = nowMs();
     }
 
     // --- передача ---
@@ -205,6 +252,12 @@ void serveClient(int fd)
     // завершився вже під час відправлення, порахувався б відправленим, а
     // частина його плиток лишилася б у карті до наступної зміни екрана.
     const uint32_t framesBefore = captureFrameCount();
+
+    // Запит на повний кадр знімається тут, до плиток: усе, що REFRESH позначив
+    // брудним, піде саме цим проходом (карта вміщає TILE_COUNT плиток, і
+    // стільки ж їх дозволено віддати за прохід), а FRAME_END закриє кадр нижче.
+    const bool refreshRequested = s_refreshPending;
+    s_refreshPending = false;
 
     int sentTiles = 0;
     TileRef tile;
@@ -239,7 +292,11 @@ void serveClient(int fd)
     // брудні плитки з'являються швидше, ніж ідуть, і прив'язка «кінець кадру =
     // черга порожня» означала б застиглу картинку саме в русі: клієнт малює в
     // позаекранний буфер і показує його лише на FRAME_END.
-    if (framesBefore != lastFrameSent) {
+    //
+    // На REFRESH кадр закривається завжди, незалежно від лічильника: пульт,
+    // що стоїть на нерухомому екрані, кадрів не породжує, а клієнт має
+    // показати те, що йому щойно надіслали.
+    if (framesBefore != lastFrameSent || refreshRequested) {
       if (!sendPacket(fd, PKT_FRAME_END, nullptr, 0)) {
         break;
       }
@@ -250,6 +307,12 @@ void serveClient(int fd)
       usleep(IDLE_SLEEP_US);
     }
   }
+
+  // ⚠️ Найважливіші два рядки файлу. Клієнта більше немає — усе, що він
+  // тримав натиснутим, відпускається негайно, а не за тайм-аутом. Тайм-аут
+  // лишається другим рубежем: він спрацює навіть тоді, коли цей потік загине
+  // й до цього рядка не дійде.
+  inputState().onDisconnect();
 
   s_clientFd.store(-1, std::memory_order_relaxed);
 }

@@ -1,6 +1,6 @@
 # `remote_ui/` — код Remote UI для EdgeTX
 
-Протокол, захоплення екрана і стиснення. Вводу тут поки немає — це крок 1.6.
+Протокол, захоплення екрана, стиснення й емульований ввід.
 
 Формат кадру описаний у [`docs/03-protocol.md`](../../../docs/03-protocol.md):
 
@@ -15,13 +15,15 @@ CRC — CRC-16/CCITT-FALSE по `TYPE + LEN + PAYLOAD` (маркер і сам C
 
 | Файл | Що в ньому |
 |---|---|
-| `remote_ui.h` | **єдине**, що бачить код EdgeTX: оголошення гачка `remoteUiOnFlush()` |
+| `remote_ui.h` | **єдине**, що бачить код EdgeTX: оголошення всіх гачків |
 | `crc16.h` / `crc16.cpp` | CRC-16/CCITT-FALSE, побітово, без таблиці |
 | `protocol.h` / `protocol.cpp` | константи кадру, коди пакетів, `encodeFrame()`, потоковий `Decoder` |
 | `geometry.h` | роздільність (з `LCD_W`/`LCD_H`) і сітка плиток |
 | `rle16.h` / `rle16.cpp` | стиснення RLE16 і зворотне перетворення для тестів |
 | `tile.h` / `tile.cpp` | PAYLOAD пакета `TILE`, вибір «сире чи стиснуте» |
 | `capture.h` / `capture.cpp` | тіньовий кадр, бітова карта брудних плиток, сам гачок |
+| `input.h` / `input.cpp` | емульований ввід: клавіші, тримери, енкодер, сенсор і **тайм-аут відпускання** |
+| `input_edgetx.cpp` | прив'язка вводу до EdgeTX: годинник, `keysGetSupported()`, кількість тримерів |
 | `hello.h` / `hello.cpp` | пакет `HELLO`: опис заліза, взятий з API EdgeTX |
 | `transport_simu.cpp` | TCP замість UART — тільки для симулятора (`#if defined(SIMU)`) |
 | `CMakeLists.txt` | дописує наші `.cpp` у список `SRC` EdgeTX |
@@ -39,6 +41,21 @@ LVGL -> flushLcd() -> remoteUiOnFlush()        задача menusTask, найн�
                           v
               captureTakeTile -> RLE16 -> encodeFrame -> TCP/UART
 ```
+
+Ввід іде назустріч і в інший бік підмішується не в інтерфейс, а в **драйвери**:
+
+```
+TCP/UART -> Decoder -> InputState (клавіші, тримери, енкодер, сенсор)
+                            |
+        keysPollingCycle() -+-> keys_input |= remoteUiGetKeys()      10 мс
+        rotaryDriverRead() -+-> newPos     += remoteUiGetEncoderOffset()
+        touchDriverRead()  -+-> remoteUiPopTouch()                   LVGL
+```
+
+Тому довге натискання, автоповтор і прискорення енкодера рахує сам EdgeTX —
+ми їх не програмуємо. І тому ж **тиша в каналі відпускає все сама**: перевіряє
+це той бік, який ввід читає, тож навіть мертвий потік транспорту не лишить
+клавішу натиснутою.
 
 Гачок не стискає й не передає нічого: він працює в задачі, яку мікшер витісняє
 будь-коли. Черга — це бітова карта фіксованого розміру, тому переповнитись і
@@ -76,9 +93,9 @@ EdgeTX тут немає, а `geometry.h` без нього не знає роз
 cd firmware/edgetx-patch/remote_ui && mkdir -p ../../../build && \
 g++ -std=c++17 -Wall -Wextra -fsanitize=address,undefined \
     -DREMOTE_UI -DREMOTE_UI_STANDALONE -DREMOTE_UI_LCD_W=480 -DREMOTE_UI_LCD_H=272 -I. \
-    crc16.cpp protocol.cpp rle16.cpp tile.cpp capture.cpp \
+    crc16.cpp protocol.cpp rle16.cpp tile.cpp capture.cpp input.cpp \
     test/alloc_guard.cpp test/test_crc16.cpp test/test_protocol.cpp \
-    test/test_rle16.cpp test/test_capture.cpp test/test_main.cpp \
+    test/test_rle16.cpp test/test_capture.cpp test/test_input.cpp test/test_main.cpp \
     -o ../../../build/remote_ui-tests \
 && ../../../build/remote_ui-tests
 ```
@@ -90,16 +107,16 @@ g++ -std=c++17 -Wall -Wextra -fsanitize=address,undefined \
 cd firmware/edgetx-patch/remote_ui && mkdir -p ../../../build && \
 g++ -std=c++17 -Wall -Wextra \
     -DREMOTE_UI -DREMOTE_UI_STANDALONE -DREMOTE_UI_LCD_W=480 -DREMOTE_UI_LCD_H=272 -I. \
-    crc16.cpp protocol.cpp rle16.cpp tile.cpp capture.cpp \
+    crc16.cpp protocol.cpp rle16.cpp tile.cpp capture.cpp input.cpp \
     test/alloc_guard.cpp test/test_crc16.cpp test/test_protocol.cpp \
-    test/test_rle16.cpp test/test_capture.cpp test/test_main.cpp \
+    test/test_rle16.cpp test/test_capture.cpp test/test_input.cpp test/test_main.cpp \
     -o ../../../build/remote_ui-tests-nosan
 ```
 
 Стан на 2026-07-26 (g++ 16.1.1, `-fsanitize=address,undefined`):
 
-- тестів — **41**, пройдено 41;
-- час прогону — **≈0.03 с**;
+- тестів — **70**, пройдено 70;
+- час прогону — **≈0.04 с**;
 - код повернення — **0** (успіх), **1** — якщо провалилась хоч одна перевірка;
 - виділень динамічної пам'яті в захищених зонах — **1**, і це навмисне
   виділення в тесті `AllocGuardDetectsAllocation`, який доводить, що сторож
@@ -151,6 +168,17 @@ g++ -std=c++17 -Wall -Wextra \
 | `CaptureKeepsTilesDirtyWhenTransportIsSlow` | **повільний транспорт не губить змін** |
 | `CaptureDoesNotStarveOtherTiles` | одна плитка, що блимає щокадру, не заступає решту |
 | `CaptureRefusesSmallDestination` | замалий буфер — відмова, і плитка при цьому не витрачається |
+| ⚠️ `InputSilenceReleasesKeys`, `…Trims`, `…Touch` | **тиша в каналі відпускає все сама**, без жодного пакета |
+| ⚠️ `InputDisconnectReleasesKeysAndTrims`, `…Touch`, `InputDisconnectBeatsLatch` | розрив відпускає все **негайно**, не чекаючи тайм-ауту |
+| ⚠️ `InputReconnectReleasesTouchOfPreviousClient`, `InputReconnectDropsUnseenTouch` | новий клієнт не успадковує натиснуте попереднім |
+| `InputPingKeepsKeyHeld` | будь-який пакет (навіть PING) тримає ввід живим — інакше довге натискання розпадалось би |
+| `InputShortPressSurvivesBetweenPolls` | натискання коротше за 10 мс не губиться між опитуваннями клавіш |
+| `InputIgnoresKeyOutsideMask` | код клавіші поза маскою відкидається, а не псує сусідні біти |
+| `InputTouchTapIsNotLost`, `InputTouchHoldsPressBetweenPolls` | тик і довге натискання доходять обидва |
+| `InputTouchIdleLeavesHardwareAlone` | **без віддаленого дотику сенсор лишається фізичним** |
+| `InputTouchHistoryOverflowEndsReleased` | читач, що відстав, доганяє й не застрягає «натиснутим» |
+| `InputEncoderAccumulates`, `InputEncoderSurvivesDisconnect` | енкодер віддає **положення**, а не приріст: фантомного оберту назад немає |
+| `InputTimeWrapDoesNotRelease` | переповнення лічильника мілісекунд (раз на 49 днів) нічого не відпускає |
 
 ## Як це підключається до EdgeTX
 
@@ -164,8 +192,9 @@ tools/patch-revert.sh    # назад; після нього дерево EdgeTX
 tools/patch-update.sh    # зняти правлені в upstream гачки назад у патч
 ```
 
-У чужих файлах — рівно дві вставки, обидві під `REMOTE_UI`: виклик
-`remoteUiOnFlush()` на початку `flushLcd()` і підключення бібліотеки в
-`radio/src/CMakeLists.txt`. Перелік дозволених місць — пункти 5 і 8 з
+У чужих файлах — п'ять вставок, усі під `REMOTE_UI`: підключення бібліотеки в
+`radio/src/CMakeLists.txt`, `remoteUiOnFlush()` на початку `flushLcd()`,
+дві маски в `keysPollingCycle()` і два гачки вводу в `LvglWrapper.cpp`.
+Разом 46 доданих рядків. Перелік дозволених місць — пункти 5, 6, 7 і 8 з
 [`docs/05-hooks.md`](../../../docs/05-hooks.md); `patch-update.sh` не дасть
 знятися патчу, у якому є щось поза цим переліком.
