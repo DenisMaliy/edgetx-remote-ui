@@ -48,6 +48,16 @@ TOUCH_UP = 2
 HELLO_PIXFMT_RGB565 = 1
 HELLO_PIXFMT_MONO1 = 2
 
+# Прапорці в HELLO (docs/03-protocol.md, байт 6).
+#
+# Біти 0…2 описують залізо, біт3 — версію прошивки: «розумію INPUT_STATE».
+# Стара прошивка його не виставляє, бо його там просто немає, і нуль означає
+# рівно те, що й має означати, — незадіяні біти прапорців завжди були нулями.
+HELLO_FLAG_TOUCH = 0x01
+HELLO_FLAG_ENCODER = 0x02
+HELLO_FLAG_FILE_OPS = 0x04
+HELLO_FLAG_INPUT_STATE = 0x08
+
 MAX_PAYLOAD = 4096
 FRAME_OVERHEAD = 7
 
@@ -205,10 +215,51 @@ class InputMirror:
             self.trims = 0
             self.touch_down = False
 
+    def holding(self) -> bool:
+        """Чи утримується хоч що-небудь.
+
+        Потрібне лише запасному шляху для старої прошивки: там утримання
+        тримається на `PING`, а слати його часто є сенс тільки поки щось
+        натиснуте (docs/03-protocol.md, таблиця в розділі 0x87). Енкодера тут
+        немає й бути не може — він накопичувальний, рівня в нього не існує.
+        """
+        with self.lock:
+            return bool(self.keys or self.trims or self.touch_down)
+
     def encode(self) -> bytes:
         """Пакет будується в момент відправлення, а не зі знятого раніше знімка."""
         with self.lock:
             return encode_input_state(self.keys, self.trims, self.touch_down, self.x, self.y)
+
+
+def hold_packet(mirror: InputMirror, fw_input_state: bool):
+    """Що слати раз на INPUT_STATE_PERIOD_S, щоб пульт не відпустив ввід.
+
+    Повертає пару `(кадр або None, назва лічильника)`.
+
+    Дві гілки, і вибирає між ними **прошивка**, а не клієнт — біт3 у `HELLO`
+    (docs/03-protocol.md, таблиця в розділі 0x87):
+
+    - **біт виставлений** — повний стан вводу, безумовно. Лікувальний пакет
+      надходить саме від клієнта, який вважає, що не утримує нічого: «відпущено»
+      він уже надіслав, воно й загубилось.
+    - **біт нуль** — стара прошивка. Вона `INPUT_STATE` не знає й відкине його
+      як невідомий тип, зате в ній ще діє правило «будь-який пакет доводить, що
+      клієнт живий», тому утримання тримається на `PING`. І тільки поки щось
+      утримується: на старій прошивці частий `PING` — це зайвий трафік і зайве
+      `HELLO` у відповідь, а лікувати там усе одно нічого.
+
+    Живе тут, а не в кожному інструменті: гілка «стара прошивка» інакше існувала
+    б лише в одному з них, тобто наполовину. Та сама причина, з якої тут живе
+    `InputMirror`.
+    """
+    if fw_input_state:
+        return mirror.encode(), "state"
+
+    if mirror.holding():
+        return encode_frame(PKT_PING), "hold"
+
+    return None, "hold"
 
 
 class Decoder:
@@ -291,6 +342,13 @@ def parse_hello(payload: bytes) -> dict:
         "keys": keys,
         "target": target,
         "fw": fw,
+        # Розібрані прапорці лежать поруч із сирим байтом, а не замість нього:
+        # сире значення потрібне, щоб побачити біт, якого ця версія клієнта ще
+        # не знає.
+        "has_touch": bool(flags & HELLO_FLAG_TOUCH),
+        "has_encoder": bool(flags & HELLO_FLAG_ENCODER),
+        "has_file_ops": bool(flags & HELLO_FLAG_FILE_OPS),
+        "has_input_state": bool(flags & HELLO_FLAG_INPUT_STATE),
     }
 
 

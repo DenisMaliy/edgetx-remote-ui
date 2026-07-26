@@ -559,6 +559,10 @@ class LostPacketProbe(unittest.TestCase):
         radio.wire = []
         radio.send = radio.wire.append
         radio.input_state = kw.get("input_state", True)
+        # Що прошивка сказала біт3 у HELLO. Тут задається прямо, бо вітання в
+        # цих тестах немає — його підміну перевіряє HelloInputStateBit нижче.
+        radio.fw_input_state = kw.get("fw_input_state", True)
+        radio.holds = 0
         radio.last_ping = radio.last_state = 0.0
         return radio
 
@@ -615,6 +619,93 @@ class LostPacketProbe(unittest.TestCase):
         types = [p[0] for p in self.packets(radio)]
         self.assertNotIn(proto.PKT_INPUT_STATE, types)
         self.assertIn(proto.PKT_ENC, types)
+
+    def test_old_firmware_holds_input_with_ping(self):
+        # Біт3 нуль — прошивка INPUT_STATE не знає. Утримувати ввід можна лише
+        # PING-ами: там ще діє «будь-який пакет доводить, що клієнт живий».
+        radio = self.make(fw_input_state=False)
+        radio.key(4, True)
+        radio.wire.clear()
+        radio.keepalive_if_due()
+
+        types = [p[0] for p in self.packets(radio)]
+        self.assertNotIn(proto.PKT_INPUT_STATE, types)
+        self.assertIn(proto.PKT_PING, types)
+        self.assertEqual(radio.holds, 1)
+
+    def test_old_firmware_stays_quiet_when_nothing_is_held(self):
+        # Утримувати нічого — значить і слати нічого. На старій прошивці частий
+        # PING лише породжував би HELLO у відповідь і нічого не лікував.
+        radio = self.make(fw_input_state=False)
+        radio.wire.clear()
+        radio.keepalive_if_due()
+
+        # PING раз на 2 с лишається, тому дивимось саме на запасний лічильник.
+        self.assertEqual(radio.holds, 0)
+
+
+class HelloInputStateBit(unittest.TestCase):
+    """Біт3 у HELLO: клієнт його читає, і підміна перемикає гілку.
+
+    Без цих тестів прапорець існував би тільки на папері — рівно те, за що
+    рецензія 0008 і зачепилась.
+    """
+
+    def hello(self, flags: int) -> bytes:
+        # Мінімальний HELLO: 13 байтів сталої частини, нуль клавіш, назва цілі
+        # й версія — порожні. Того досить, щоб parse_hello прочитав прапорці.
+        return (
+            struct.pack("<BHHBBBIB", 1, 480, 272, proto.HELLO_PIXFMT_RGB565,
+                        flags, 4, 0, 0)
+            + bytes(32)
+            + bytes(16)
+        )
+
+    def test_parse_hello_reads_the_bit(self):
+        with_bit = proto.parse_hello(self.hello(proto.HELLO_FLAG_TOUCH
+                                                | proto.HELLO_FLAG_INPUT_STATE))
+        self.assertTrue(with_bit["has_input_state"])
+        self.assertTrue(with_bit["has_touch"])
+
+        without = proto.parse_hello(self.hello(proto.HELLO_FLAG_TOUCH))
+        self.assertFalse(without["has_input_state"])
+
+    def test_hold_packet_follows_the_bit(self):
+        mirror = proto.InputMirror()
+        mirror.key(4, True)
+
+        packet, kind = proto.hold_packet(mirror, True)
+        self.assertEqual(kind, "state")
+        self.assertEqual(list(proto.Decoder().feed(packet))[0][0],
+                         proto.PKT_INPUT_STATE)
+
+        packet, kind = proto.hold_packet(mirror, False)
+        self.assertEqual(kind, "hold")
+        self.assertEqual(list(proto.Decoder().feed(packet))[0][0], proto.PKT_PING)
+
+        mirror.clear()
+        packet, _ = proto.hold_packet(mirror, False)
+        self.assertIsNone(packet)
+
+    def test_masking_the_bit_switches_the_client(self):
+        import input_check
+
+        payload = self.hello(proto.HELLO_FLAG_TOUCH | proto.HELLO_FLAG_INPUT_STATE)
+
+        radio = input_check.Radio.__new__(input_check.Radio)
+        radio.frame = object()  # щоб handle() не заводив кадр
+        radio.mask_input_state_bit = False
+        radio.handle(proto.PKT_HELLO, payload)
+        self.assertTrue(radio.fw_input_state)
+
+        radio.mask_input_state_bit = True
+        radio.handle(proto.PKT_HELLO, payload)
+        self.assertFalse(radio.fw_input_state)
+        # Підміняється байт на дроті, а не рішення клієнта: сирі прапорці
+        # мусять приїхати вже без біта.
+        self.assertEqual(radio.hello["flags"] & proto.HELLO_FLAG_INPUT_STATE, 0)
+        self.assertEqual(radio.hello["flags"] & proto.HELLO_FLAG_TOUCH,
+                         proto.HELLO_FLAG_TOUCH)
 
 
 class FakeRoot:

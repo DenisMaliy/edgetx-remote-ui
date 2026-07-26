@@ -60,8 +60,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from capture_check import Frame, write_png  # noqa: E402
 from remote_ui_proto import (  # noqa: E402
     DEFAULT_TCP_PORT,
+    HELLO_FLAG_ENCODER,
+    HELLO_FLAG_FILE_OPS,
+    HELLO_FLAG_INPUT_STATE,
+    HELLO_FLAG_TOUCH,
     INPUT_STATE_PERIOD_S,
     InputMirror,
+    hold_packet,
     PING_PERIOD_S,
     PKT_FRAME_END,
     PKT_HELLO,
@@ -89,7 +94,7 @@ class Radio:
     """З'єднання з пультом: шле дії, збирає кадри, міряє час реакції."""
 
     def __init__(self, host: str, port: int, quiet: float = 0.25,
-                 input_state: bool = True):
+                 input_state: bool = True, mask_input_state_bit: bool = False):
         self.host = host
         self.port = port
         # Скільки тиші означає «пульт домалював». Кадри в русі йдуть один за
@@ -99,7 +104,18 @@ class Radio:
         # Чи повторювати повний стан вводу. Вимикається прапорцем, щоб «до» і
         # «після» знімались тим самим виконуваним файлом і тим самим сценарієм
         # — інакше порівняння нечесне.
+        #
+        # ⚠️ Це **не те саме**, що запасний шлях для старої прошивки. Тут ми
+        # свідомо ламаємо клієнта, щоб побачити ваду; там клієнт працює
+        # правильно, просто прошивка інша. Тому й гілки різні: `--no-input-state`
+        # шле `ENC 0` (несе ввід, рівня не повторює), а запасний шлях — `PING`,
+        # як велить docs/03-protocol.md.
         self.input_state = input_state
+        self.mask_input_state_bit = mask_input_state_bit
+
+        # Заповнюється з HELLO. None — ще не вітались.
+        self.fw_input_state = None
+        self.holds = 0  # скільки разів пішов PING запасним шляхом
         self.mirror = InputMirror()
 
         self.sock = None
@@ -144,7 +160,13 @@ class Radio:
 
         if now - self.last_state >= INPUT_STATE_PERIOD_S:
             if self.input_state:
-                self.send(self.mirror.encode())
+                # Гілку вибирає прошивка своїм біт3, а не ми: при нулі йде
+                # `PING`, поки щось утримується, і нічого — коли не утримується.
+                packet, kind = hold_packet(self.mirror, bool(self.fw_input_state))
+                if packet is not None:
+                    self.send(packet)
+                    if kind == "hold":
+                        self.holds += 1
             else:
                 # ⚠️ Режим «як було до INPUT_STATE», і він мусить лишатись
                 # чесним. Просто замовкнути не можна: прошивка відпускає ввід за
@@ -216,7 +238,14 @@ class Radio:
 
     def handle(self, ptype: int, payload: bytes):
         if ptype == PKT_HELLO:
+            if self.mask_input_state_bit and len(payload) > 6:
+                # Тестова підміна: викидаємо біт3 з байта на дроті, а не з
+                # рішення клієнта. Так гілку вибирає той самий код, що й у житті.
+                payload = bytearray(payload)
+                payload[6] &= ~HELLO_FLAG_INPUT_STATE & 0xFF
+                payload = bytes(payload)
             self.hello = parse_hello(payload)
+            self.fw_input_state = self.hello["has_input_state"]
             if self.frame is None:
                 self.frame = Frame(self.hello["width"], self.hello["height"])
         elif ptype == PKT_TILE and self.frame is not None:
@@ -532,22 +561,49 @@ def main() -> int:
         action="store_true",
         help="не повторювати повний стан вводу — знімок поведінки «як було до 0008»",
     )
+    ap.add_argument(
+        "--mask-input-state-bit",
+        action="store_true",
+        help="тестова підміна: викинути біт3 з прийнятого HELLO і вдати стару "
+        "прошивку — клієнт має перейти на PING раз на 250 мс, поки щось утримується",
+    )
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
 
-    radio = Radio(args.host, args.port, input_state=not args.no_input_state)
+    radio = Radio(args.host, args.port, input_state=not args.no_input_state,
+                  mask_input_state_bit=args.mask_input_state_bit)
     radio.connect()
 
     hello = radio.hello
+    flag_names = [
+        name
+        for bit, name in (
+            (HELLO_FLAG_TOUCH, "сенсор"),
+            (HELLO_FLAG_ENCODER, "енкодер"),
+            (HELLO_FLAG_FILE_OPS, "файли"),
+            (HELLO_FLAG_INPUT_STATE, "INPUT_STATE"),
+        )
+        if hello["flags"] & bit
+    ]
+    if radio.fw_input_state:
+        hold_how = "INPUT_STATE раз на 250 мс (біт3 виставлений)"
+    else:
+        hold_how = "PING раз на 250 мс, поки щось утримується (біт3 нуль)"
+
     report = [
         f"Пульт: {hello['target']} {hello['fw']}  {hello['width']}x{hello['height']}",
         "Клавіші: " + ", ".join(f"{name}({code})" for code, name in hello["keys"]),
-        f"Повтор стану вводу: {'так, раз на 250 мс' if radio.input_state else 'ВИМКНЕНО'}",
+        f"Прапорці HELLO: 0x{hello['flags']:02X}"
+        + (f" — {', '.join(flag_names)}" if flag_names else "")
+        + (" [біт3 знято підміною]" if args.mask_input_state_bit else ""),
+        f"Утримання вводу: {hold_how if radio.input_state else 'ВИМКНЕНО (ENC 0)'}",
         "",
     ]
 
     run_steps(radio, args.steps.split(","), args.out, report)
+
+    report.append(f"PING запасним шляхом: {radio.holds}")
 
     print("\n".join(report))
     if radio.log:

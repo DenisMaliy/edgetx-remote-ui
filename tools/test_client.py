@@ -36,6 +36,9 @@ import tkinter as tk
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from remote_ui_proto import (  # noqa: E402
+    HELLO_FLAG_ENCODER,
+    HELLO_FLAG_INPUT_STATE,
+    HELLO_FLAG_TOUCH,
     HELLO_PIXFMT_RGB565,
     INPUT_STATE_PERIOD_S,
     PING_PERIOD_S,
@@ -60,13 +63,10 @@ from remote_ui_proto import (  # noqa: E402
     encode_frame,
     encode_key,
     encode_touch,
+    hold_packet,
     make_connector,
     parse_hello,
 )
-
-# Прапорці в HELLO.
-HELLO_FLAG_TOUCH = 0x01
-HELLO_FLAG_ENCODER = 0x02
 
 # --- Пікселі --------------------------------------------------------------
 
@@ -161,8 +161,12 @@ class Session:
     росте, розбір триває далі.
     """
 
-    def __init__(self, on_frame=None):
+    def __init__(self, on_frame=None, mask_input_state_bit=False):
         self.on_frame = on_frame
+        # Тестова підміна: викинути біт3 з прийнятого HELLO і тим самим вдати
+        # стару прошивку. Підмінюється саме байт на дроті, а не рішення клієнта,
+        # тому запасний шлях вибирає той самий код, що й у житті.
+        self.mask_input_state_bit = mask_input_state_bit
         self.hello = None
         self.screen = None
         self.frames = 0
@@ -183,6 +187,10 @@ class Session:
             if len(payload) < 13:
                 return  # обрізаний HELLO — читати нічого
             self.hello_count += 1
+            if self.mask_input_state_bit:
+                payload = bytearray(payload)
+                payload[6] &= ~HELLO_FLAG_INPUT_STATE & 0xFF
+                payload = bytes(payload)
             hello = parse_hello(payload)
             self.hello = hello
             # HELLO приходить на кожен PING, тобто раз на дві секунди. Кадр
@@ -485,10 +493,11 @@ class Link(threading.Thread):
 
     daemon = True
 
-    def __init__(self, connect, on_frame):
+    def __init__(self, connect, on_frame, mask_input_state_bit=False):
         super().__init__(name="remote-ui-link")
         self.connect = connect
-        self.session = Session(on_frame=on_frame)
+        self.session = Session(on_frame=on_frame,
+                               mask_input_state_bit=mask_input_state_bit)
         self.stop = threading.Event()
         # Декодувальник один на всі з'єднання: `reset()` чистить лише
         # недочитаний кадр, тому лічильники помилок не обнуляються при
@@ -505,7 +514,7 @@ class Link(threading.Thread):
         # одна, і два потоки, що пишуть у неї одночасно, рано чи пізно
         # переплетуть половинки кадрів.
         self.outbox = queue.Queue(maxsize=512)
-        self.sent = {"key": 0, "enc": 0, "touch": 0, "state": 0}
+        self.sent = {"key": 0, "enc": 0, "touch": 0, "state": 0, "hold": 0}
         self.outbox_dropped = 0
 
         # Рівень вводу, який ми періодично повторюємо пульту. Пише потік вікна,
@@ -536,6 +545,18 @@ class Link(threading.Thread):
         # Енкодера в дзеркалі немає: він накопичувальний, і рівня в нього
         # просто не існує (docs/03-protocol.md, правило 5).
         self.send(encode_enc(steps), "enc")
+
+    def _hold_packet(self, session):
+        """Обгортка над спільним `hold_packet()`: гілку вибирає біт3 у HELLO.
+
+        Поки `HELLO` не прийшов, не шлемо нічого: утримувати ще нічого, а
+        вгадувати версію прошивки — найкращий спосіб вибрати не ту гілку.
+        """
+        hello = session.hello
+        if hello is None:
+            return None, "state"
+
+        return hold_packet(self.mirror, hello["has_input_state"])
 
     def run(self):
         while not self.stop.is_set():
@@ -632,13 +653,15 @@ class Link(threading.Thread):
             # «відпущено». Лікувальний пакет надходить від клієнта, який вважає,
             # що не утримує нічого, — тому й безумовно.
             if now - last_state >= INPUT_STATE_PERIOD_S:
-                try:
-                    transport.send(self.mirror.encode())
-                except OSError as exc:
-                    self.status = f"розрив на передачі: {exc}"
-                    self.drops += 1
-                    return
-                self.sent["state"] += 1
+                packet, kind = self._hold_packet(session)
+                if packet is not None:
+                    try:
+                        transport.send(packet)
+                    except OSError as exc:
+                        self.status = f"розрив на передачі: {exc}"
+                        self.drops += 1
+                        return
+                    self.sent[kind] += 1
                 last_state = now
 
             if not refresh_sent and session.hello_count != hello_mark:
@@ -835,6 +858,7 @@ class Window:
                 f"застарілі {self.skipped}  розриви {link.drops}",
                 f"надіслано: клавіш {sent['key']:4d}  енкодер {sent['enc']:4d}  "
                 f"дотик {sent['touch']:5d}  стан {sent['state']:4d}  "
+                f"утримання {sent['hold']:4d}  "
                 f"черга не влізла {link.outbox_dropped}"
                 f"   |   {self.input.layout_text if self.input else ''}",
             )
@@ -849,6 +873,13 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Тестовий клієнт Remote UI: вікно з екраном пульта")
     add_transport_args(ap)
     ap.add_argument("--scale", type=int, default=1, help="ціле збільшення картинки")
+    ap.add_argument(
+        "--mask-input-state-bit",
+        action="store_true",
+        help="тестова підміна: викинути біт3 з прийнятого HELLO і вдати стару "
+        "прошивку — клієнт має перейти на PING раз на 250 мс, поки щось "
+        "утримується",
+    )
     args = ap.parse_args()
 
     # 5 мс, а не типові 50: цим вікном ще й керують, і кожна мілісекунда тут
@@ -856,7 +887,8 @@ def main() -> int:
     where, connect = make_connector(args, poll=0.005)
 
     window = Window(f"Remote UI — {where}", max(1, args.scale))
-    link = Link(connect, window.submit)
+    link = Link(connect, window.submit,
+                mask_input_state_bit=args.mask_input_state_bit)
     link.start()
     try:
         window.run(link)
