@@ -23,6 +23,9 @@
       "Bash(ls -la /etc/udev/rules.d/)",
       "Bash(dfu-util:*)",
       "Read(//etc/udev/rules.d/**)",
+      "Bash(gcc:*)",
+      "Bash(pgrep:*)",
+      "Bash(ps:*)",
       "WebFetch(domain:raw.githubusercontent.com)",
       "WebFetch(domain:github.com)"
     ],
