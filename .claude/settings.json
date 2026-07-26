@@ -57,9 +57,11 @@
       "Bash(grep -nE \"^\\\\*\\\\*\\\\`radio|^## [0-9]\" docs/05-hooks.md)",
       "Bash(tools/patch-revert.sh)",
       "Bash(git -C upstream/edgetx status --short --untracked-files=all)",
-      "Bash(sed -i 's/^- \\\\*\\\\*Статус:\\\\*\\\\* нова$/- **Статус:** прийнято 2026-07-26/' tasks/0005-screen-capture.md)",
       "Bash(sed -i 's#| \\\\[0005\\\\]\\(0005-screen-capture.md\\) | Захоплення екрана: гачок, RLE, транспорт | 1 | виконано |#| [0005]\\(0005-screen-capture.md\\) | Захоплення екрана: гачок, RLE, транспорт | 1 | прийнято |#' tasks/INDEX.md)",
-      "Bash(sed -i 's#^- \\\\[ \\\\] 1.4 Захоплення екрана#- [x] 1.4 Захоплення екрана#' docs/04-plan.md)"
+      "Bash(sed -i 's#^- \\\\[ \\\\] 1.4 Захоплення екрана#- [x] 1.4 Захоплення екрана#' docs/04-plan.md)",
+      "Bash(ps -eo pid,etime,pcpu,comm,args --sort=-pcpu)",
+      "Bash(ps -p 336044 -o pid=,pcpu=,stat=)",
+      "Read(//proc/336044/fd/**)"
     ],
     "deny": [
       "Bash(git push:*)",
