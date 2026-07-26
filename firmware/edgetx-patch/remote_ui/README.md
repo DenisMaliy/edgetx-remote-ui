@@ -1,7 +1,6 @@
 # `remote_ui/` — код Remote UI для EdgeTX
 
-Нижній шар протоколу: перетворення потоку байтів на пакети й назад.
-Ані картинки, ані стиснення, ані вводу тут немає — це наступні кроки плану.
+Протокол, захоплення екрана і стиснення. Вводу тут поки немає — це крок 1.6.
 
 Формат кадру описаний у [`docs/03-protocol.md`](../../../docs/03-protocol.md):
 
@@ -16,10 +15,35 @@ CRC — CRC-16/CCITT-FALSE по `TYPE + LEN + PAYLOAD` (маркер і сам C
 
 | Файл | Що в ньому |
 |---|---|
+| `remote_ui.h` | **єдине**, що бачить код EdgeTX: оголошення гачка `remoteUiOnFlush()` |
 | `crc16.h` / `crc16.cpp` | CRC-16/CCITT-FALSE, побітово, без таблиці |
 | `protocol.h` / `protocol.cpp` | константи кадру, коди пакетів, `encodeFrame()`, потоковий `Decoder` |
-| `CMakeLists.txt` | статична бібліотека для майбутнього `add_subdirectory(remote_ui)` |
+| `geometry.h` | роздільність (з `LCD_W`/`LCD_H`) і сітка плиток |
+| `rle16.h` / `rle16.cpp` | стиснення RLE16 і зворотне перетворення для тестів |
+| `tile.h` / `tile.cpp` | PAYLOAD пакета `TILE`, вибір «сире чи стиснуте» |
+| `capture.h` / `capture.cpp` | тіньовий кадр, бітова карта брудних плиток, сам гачок |
+| `hello.h` / `hello.cpp` | пакет `HELLO`: опис заліза, взятий з API EdgeTX |
+| `transport_simu.cpp` | TCP замість UART — тільки для симулятора (`#if defined(SIMU)`) |
+| `CMakeLists.txt` | дописує наші `.cpp` у список `SRC` EdgeTX |
 | `test/` | свій каркас тестів і самі тести (у прошивку не потрапляють) |
+
+## Як усе працює разом
+
+```
+LVGL -> flushLcd() -> remoteUiOnFlush()        задача menusTask, найнижчий пріоритет
+                          |  memcpy у тіньовий кадр + біти «брудна»
+                          v
+                     бітова карта плиток
+                          |
+                          |  окремий потік (у симуляторі) або задача (на пульті)
+                          v
+              captureTakeTile -> RLE16 -> encodeFrame -> TCP/UART
+```
+
+Гачок не стискає й не передає нічого: він працює в задачі, яку мікшер витісняє
+будь-коли. Черга — це бітова карта фіксованого розміру, тому переповнитись і
+мовчки загубити зміну вона не може: плитка просто лишається позначеною
+брудною.
 
 Правила, яких код дотримується:
 
@@ -29,22 +53,32 @@ CRC — CRC-16/CCITT-FALSE по `TYPE + LEN + PAYLOAD` (маркер і сам C
   Уся пам'ять або статична, або приходить ззовні викликом.
 - **Нуль специфіки пульта** — роздільність, клавіші й сенсор цього шару не
   стосуються, вони живуть у `PAYLOAD`.
-- **Усе під `REMOTE_UI`** — без цього визначення обидва `.cpp` дають порожні
+- **Усе під `REMOTE_UI`** — без цього визначення `.cpp` дають порожні
   об'єктні файли (`.text`, `.data`, `.bss` — нулі).
+
+Винятки з першого правила рівно два, обидва свідомі: `hello.cpp` питає в
+EdgeTX опис заліза (`keysGetSupported`, `keysGetLabel`, `LCD_W/LCD_H`,
+`FLAVOUR`, `VERSION`), а `geometry.h` бере з `board.h` роздільність. Це не
+залежність від внутрішньої логіки, а те саме «нуль специфіки пульта в коді»:
+числа питаються в EdgeTX, а не пишуться руками.
 
 Ціна на пульті: `sizeof(remote_ui::Decoder)` = **4120 байт** ОЗП (з них 4096 —
 буфер найбільшого `PAYLOAD`), найбільший кадр `MAX_FRAME_SIZE` = **4103 байти**.
-Декодувальник заводиться один раз статично, а не на стеку.
+Тіньовий кадр 480×272 — **261 120 байт** (на пульті це SDRAM, де вже лежать два
+кадрові буфери EdgeTX), бітова карта плиток — **20 байт**. Усе статичне.
 
 ## Як зібрати й прогнати тести
 
-З кореня репозиторію, одна команда:
+З кореня репозиторію, одна команда. Роздільність тестам задається прапорцями:
+EdgeTX тут немає, а `geometry.h` без нього не знає розміру екрана.
 
 ```sh
 cd firmware/edgetx-patch/remote_ui && mkdir -p ../../../build && \
-g++ -std=c++17 -Wall -Wextra -fsanitize=address,undefined -DREMOTE_UI -I. \
-    crc16.cpp protocol.cpp \
-    test/alloc_guard.cpp test/test_crc16.cpp test/test_protocol.cpp test/test_main.cpp \
+g++ -std=c++17 -Wall -Wextra -fsanitize=address,undefined \
+    -DREMOTE_UI -DREMOTE_UI_STANDALONE -DREMOTE_UI_LCD_W=480 -DREMOTE_UI_LCD_H=272 -I. \
+    crc16.cpp protocol.cpp rle16.cpp tile.cpp capture.cpp \
+    test/alloc_guard.cpp test/test_crc16.cpp test/test_protocol.cpp \
+    test/test_rle16.cpp test/test_capture.cpp test/test_main.cpp \
     -o ../../../build/remote_ui-tests \
 && ../../../build/remote_ui-tests
 ```
@@ -54,16 +88,18 @@ g++ -std=c++17 -Wall -Wextra -fsanitize=address,undefined -DREMOTE_UI -I. \
 
 ```sh
 cd firmware/edgetx-patch/remote_ui && mkdir -p ../../../build && \
-g++ -std=c++17 -Wall -Wextra -DREMOTE_UI -I. \
-    crc16.cpp protocol.cpp \
-    test/alloc_guard.cpp test/test_crc16.cpp test/test_protocol.cpp test/test_main.cpp \
+g++ -std=c++17 -Wall -Wextra \
+    -DREMOTE_UI -DREMOTE_UI_STANDALONE -DREMOTE_UI_LCD_W=480 -DREMOTE_UI_LCD_H=272 -I. \
+    crc16.cpp protocol.cpp rle16.cpp tile.cpp capture.cpp \
+    test/alloc_guard.cpp test/test_crc16.cpp test/test_protocol.cpp \
+    test/test_rle16.cpp test/test_capture.cpp test/test_main.cpp \
     -o ../../../build/remote_ui-tests-nosan
 ```
 
 Стан на 2026-07-26 (g++ 16.1.1, `-fsanitize=address,undefined`):
 
-- тестів — **21**, пройдено 21;
-- час прогону — **≈0.03 с** (збірка з нуля разом із прогоном — **0.94 с**);
+- тестів — **41**, пройдено 41;
+- час прогону — **≈0.03 с**;
 - код повернення — **0** (успіх), **1** — якщо провалилась хоч одна перевірка;
 - виділень динамічної пам'яті в захищених зонах — **1**, і це навмисне
   виділення в тесті `AllocGuardDetectsAllocation`, який доводить, що сторож
@@ -101,10 +137,35 @@ g++ -std=c++17 -Wall -Wextra -DREMOTE_UI -I. \
 | `OversizedLenRejectedImmediately` | `LEN` понад стелю → ресинхронізація одразу за `LEN` |
 | `RandomGarbageDoesNotCrash` | 1 МБ псевдовипадкових байтів, зерно 12345 |
 | `NoHeapAllocations`, `AllocGuardDetectsAllocation` | нуль динамічної пам'яті і доказ, що сторож працює |
+| `RleSolidBlockCollapses` | однотонна плитка 32×32 → 15 байтів замість 2048 |
+| `RleCounterStopsAt255` | серія довша за 255 ріжеться на дві пари |
+| `RleWithoutRepeatsGrows` | без повторів RLE **більший** за сире — і чесно про це каже |
+| `RleRoundTripMixedRuns` | туди-назад на суміші смуг і шуму |
+| `RleDecodeRejectsBrokenStream` | довжина не кратна 3, лічильник 0, переповнення |
+| `TileChoosesRleForFlatArea`, `TileFallsBackToRawOnNoise` | **правило «стиснуте більше за сире → шлемо сире»** |
+| `TileEdgeSizeIsHandled` | нижній ряд плиток заввишки 16, а не 32 |
+| `CaptureGridMatchesScreen` | сітка рахується з `LCD_W`/`LCD_H`, а не з констант |
+| `CaptureMarksOnlyTouchedTiles` | брудними стають рівно накриті плитки |
+| `CaptureDeliversWhatWasFlushed`, `CapturePlacesPixelsAtRightOffset` | пікселі лягають туди, куди слід, із правильним кроком рядка |
+| `CaptureClipsAreasOutsideScreen` | область за межами екрана обрізається, а не пише в чужу пам'ять |
+| `CaptureKeepsTilesDirtyWhenTransportIsSlow` | **повільний транспорт не губить змін** |
+| `CaptureDoesNotStarveOtherTiles` | одна плитка, що блимає щокадру, не заступає решту |
+| `CaptureRefusesSmallDestination` | замалий буфер — відмова, і плитка при цьому не витрачається |
 
 ## Як це підключається до EdgeTX
 
-Поки що ніяк — це «коміт A» за правилом двох комітів (`CLAUDE.md`): тільки
-нові файли, жодного рядка в чужих файлах. `CMakeLists.txt` уже готовий до
-`add_subdirectory(remote_ui)`, але сама вставка — пункт 8 з
-[`docs/05-hooks.md`](../../../docs/05-hooks.md) і окрема задача.
+Сам код у дерево EdgeTX не копіюється — туди веде symlink
+`upstream/edgetx/radio/src/remote_ui`. Тобто примірник нашого коду один, і він
+у git цього репозиторію.
+
+```sh
+tools/patch-apply.sh     # symlink + гачки з patches/hooks.patch
+tools/patch-revert.sh    # назад; після нього дерево EdgeTX чисте
+tools/patch-update.sh    # зняти правлені в upstream гачки назад у патч
+```
+
+У чужих файлах — рівно дві вставки, обидві під `REMOTE_UI`: виклик
+`remoteUiOnFlush()` на початку `flushLcd()` і підключення бібліотеки в
+`radio/src/CMakeLists.txt`. Перелік дозволених місць — пункти 5 і 8 з
+[`docs/05-hooks.md`](../../../docs/05-hooks.md); `patch-update.sh` не дасть
+знятися патчу, у якому є щось поза цим переліком.

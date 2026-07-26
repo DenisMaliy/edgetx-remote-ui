@@ -1,21 +1,31 @@
-# Remote UI — статична бібліотека з нашим кодом.
+# Remote UI — наші файли у складі збірки EdgeTX.
 #
 # Підключається з `radio/src/CMakeLists.txt` рядком `add_subdirectory(remote_ui)`
-# усередині `if(REMOTE_UI)` — це пункт 8 з docs/05-hooks.md, і робиться він
-# окремою задачею («коміт B: гачки»). Тут навмисно немає ані project(), ані
-# cmake_minimum_required(): файл призначений для включення в чуже дерево і не
-# має права переставляти чужі політики CMake.
+# усередині `if(REMOTE_UI)` — це пункт 8 з docs/05-hooks.md.
 #
-# Залежностей від EdgeTX у цих файлах немає — ані заголовків, ані типів.
-# Той самий код збирається звичайним g++ на комп'ютері (див. README.md).
+# Тут навмисно немає ані project(), ані cmake_minimum_required(): файл
+# призначений для включення в чуже дерево і не має права переставляти чужі
+# політики CMake.
+#
+# Окремої статичної бібліотеки теж немає, і це свідомо. EdgeTX збирає радіо з
+# одного списку `SRC`: із нього робиться і об'єктна бібліотека `radiolib_native`
+# для симулятора, і ціль `firmware` для пульта. Свій target довелося б
+# прилінковувати до обох, тобто чіпати чужий файл ще у двох місцях. Дописати
+# файли у вже наявний список — рівно нуль зайвих рядків у чужому коді.
+#
+# Шляхи відносні до `radio/src`, бо саме там створюються цілі.
 
-add_library(remote_ui STATIC
-  crc16.cpp
-  protocol.cpp
+set(SRC ${SRC}
+  remote_ui/capture.cpp
+  remote_ui/crc16.cpp
+  remote_ui/hello.cpp
+  remote_ui/protocol.cpp
+  remote_ui/rle16.cpp
+  remote_ui/tile.cpp
+  remote_ui/transport_simu.cpp
+  PARENT_SCOPE
 )
 
-target_include_directories(remote_ui PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-
-# Без цього визначення весь вміст .cpp вимикається і бібліотека виходить
-# порожньою — так задумано (CLAUDE.md: усе під прапорцем REMOTE_UI).
-target_compile_definitions(remote_ui PUBLIC REMOTE_UI)
+# Прапорець REMOTE_UI ставить викликач (`add_definitions(-DREMOTE_UI)` поряд із
+# `add_subdirectory`). Без нього вміст усіх наших .cpp вимикається препроцесором
+# і об'єктні файли виходять порожніми — так задумано (CLAUDE.md).

@@ -4,7 +4,7 @@
  * Ліцензія: GPLv2 (та сама, що в EdgeTX).
  */
 
-#ifdef REMOTE_UI
+#if defined(REMOTE_UI)
 
 #include "protocol.h"
 
