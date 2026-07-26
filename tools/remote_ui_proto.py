@@ -15,6 +15,9 @@
 послідовного транспорту й імпортується в момент відкриття порту.
 """
 
+import base64
+import hashlib
+import os
 import socket
 import struct
 import threading
@@ -459,6 +462,173 @@ class SerialTransport(Transport):
             pass
 
 
+class WsTransport(Transport):
+    """WebSocket до моста ESP32 — третя труба, з тим самим інтерфейсом.
+
+    Потрібна, щоб **уся наявна перевірена оснастка заговорила з мостом**:
+    `test_client.py` (вікно з екраном пульта) і будь-який новий інструмент
+    отримують міст безкоштовно, замість того щоб писати для нього окремих
+    клієнтів. На боці моста це той самий байтовий потік, що й на дроті, —
+    міст пересилає, не тлумачачи.
+
+    Клієнт WebSocket написаний тут руками, без сторонніх бібліотек: решта
+    `tools/` теж обходиться стандартною бібліотекою, а тягнути залежність
+    заради шести кілобайтів коду не варто.
+
+    ⚠️ Кадри від клієнта до сервера **обов'язково маскуються** — це вимога
+    RFC 6455, а не забаганка: без маски сервер має розірвати з'єднання.
+    """
+
+    GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+    OP_TEXT, OP_BINARY = 0x1, 0x2
+    OP_CLOSE, OP_PING, OP_PONG = 0x8, 0x9, 0xA
+
+    def __init__(self, url: str, poll: float = 0.05, connect_timeout: float = 5.0):
+        host, port, path = self._split(url)
+        self.sock = socket.create_connection((host, port), timeout=connect_timeout)
+        self.sock.settimeout(poll)
+        self.buf = bytearray()
+        self.name = f"ws {url}"
+        self._handshake(host, port, path)
+
+    @staticmethod
+    def _split(url: str):
+        rest = url.split("://", 1)[1] if "://" in url else url
+        hostport, _, path = rest.partition("/")
+        host, _, port = hostport.partition(":")
+        return host, int(port) if port else 80, "/" + path if path else "/ws"
+
+    def _handshake(self, host, port, path):
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        req = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        )
+        self.sock.sendall(req.encode("ascii"))
+
+        head = bytearray()
+        deadline = 5.0
+        while b"\r\n\r\n" not in head:
+            try:
+                chunk = self.sock.recv(1024)
+            except TimeoutError:
+                deadline -= 0.05
+                if deadline <= 0:
+                    raise RuntimeError("міст не відповів на рукостискання WebSocket")
+                continue
+            if not chunk:
+                raise RuntimeError("міст закрив з'єднання під час рукостискання")
+            head += chunk
+
+        header, _, tail = bytes(head).partition(b"\r\n\r\n")
+        text = header.decode("latin-1")
+        if "101" not in text.split("\r\n", 1)[0]:
+            raise RuntimeError(f"міст не перейшов на WebSocket: {text.splitlines()[0]}")
+
+        want = base64.b64encode(hashlib.sha1((key + self.GUID).encode()).digest()).decode()
+        if want.lower() not in text.lower():
+            raise RuntimeError("міст повернув хибний Sec-WebSocket-Accept")
+
+        self.buf += tail   # дані могли приїхати разом із відповіддю
+
+    def _frame(self, payload: bytes, opcode: int) -> bytes:
+        head = bytearray([0x80 | opcode])
+        n = len(payload)
+        if n < 126:
+            head.append(0x80 | n)
+        elif n < 65536:
+            head.append(0x80 | 126)
+            head += struct.pack(">H", n)
+        else:
+            head.append(0x80 | 127)
+            head += struct.pack(">Q", n)
+        mask = os.urandom(4)
+        head += mask
+        return bytes(head) + bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+
+    def _take(self):
+        """Вийняти з буфера один цілий кадр. Повертає (opcode, payload) або None."""
+        if len(self.buf) < 2:
+            return None
+        opcode = self.buf[0] & 0x0F
+        masked = bool(self.buf[1] & 0x80)
+        length = self.buf[1] & 0x7F
+        pos = 2
+
+        if length == 126:
+            if len(self.buf) < pos + 2:
+                return None
+            length = struct.unpack_from(">H", self.buf, pos)[0]
+            pos += 2
+        elif length == 127:
+            if len(self.buf) < pos + 8:
+                return None
+            length = struct.unpack_from(">Q", self.buf, pos)[0]
+            pos += 8
+
+        mask = None
+        if masked:
+            if len(self.buf) < pos + 4:
+                return None
+            mask = bytes(self.buf[pos:pos + 4])
+            pos += 4
+
+        if len(self.buf) < pos + length:
+            return None
+
+        payload = bytes(self.buf[pos:pos + length])
+        del self.buf[:pos + length]
+        if mask:
+            payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        return opcode, payload
+
+    def recv(self):
+        try:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                return None
+            self.buf += chunk
+        except TimeoutError:
+            pass
+        except OSError:
+            return None
+
+        out = bytearray()
+        while True:
+            got = self._take()
+            if got is None:
+                break
+            opcode, payload = got
+            if opcode == self.OP_CLOSE:
+                return None
+            if opcode == self.OP_PING:
+                try:
+                    self.sock.sendall(self._frame(payload, self.OP_PONG))
+                except OSError:
+                    return None
+            elif opcode in (self.OP_BINARY, self.OP_TEXT, 0x0):
+                out += payload
+        return bytes(out)
+
+    def send(self, data: bytes):
+        self.sock.sendall(self._frame(data, self.OP_BINARY))
+
+    def close(self):
+        try:
+            self.sock.sendall(self._frame(b"", self.OP_CLOSE))
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
 def add_transport_args(parser):
     """Прапорці вибору труби — однакові в усіх інструментах."""
     parser.add_argument(
@@ -471,6 +641,11 @@ def add_transport_args(parser):
         "--serial",
         metavar="ПРИСТРІЙ",
         help="послідовний порт замість TCP: /dev/ttyUSB0, /dev/pts/7, socket://…",
+    )
+    parser.add_argument(
+        "--ws",
+        metavar="URL",
+        help="WebSocket до моста ESP32: ws://192.168.4.1/ws",
     )
     parser.add_argument(
         "--baud", type=int, default=DEFAULT_BAUD, help="швидкість порту (типово 921600)"
@@ -488,6 +663,10 @@ def make_connector(args, poll: float = 0.05):
     після читання, тож інструмент, яким керують, просить тут малого числа, а
     той, що лише дивиться, — звичайного.
     """
+    if getattr(args, "ws", None):
+        url = args.ws
+        return f"ws {url}", lambda: WsTransport(url, poll)
+
     if args.serial:
         device, baud = args.serial, args.baud
         return f"serial {device} @ {baud}", lambda: SerialTransport(device, baud, poll)
