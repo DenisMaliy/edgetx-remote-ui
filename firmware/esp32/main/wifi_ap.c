@@ -33,12 +33,28 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         ESP_LOGI(TAG, "телефон у мережі: " MACSTR, MAC2STR(e->mac));
     } else if (id == WIFI_EVENT_AP_STADISCONNECTED) {
         const wifi_event_ap_stadisconnected_t *e = (const wifi_event_ap_stadisconnected_t *)data;
-        ESP_LOGW(TAG, "телефон вийшов з мережі: " MACSTR, MAC2STR(e->mac));
+        ESP_LOGW(TAG, "станція вийшла з мережі: " MACSTR, MAC2STR(e->mac));
 
-        /* Найшвидший із трьох способів помітити втрату — телефон сам сказав,
-         * що йде. Сторож мовчання спіймав би це за 750 мс, TCP — за десятки
-         * секунд. Ввід має бути відпущений негайно. */
-        ws_bridge_client_lost(false);
+        /* ⚠️ Подія приходить на **будь-яку** станцію, а не тільки на ту, чий
+         * сокет ми тримаємо. У мережі цілком може бути й ноутбук із
+         * відкритою `/api/stats` — саме так буде на замірах. Закрита кришка
+         * ноутбука не сміє рвати робочий сеанс телефона.
+         *
+         * Тому діємо тільки коли не лишилось **нікого**: тоді сокет, який ми
+         * тримаємо, свідомо мертвий. Проміжні випадки за 750 мс добере
+         * сторож мовчання, і це його робота, а не наша. */
+        wifi_sta_list_t stations;
+        if (esp_wifi_ap_get_sta_list(&stations) == ESP_OK && stations.num > 0) {
+            ESP_LOGI(TAG, "у мережі лишилось %d — сеанс не чіпаю", stations.num);
+            return;
+        }
+
+        /* Сокет беремо до рішення й гасимо саме його: поки ми питали список
+         * станцій, міг під'єднатися вже інший телефон. */
+        const int fd = ws_bridge_client_fd();
+        if (fd >= 0) {
+            ws_bridge_client_lost(fd, false);
+        }
     }
 }
 

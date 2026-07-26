@@ -50,6 +50,12 @@ static int s_client_fd = -1;
 /** Коли востаннє прийшов пакет із вводом, мкс. 0 — не приходив. Під `s_lock`. */
 static int64_t s_last_input_us;
 
+/** Ввід уже відпущено за мовчанням — вдруге не відпускаємо. Під `s_lock`. */
+static bool s_input_released;
+
+/** Скільки відправлень поспіль не вдалося. Пише лише `ws_tx_task`. */
+static uint32_t s_send_fails;
+
 /** Розбирач напрямку «телефон → пульт». Потрібен лише щоб бачити типи. */
 static rui_scanner_t s_client_scan;
 
@@ -66,17 +72,34 @@ bool ws_bridge_has_client(void)
     return has;
 }
 
-uint32_t ws_bridge_input_silence_ms(void)
+int ws_bridge_client_fd(void)
 {
     lock();
     const int fd = s_client_fd;
-    const int64_t last = s_last_input_us;
+    unlock();
+    return fd;
+}
+
+bool ws_bridge_release_if_silent(uint32_t silence_ms)
+{
+    /* Рішення й засувка — під одним замком: інакше між «побачив мовчання» і
+     * «відпустив» устигає під'єднатися новий телефон, і ми відпустимо його
+     * ввід. Та сама гонка, що й із сокетом, тільки тихіша. */
+    lock();
+    const bool due = (s_client_fd >= 0) && (s_last_input_us != 0) && !s_input_released &&
+                     ((esp_timer_get_time() - s_last_input_us) / 1000 > (int64_t)silence_ms);
+    if (due) {
+        s_input_released = true;
+    }
     unlock();
 
-    if (fd < 0 || last == 0) {
-        return UINT32_MAX;
+    if (!due) {
+        return false;
     }
-    return (uint32_t)((esp_timer_get_time() - last) / 1000);
+
+    /* Сокет лишається живим — телефон міг просто згасити екран. */
+    uart_link_send_input_release(true);
+    return true;
 }
 
 /**
@@ -99,6 +122,7 @@ static void client_drop(int expect_fd, bool silence, bool close_socket)
     if (mine) {
         s_client_fd = -1;
         s_last_input_us = 0;
+        s_input_released = false;
     }
     unlock();
 
@@ -117,7 +141,10 @@ static void client_drop(int expect_fd, bool silence, bool close_socket)
     }
 }
 
-void ws_bridge_client_lost(bool silence) { client_drop(-1, silence, true); }
+void ws_bridge_client_lost(int expect_fd, bool silence)
+{
+    client_drop(expect_fd, silence, true);
+}
 
 /**
  * @brief Сокет закрився сам.
@@ -141,8 +168,10 @@ static void client_attach(int fd)
     const int old = s_client_fd;
     s_client_fd = fd;
     s_last_input_us = 0;
+    s_input_released = false;
     unlock();
 
+    s_send_fails = 0;
     rui_scanner_reset(&s_client_scan);
     g_stats.clients_seen++;
 
@@ -183,15 +212,28 @@ esp_err_t ws_bridge_send(const uint8_t *data, size_t len)
 
     const esp_err_t err = httpd_ws_send_frame_async(s_server, fd, &frame);
     if (err != ESP_OK) {
+        /* ⚠️ Невдале відправлення — це **викинута пачка**, а не «телефона
+         * немає». Серед причин тут банальне переповнення вікна TCP, тобто
+         * рівно той затор, на який ухвалена плавна деградація. Розрив
+         * коштував би перепідключення й `REFRESH` на 20–40 КБ у той самий
+         * затор — і знову розриву. Вирішувати, що телефона немає, має
+         * сторож мовчання, а не черга передачі. */
         g_stats.ws_errors++;
-        ESP_LOGW(TAG, "відправлення не вдалося (%s) — вважаю телефон загубленим",
-                 esp_err_to_name(err));
-        /* Саме `fd`, а не «поточний»: доки ми відправляли, телефон міг уже
-         * змінитися, і скидати треба той сокет, на якому справді впало. */
-        client_drop(fd, false, true);
+        g_stats.send_dropped++;
+        s_send_fails++;
+
+        if (s_send_fails >= BRIDGE_WS_SEND_FAILS_MAX) {
+            ESP_LOGW(TAG, "%u відправлень поспіль не вдалося (%s) — сокет мертвий",
+                     (unsigned)s_send_fails, esp_err_to_name(err));
+            s_send_fails = 0;
+            /* Саме `fd`, а не «поточний»: доки ми відправляли, телефон міг
+             * уже змінитися, і гасити треба той сокет, на якому впало. */
+            client_drop(fd, false, true);
+        }
         return err;
     }
 
+    s_send_fails = 0;
     g_stats.ws_bytes += len;
     g_stats.ws_chunks++;
     return ESP_OK;
@@ -215,6 +257,9 @@ static void on_client_packet(void *ctx, uint8_t type, const uint8_t *frame, size
         g_stats.client_input++;
         lock();
         s_last_input_us = esp_timer_get_time();
+        /* Ввід повернувся — засувка знімається, наступне мовчання буде
+         * новим епізодом і знову дасть відпускання. */
+        s_input_released = false;
         unlock();
     }
 }
@@ -233,8 +278,17 @@ static esp_err_t ws_handler(httpd_req_t *req)
         return err;
     }
 
+    const int fd = httpd_req_to_sockfd(req);
+
     if (frame.type == HTTPD_WS_TYPE_CLOSE) {
-        ws_bridge_client_lost(false);
+        ws_bridge_client_lost(fd, false);
+        return ESP_OK;
+    }
+
+    /* ⚠️ Тільки двійкові кадри. Наш клієнт шле виключно їх; текстовий кадр
+     * означає, що на тому кінці не наш клієнт, і згодовувати його розбирачу
+     * протоколу нема сенсу. */
+    if (frame.type != HTTPD_WS_TYPE_BINARY) {
         return ESP_OK;
     }
 
@@ -247,7 +301,7 @@ static esp_err_t ws_handler(httpd_req_t *req)
          * означає, що на тому кінці не наш клієнт. */
         ESP_LOGW(TAG, "кадр від клієнта %u Б понад стелю — рву з'єднання",
                  (unsigned)frame.len);
-        ws_bridge_client_lost(false);
+        ws_bridge_client_lost(fd, false);
         return ESP_FAIL;
     }
 
@@ -330,13 +384,28 @@ static esp_err_t wifi_off_post(httpd_req_t *req)
 
 /* ------------------------------------------------------------- запуск -----*/
 
-esp_err_t ws_bridge_start(void)
+esp_err_t ws_bridge_init(void)
 {
+    /* ⚠️ Замок створюється тут, а не в `ws_bridge_start()`, і це не
+     * причісування. `esp_wifi_start()` уже здатен покликати обробник події,
+     * а той бере цей замок: у вікні між підняттям Wi-Fi і стартом сервера
+     * `xSemaphoreTake(NULL)` дав би паніку. Виглядало б це як
+     * перезавантаження моста на старті — тобто **точно як просадка живлення
+     * від кидка струму**, і шукали б у конденсаторі. */
     s_lock = xSemaphoreCreateMutex();
     if (!s_lock) {
         return ESP_ERR_NO_MEM;
     }
     rui_scanner_reset(&s_client_scan);
+    return ESP_OK;
+}
+
+esp_err_t ws_bridge_start(void)
+{
+    if (!s_lock) {
+        ESP_LOGE(TAG, "ws_bridge_init() не викликано");
+        return ESP_ERR_INVALID_STATE;
+    }
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.stack_size = 8192; /* у обробнику лежить буфер на BRIDGE_WS_RX_MAX */

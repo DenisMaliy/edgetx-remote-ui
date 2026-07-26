@@ -225,8 +225,22 @@ function cstr(buf, from, n) {
   return new TextDecoder('utf-8').decode(end < 0 ? raw : raw.subarray(0, end));
 }
 
-/** Читаємо рівно ті поля, які знаємо: решта — запас на сумісність. */
+/** Найкоротший `HELLO`, який ще має сенс: самі лічильники, без переліків. */
+const HELLO_MIN = 13;
+
+/**
+ * Читаємо рівно ті поля, які знаємо: решта — запас на сумісність.
+ *
+ * ⚠️ Обрізаний `HELLO` віддає `null`, а не половину полів. Читання за межу
+ * `DataView` кидає виняток, і той виліз би з обробника пакета — тобто
+ * побитий кадр, який мав бути просто відкинутий, зупинив би розбір усього
+ * потоку. Ширина екрана з обрізаного пакета до того ж була б випадковою.
+ *
+ * @return {object|null}
+ */
 function parseHello(p) {
+  if (p.length < HELLO_MIN) return null;
+
   const dv = new DataView(p.buffer, p.byteOffset, p.byteLength);
   const h = {
     version: dv.getUint8(0),
@@ -405,6 +419,7 @@ const RemoteUI = {
   HELLO_FLAG_TOUCH, HELLO_FLAG_ENCODER, HELLO_FLAG_FILE_OPS, HELLO_FLAG_INPUT_STATE,
   MAX_PAYLOAD, FRAME_OVERHEAD,
   PING_PERIOD_MS, PING_TIMEOUT_MS, INPUT_STATE_PERIOD_MS, LEGACY_HOLD_PERIOD_MS,
+  HELLO_MIN,
   crc16, encodeFrame, encodeKey, encodeEnc, encodeTouch, encodeTrim, encodeInputState,
   Decoder, parseHello, decodeTile, blitTile, InputMirror, holdPacket,
 };

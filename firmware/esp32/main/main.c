@@ -26,6 +26,7 @@
 #include "bridge_cfg.h"
 #include "esp_app_desc.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "framing.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/ringbuf.h"
@@ -42,6 +43,16 @@ static const char *TAG = "bridge";
  * `chunk_flush` нижче не врятує й станеться вихід за межі буфера. */
 _Static_assert(BRIDGE_WS_CHUNK_BYTES >= RUI_FRAME_MAX,
                "пачка WebSocket менша за найбільший кадр протоколу");
+
+/* Черга мусить вміщати пачку, інакше `xRingbufferSend` не прийме її ніколи —
+ * і міст мовчки відкидав би все, показуючи зростання `chunks_dropped`. */
+_Static_assert(BRIDGE_WS_RING_BYTES > BRIDGE_WS_CHUNK_BYTES,
+               "черга до Wi-Fi не вміщає навіть однієї пачки");
+
+/* Найбільший пакет від клієнта — `INPUT_STATE`, 20 Б на дроті. Якщо стеля
+ * приймання опиниться нижче, міст рватиме з'єднання на кожному пакеті. */
+_Static_assert(BRIDGE_WS_RX_MAX >= RUI_INPUT_STATE_FRAME,
+               "стеля приймання нижча за найбільший пакет від клієнта");
 
 static RingbufHandle_t s_ring;
 static rui_scanner_t s_uart_scan;
@@ -113,16 +124,35 @@ static void rx_task(void *arg)
 {
     (void)arg;
     static uint8_t rd[2048];
+    int64_t last_byte_us = esp_timer_get_time();
 
     for (;;) {
         const int n = uart_link_read(rd, sizeof(rd), 10);
+        const int64_t now = esp_timer_get_time();
+
         if (n > 0) {
+            last_byte_us = now;
             g_stats.uart_bytes += (uint32_t)n;
             rui_scanner_feed(&s_uart_scan, rd, (size_t)n, on_uart_packet, NULL);
 
             g_stats.packets_ok = s_uart_scan.packets;
             g_stats.crc_errors = s_uart_scan.crc_errors;
             g_stats.oversized = s_uart_scan.oversized;
+        } else if ((now - last_byte_us) / 1000 > BRIDGE_SILENCE_RESET_MS) {
+            /* ⚠️ Скид розбирача за тишею — обов'язок транспортного шару, і
+             * протокол кладе його саме сюди: у кадрування часу немає, воно
+             * не знає, скільки минуло між байтами.
+             *
+             * Без цього пульт, вимкнений посеред плитки, лишає розбирач
+             * назавжди застряглим у стані «дочитую вантаж» — і він з'їдає
+             * початок потоку після ввімкнення, зокрема `HELLO` для нового
+             * телефона. Замасковано повтором вітання: клієнт просто питав би
+             * знову й знову, а виглядало б це як мертвий міст. */
+            if (s_uart_scan.state != RUI_S_SYNC0) {
+                g_stats.silence_resets++;
+            }
+            rui_scanner_reset(&s_uart_scan);
+            last_byte_us = now;
         }
 
         uart_link_poll_events();
@@ -152,11 +182,17 @@ static void ws_tx_task(void *arg)
 /**
  * @brief Сторож мовчання телефона.
  *
- * Третій і найважливіший спосіб помітити втрату. Закриття сокета ловить
- * штатний вихід, подія Wi-Fi ловить вимкнений телефон, а от телефон, який
+ * Найважливіший спосіб помітити, що ввід застарів. Закриття сокета ловить
+ * штатний вихід, подія Wi-Fi ловить порожню мережу, а от телефон, який
  * просто винесли за межу зв'язку, не породжує **жодної** події: сокет із
  * боку моста лишається відкритим ще десятки секунд. Саме в цьому випадку
  * клавіша й лишилася б натиснутою.
+ *
+ * ⚠️ Сторож **відпускає ввід, але не рве сокет.** «Ввід застарів» і
+ * «телефона немає» — різні висновки, і другий йому не належить: браузер
+ * душить таймери у схованій вкладці, тож згаслий екран легко дає мовчання
+ * довше за поріг, а розрив коштував би перепідключення й повного `REFRESH`
+ * саме там, де ми міряємо затримку.
  */
 static void watchdog_task(void *arg)
 {
@@ -165,10 +201,9 @@ static void watchdog_task(void *arg)
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(BRIDGE_WATCHDOG_PERIOD_MS));
 
-        const uint32_t silence = ws_bridge_input_silence_ms();
-        if (silence != UINT32_MAX && silence > BRIDGE_CLIENT_SILENCE_MS) {
-            ESP_LOGW(TAG, "клієнт мовчить %u мс", (unsigned)silence);
-            ws_bridge_client_lost(true);
+        if (ws_bridge_release_if_silent(BRIDGE_CLIENT_SILENCE_MS)) {
+            ESP_LOGW(TAG, "клієнт мовчить понад %d мс — ввід відпущено, сокет лишаю",
+                     BRIDGE_CLIENT_SILENCE_MS);
         }
     }
 }
@@ -188,6 +223,18 @@ void app_main(void)
      * куди слати ще до того, як з'явиться перший телефон. */
     ESP_ERROR_CHECK(uart_link_init());
 
+    /* ⚠️ Перше, що міст каже пульту, — «відпусти все».
+     *
+     * Перезавантаження моста (кидок живлення, `idf.py flash`, натиснута
+     * кнопка) — це теж «втратив телефон», просто з іншого боку: пульт про
+     * той розрив не дізнався й досі тримає натиснутим те, що тримав. Один
+     * пакет на 20 байтів закриває цей випадок назавжди. */
+    uart_link_send_input_release(false);
+
+    /* Стан моста готуємо **до** підняття Wi-Fi: інакше подія в проміжку
+     * візьме ще не створений замок (знахідка рецензії). */
+    ESP_ERROR_CHECK(ws_bridge_init());
+
     rui_scanner_reset(&s_uart_scan);
     s_ring = xRingbufferCreate(BRIDGE_WS_RING_BYTES, RINGBUF_TYPE_NOSPLIT);
     if (!s_ring) {
@@ -202,9 +249,19 @@ void app_main(void)
      * ядер два. Задачі Wi-Fi і TCP/IP усе одно вищі за нас; це правильно —
      * ми не маємо права заважати їм, як і транспорт у пульті не має права
      * заважати мікшеру. */
-    xTaskCreatePinnedToCore(rx_task, "rui_rx", 4096, NULL, 12, NULL, BRIDGE_RX_CORE);
-    xTaskCreate(ws_tx_task, "rui_ws_tx", 4096, NULL, 6, NULL);
-    xTaskCreate(watchdog_task, "rui_wd", 3072, NULL, 4, NULL);
+    BaseType_t ok = pdPASS;
+    ok &= xTaskCreatePinnedToCore(rx_task, "rui_rx", 4096, NULL, 12, NULL, BRIDGE_RX_CORE);
+    ok &= xTaskCreate(ws_tx_task, "rui_ws_tx", 4096, NULL, 6, NULL);
+    ok &= xTaskCreate(watchdog_task, "rui_wd", 3072, NULL, 4, NULL);
+
+    /* ⚠️ Мовчазна відмова тут — найгірший вид відмови в цьому проєкті.
+     * Не вистачило купи на сторож — і міст працює **без головного механізму
+     * безпеки**, а в журналі стоїть «міст працює». Краще не стартувати
+     * зовсім: це видно одразу й ні на що не схоже. */
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "не вдалося створити задачі — міст без них небезпечний");
+        abort();
+    }
 
     ESP_LOGI(TAG, "міст працює");
 }

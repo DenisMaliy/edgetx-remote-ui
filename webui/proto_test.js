@@ -280,6 +280,34 @@ console.log('HELLO');
   check(!h.hasInputState, 'біт3 нуль — прошивка INPUT_STATE не знає');
 }
 
+{
+  // ⚠️ Обрізаний HELLO має віддати null, а не половину полів і не виняток:
+  // читання за межу DataView вилізло б із обробника пакета і зупинило
+  // розбір усього потоку — через кадр, який мав бути просто відкинутий.
+  for (const n of [0, 1, 12]) {
+    let threw = false, res;
+    try { res = proto.parseHello(new Uint8Array(n)); } catch (e) { threw = true; }
+    check(!threw && res === null, `HELLO на ${n} Б → null, без винятку`);
+  }
+
+  // Рівно мінімум — уже осмислений: лічильники є, переліків просто немає.
+  const min = proto.parseHello(new Uint8Array(proto.HELLO_MIN));
+  check(min !== null && min.keys.length === 0 && min.target === '',
+        'HELLO рівно на 13 Б розбирається');
+
+  // Обрізаний перелік клавіш: беремо стільки, скільки вмістилось.
+  const p = new Uint8Array(13 + 17 + 5);
+  const dv = new DataView(p.buffer);
+  dv.setUint16(1, 320, true);
+  dv.setUint16(3, 240, true);
+  dv.setUint8(12, 4);                     // обіцяє чотири клавіші
+  p.set(new TextEncoder().encode('A'), 14);
+  const h = proto.parseHello(p);
+  check(h !== null && h.keys.length === 1 && h.keys[0].name === 'A',
+        `обіцяно 4 клавіші, вмістилась 1 — узяли ${h ? h.keys.length : '?'}`);
+  check(h !== null && h.width === 320 && h.height === 240, 'розмір із обрізаного HELLO цілий');
+}
+
 // ------------------------------------------------------ дзеркало вводу -----
 
 console.log('дзеркало вводу і вибір пакета утримання');

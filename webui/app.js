@@ -17,6 +17,23 @@ const RECONNECT_MS = 1000;
 /** Як часто повторювати вітальний `PING`, доки пульт не відповів `HELLO`. */
 const GREET_RETRY_MS = 500;
 
+/* --- лікування плиток, які відкинув міст ---------------------------------
+ *
+ * ⚠️ Ухвалене «міст відкинув — клієнт потім попросить REFRESH» саме по собі
+ * не працює: ніхто не питає. `FRAME_END` доходить, клієнт показує кадр як
+ * цілісний, а пульт ту плитку більше не надішле — він шле **лише зміни**.
+ * Прямокутник зі старими пікселями лишається на екрані назавжди.
+ *
+ * Тому просимо самі, за лічильником `packets_dropped` із `/api/stats`. Але
+ * не одразу: доки екран рухається, наступні кадри однаково перемалюють те
+ * місце, а `REFRESH` на 20–40 КБ у той самий затор зробить лише гірше.
+ * Чекаємо, доки картинка **вгамується**, і придушуємо частоту — інакше
+ * `REFRESH` годуватиме сам себе.
+ */
+const BRIDGE_POLL_MS = 1000;
+const QUIET_BEFORE_REFRESH_MS = 500;
+const REFRESH_MIN_GAP_MS = 2000;
+
 // ------------------------------------------------------------- малювання ---
 
 const canvas = document.getElementById('screen');
@@ -32,6 +49,7 @@ const counters = {
   outOfBounds: 0,
   beforeHello: 0,
   frames: 0,
+  autoRefresh: 0,   // скільки разів просили REFRESH через втрати на мості
 };
 
 function resizeTo(w, h) {
@@ -80,6 +98,7 @@ function showFrame() {
   if (!frameBuf) return;
   ctx.putImageData(frameBuf, 0, 0);
   counters.frames++;
+  lastFrameAt = performance.now();
   veil(null);
 }
 
@@ -91,7 +110,14 @@ const decoder = new P.Decoder();
 const mirror = new P.InputMirror();
 
 let lastHelloAt = 0;
+let lastFrameAt = 0;
 let holdTimer = null, pingTimer = null, greetTimer = null, reconnectTimer = null;
+
+/* Стан моста: тягнеться раз на секунду й використовується і для лікування
+ * втрачених плиток, і для панелі стану — щоб не питати двічі. */
+let bridgeStats = null;
+let lastDropped = null;
+let lastRefreshAt = 0;
 
 function veil(text) {
   const el = document.getElementById('veil');
@@ -191,6 +217,7 @@ function onPacket(type, payload) {
   switch (type) {
     case P.PKT_HELLO: {
       const h = P.parseHello(payload);
+      if (!h) break;   // обрізаний HELLO — відкинути, а не вгадувати розмір
       lastHelloAt = performance.now();
 
       const first = !hello;
@@ -321,6 +348,45 @@ document.getElementById('btn-info').addEventListener('click', () => {
   updateInfo();
 });
 
+/**
+ * Опитування моста: і джерело для панелі стану, і лікування втрачених плиток.
+ *
+ * Втрату видно **тільки звідси**: пульт про неї не знає (він плитку віддав),
+ * клієнт не знає (він її не отримував і не мав чого чекати). Знає рівно міст,
+ * бо саме він її й викинув.
+ */
+async function pollBridge() {
+  try {
+    const r = await fetch('/api/stats', { cache: 'no-store' });
+    bridgeStats = await r.json();
+  } catch (e) {
+    bridgeStats = null;   // ми не за мостом, або Wi-Fi вимкнули командою
+    return;
+  }
+
+  const dropped = (bridgeStats.ws && bridgeStats.ws.packets_dropped) || 0;
+  if (lastDropped === null) { lastDropped = dropped; return; }
+
+  const grew = dropped > lastDropped;
+  lastDropped = dropped;
+  if (!grew || !hello) return;
+
+  const now = performance.now();
+
+  // Картинка ще рухається — наступні кадри перемалюють те місце самі, а
+  // REFRESH зараз лише додасть 20–40 КБ у той самий затор.
+  if (now - lastFrameAt < QUIET_BEFORE_REFRESH_MS) return;
+
+  // Придушення: інакше REFRESH породжує втрати, які породжують REFRESH.
+  if (now - lastRefreshAt < REFRESH_MIN_GAP_MS) return;
+
+  lastRefreshAt = now;
+  counters.autoRefresh++;
+  send(P.encodeFrame(P.PKT_REFRESH));
+}
+
+setInterval(pollBridge, BRIDGE_POLL_MS);
+
 async function updateInfo() {
   if (info.hidden) return;
 
@@ -334,6 +400,7 @@ async function updateInfo() {
     `  поза екраном   ${counters.outOfBounds}`,
     `  до HELLO       ${counters.beforeHello}`,
     `  кадрів         ${counters.frames}`,
+    `  REFRESH через втрати на мості  ${counters.autoRefresh}`,
   ];
 
   if (hello) {
@@ -346,11 +413,10 @@ async function updateInfo() {
   }
   lines.push('');
 
-  let bridge = 'міст — не відповів';
-  try {
-    const r = await fetch('/api/stats', { cache: 'no-store' });
-    bridge = 'міст\n' + JSON.stringify(await r.json(), null, 1);
-  } catch (e) { /* міст міг вимкнути Wi-Fi, або ми не за мостом */ }
+  // Беремо вже стягнутий стан, а не питаємо вдруге.
+  const bridge = bridgeStats
+    ? 'міст\n' + JSON.stringify(bridgeStats, null, 1)
+    : 'міст — не відповів (або ми не за мостом)';
 
   info.textContent = lines.join('\n') + bridge;
 }

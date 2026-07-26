@@ -1,33 +1,40 @@
 #!/usr/bin/env python3
 """Програмний двійник моста ESP32: HTTP + WebSocket на ПК.
 
-Робить рівно те саме, що прошивка моста, тільки на комп'ютері: віддає
-`webui/` по HTTP, приймає WebSocket на `/ws` і перекладає байти між ним і
-пультом (TCP до симулятора або послідовний порт).
+Робить те саме, що прошивка моста, тільки на комп'ютері: віддає `webui/` по
+HTTP, приймає WebSocket на `/ws` і перекладає байти між ним і пультом (TCP до
+симулятора або послідовний порт).
 
 **Навіщо це є.** Клієнт у браузері інакше можна було б перевірити тільки на
-зібраному стенді з живим ESP32 — тобто найпізніше і найдорожче. З цим
-двійником браузерний клієнт перевіряється на симуляторі EdgeTX, і на залізо
-приїжджає вже робочим. Та сама причина, з якої в проєкті існує
-`tools/test_client.py`.
+зібраному стенді з живим ESP32 — тобто найпізніше й найдорожче. З двійником
+браузерний клієнт перевіряється на симуляторі EdgeTX і приїжджає на залізо
+вже робочим. Та сама причина, з якої існує `tools/test_client.py`.
 
-⚠️ Це **інструмент розробки**, а не полегшена версія моста. Він слухає всі
-інтерфейси, бо на нього заходять з телефона в тій самій мережі, і жодного
-пароля не питає — у полі його не використовують.
+⚠️ **Двійник має право відрізнятися від моста в чому завгодно, крім
+поведінки, яку на ньому доводять.** Рецензія 2026-07-27 спіймала саме це:
+двійник стверджував, що витісняє клієнта, а насправді лишав потоки старого —
+два потоки читали один транспорт, старий клієнт далі слав ввід, обнулений
+`INPUT_STATE` при витісненні не йшов. Тобто пункт «кілька телефонів
+одночасно» на ньому **не перевірявся й не міг бути перевірений**.
 
-Поведінку, від якої залежить безпека, двійник повторює навмисно:
+Тому будова тут навмисно та сама, що в мості: **один** читач пульта на весь
+сервер (як `rx_task`), один поточний клієнт, і те саме розрізнення двох
+різних висновків:
 
-* втративши клієнта, **негайно** шле пульту обнулений `INPUT_STATE`;
-* сам `PING` не породжує — тільки пересилає те, що надіслав клієнт;
-* новий клієнт витісняє попереднього.
+| Подія | Що робить | Як у мості |
+|---|---|---|
+| сокет закрився | відпустити ввід, забути клієнта | `client_drop` |
+| витіснення новим клієнтом | відпустити ввід, вигнати старого | `client_attach` |
+| мовчання понад 750 мс | відпустити ввід, **сокет лишити** | `ws_bridge_release_if_silent` |
+
+⚠️ Це **інструмент розробки**. Він слухає всі інтерфейси, бо на нього
+заходять із телефона в тій самій мережі, і пароля не питає. У полі його не
+використовують.
 
 Приклади:
 
-    # проти симулятора EdgeTX (він слухає 127.0.0.1:7616)
-    python3 tools/webui_serve.py
-
-    # проти живого пульта через перетворювач USB-UART
-    python3 tools/webui_serve.py --serial /dev/ttyUSB0
+    python3 tools/webui_serve.py                      # проти симулятора
+    python3 tools/webui_serve.py --serial /dev/ttyUSB0  # проти живого пульта
 
 Далі відкрити http://<адреса цього ПК>:8080/ у браузері або з телефона.
 """
@@ -37,6 +44,7 @@ import base64
 import hashlib
 import json
 import os
+import socket
 import struct
 import sys
 import threading
@@ -59,10 +67,10 @@ CONTENT_TYPES = {
     ".css": "text/css; charset=utf-8",
 }
 
-# Скільки мовчання клієнта означає «телефон зник». Те саме число, що в
-# bridge_cfg.h: три пропущені періоди INPUT_STATE і менше за тайм-аут
-# відпускання в прошивці (1000 мс).
+# Те саме число, що BRIDGE_CLIENT_SILENCE_MS у мості: три пропущені періоди
+# INPUT_STATE і менше за тайм-аут відпускання в прошивці (1000 мс).
 CLIENT_SILENCE_S = 0.750
+WATCHDOG_PERIOD_S = 0.1
 
 
 class Stats:
@@ -73,7 +81,7 @@ class Stats:
         self.started = time.monotonic()
         self.d = {
             "uart_bytes": 0, "packets": 0, "tiles": 0, "frames": 0,
-            "crc_errors": 0, "oversized": 0,
+            "crc_errors": 0, "oversized": 0, "silence_resets": 0,
             "ws_bytes": 0, "ws_chunks": 0, "ws_errors": 0,
             "client_bytes": 0, "client_packets": 0, "client_input": 0,
             "clients_seen": 0, "clients_lost": 0,
@@ -83,6 +91,10 @@ class Stats:
     def bump(self, key, by=1):
         with self.lock:
             self.d[key] += by
+
+    def put(self, key, value):
+        with self.lock:
+            self.d[key] = value
 
     def snapshot(self, has_client):
         with self.lock:
@@ -95,13 +107,17 @@ class Stats:
                 "bytes": d["uart_bytes"], "packets": d["packets"], "tiles": d["tiles"],
                 "frames": d["frames"], "crc_errors": d["crc_errors"],
                 "oversized": d["oversized"], "dropped": 0,
+                "silence_resets": d["silence_resets"],
             },
             "ws": {
                 "bytes": d["ws_bytes"], "chunks": d["ws_chunks"], "errors": d["ws_errors"],
-                # Двійник нічого не відкидає: у ПК канал не вузький. Поля
-                # лишаються, щоб панель стану виглядала однаково.
+                # ⚠️ Двійник нічого не відкидає: у ПК канал не вузький, і
+                # черги перед Wi-Fi тут немає взагалі. Поля лишаються з тими
+                # самими назвами, щоб панель стану й проби виглядали однаково,
+                # але **нулі тут нічого не доводять** — втрати перевіряються
+                # на залізі.
                 "tiles_dropped": 0, "packets_dropped": 0,
-                "chunks_dropped": 0, "chunks_noclient": 0,
+                "chunks_dropped": 0, "chunks_noclient": 0, "send_dropped": 0,
             },
             "client_to_radio": {
                 "bytes": d["client_bytes"], "packets": d["client_packets"],
@@ -117,9 +133,160 @@ class Stats:
 
 STATS = Stats()
 
-# Поточний клієнт. Двійник, як і справжній міст, тримає рівно одного.
-CLIENT_LOCK = threading.Lock()
-CLIENT_ID = 0
+
+class Session:
+    """Один під'єднаний клієнт. Поточний завжди рівно один — як у мості."""
+
+    _next_id = 0
+    _id_lock = threading.Lock()
+
+    def __init__(self, sock):
+        with Session._id_lock:
+            Session._next_id += 1
+            self.id = Session._next_id
+        self.sock = sock
+        self.send_lock = threading.Lock()
+        self.stop = threading.Event()
+        self.scan = proto.Decoder()
+        self.last_input = None      # коли востаннє прийшов пакет із вводом
+        self.input_released = False  # засувка: відпускаємо раз на епізод
+
+    def send_frame(self, payload, opcode=OP_BINARY):
+        with self.send_lock:
+            self.sock.sendall(ws_encode(payload, opcode))
+
+    def kick(self):
+        """Вигнати: розбудити всі читання й закрити сокет."""
+        self.stop.set()
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+
+class Bridge:
+    """Стан двійника: пульт, поточний клієнт і те, що між ними."""
+
+    def __init__(self, radio):
+        self.radio = radio
+        self.lock = threading.Lock()
+        self.current = None
+        self.stop = threading.Event()
+
+    # --- клієнт ---------------------------------------------------------
+
+    def attach(self, session):
+        """Новий клієнт витісняє попереднього — як `client_attach` у мості."""
+        with self.lock:
+            old = self.current
+            self.current = session
+
+        STATS.bump("clients_seen")
+
+        if old is not None:
+            # ⚠️ Саме те, чого двійник не робив: справді вигнати старого і
+            # відпустити ввід. Старий міг щось утримувати, а новий заявить
+            # власний стан не пізніше ніж за 250 мс.
+            print(f"  клієнт {session.id} витісняє клієнта {old.id}")
+            old.kick()
+            STATS.bump("clients_lost")
+            self.release_input("витіснення")
+
+        print(f"  клієнт {session.id} під'єднався")
+
+    def detach(self, session, reason):
+        """Клієнт зник: забути його й відпустити ввід."""
+        with self.lock:
+            if self.current is not session:
+                return   # нас уже витіснив новіший — він і відпустив ввід
+            self.current = None
+
+        STATS.bump("clients_lost")
+        self.release_input(reason)
+        print(f"  клієнт {session.id} зник ({reason}) — ввід на пульті відпущено")
+
+    def peek(self):
+        with self.lock:
+            return self.current
+
+    # --- ввід -----------------------------------------------------------
+
+    def release_input(self, reason, silence=False):
+        """Обнулений `INPUT_STATE` — негайно, не чекаючи тайм-ауту."""
+        STATS.bump("input_releases")
+        if silence:
+            STATS.bump("silence_timeouts")
+        try:
+            self.radio.send(proto.encode_input_state(0, 0, False, 0, 0))
+        except OSError:
+            pass
+
+    # --- потоки ---------------------------------------------------------
+
+    def radio_reader(self):
+        """Один читач пульта на весь сервер — рівно як `rx_task` у мості.
+
+        ⚠️ Саме «один» тут і є виправленням: доти кожен сеанс заводив
+        власного читача, і два потоки ділили байти одного транспорту між
+        собою, породжуючи суцільні помилки CRC у клієнта.
+        """
+        decoder = proto.Decoder()
+        last_byte = time.monotonic()
+
+        while not self.stop.is_set():
+            data = self.radio.recv()
+            if data is None:
+                print("  пульт закрив канал")
+                self.stop.set()
+                break
+
+            now = time.monotonic()
+            if not data:
+                # Скид розбирача за тишею — обов'язок транспортного шару.
+                if now - last_byte > proto.SILENCE_RESET_S and decoder.buf:
+                    decoder.reset()
+                    STATS.bump("silence_resets")
+                    last_byte = now
+                continue
+
+            last_byte = now
+            STATS.bump("uart_bytes", len(data))
+            for ptype, _payload in decoder.feed(data):
+                STATS.bump("packets")
+                if ptype == proto.PKT_TILE:
+                    STATS.bump("tiles")
+                elif ptype == proto.PKT_FRAME_END:
+                    STATS.bump("frames")
+            STATS.put("crc_errors", decoder.crc_errors)
+            STATS.put("oversized", decoder.oversized)
+
+            session = self.peek()
+            if session is None:
+                continue
+            try:
+                session.send_frame(data)
+                STATS.bump("ws_bytes", len(data))
+                STATS.bump("ws_chunks")
+            except OSError:
+                STATS.bump("ws_errors")
+                self.detach(session, "розрив на передачі")
+
+    def watchdog(self):
+        """Сторож мовчання: відпускає ввід, але **не рве сокет** — як у мості."""
+        while not self.stop.wait(WATCHDOG_PERIOD_S):
+            session = self.peek()
+            if session is None:
+                continue
+            last = session.last_input
+            if last is None or session.input_released:
+                continue
+            if time.monotonic() - last > CLIENT_SILENCE_S:
+                session.input_released = True
+                self.release_input("мовчання", silence=True)
+                print(f"  клієнт {session.id} мовчить — ввід відпущено, сокет лишаю")
+
+
+BRIDGE = None   # заповнюється в main()
 
 
 def ws_encode(payload, opcode=OP_BINARY):
@@ -168,6 +335,15 @@ class Handler(BaseHTTPRequestHandler):
         if self.server.verbose:
             sys.stderr.write("  http: " + (fmt % args) + "\n")
 
+    def _json(self, obj, code=200):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     # --- звичайний HTTP --------------------------------------------------
 
     def do_GET(self):
@@ -178,18 +354,12 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/stats":
-            body = json.dumps(STATS.snapshot(CLIENT_ID != 0)).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(body)
+            self._json(STATS.snapshot(BRIDGE.peek() is not None))
             return
 
         name = "index.html" if path == "/" else path.lstrip("/")
         # Ходити вище webui/ не даємо: інструмент інструментом, а віддавати
-        # весь диск тому, хто відкрив сторінку, не треба.
+        # увесь диск тому, хто відкрив сторінку, не треба.
         full = os.path.normpath(os.path.join(WEBUI_DIR, name))
         if not full.startswith(WEBUI_DIR) or not os.path.isfile(full):
             self.send_error(404, "немає такого файлу")
@@ -197,9 +367,9 @@ class Handler(BaseHTTPRequestHandler):
 
         with open(full, "rb") as f:
             body = f.read()
-        ctype = CONTENT_TYPES.get(os.path.splitext(full)[1], "application/octet-stream")
         self.send_response(200)
-        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Type",
+                         CONTENT_TYPES.get(os.path.splitext(full)[1], "application/octet-stream"))
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
@@ -207,15 +377,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path.split("?", 1)[0] == "/api/wifi/off":
-            body = json.dumps({
-                "ok": False,
-                "note": "це програмний двійник моста — Wi-Fi тут вимикати нема чого",
-            }).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._json({"ok": False,
+                        "note": "це програмний двійник моста — Wi-Fi тут вимикати нема чого"})
             return
         self.send_error(404)
 
@@ -238,123 +401,45 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.flush()
 
-        global CLIENT_ID
-        with CLIENT_LOCK:
-            CLIENT_ID += 1
-            my_id = CLIENT_ID
-        STATS.bump("clients_seen")
-        print(f"  клієнт {my_id} під'єднався")
+        session = Session(self.connection)
+        BRIDGE.attach(session)
 
+        reason = "розрив"
         try:
-            self.pump(my_id)
+            reason = self.pump(session)
         except (OSError, struct.error):
             pass
         finally:
-            self.client_lost(my_id, silence=False)
+            BRIDGE.detach(session, reason)
 
-    def client_lost(self, my_id, silence):
-        """Втратили клієнта — негайно відпускаємо ввід на пульті."""
-        global CLIENT_ID
-        with CLIENT_LOCK:
-            if CLIENT_ID != my_id:
-                return   # нас уже витіснив новіший клієнт
-            CLIENT_ID = 0
-
-        STATS.bump("clients_lost")
-        STATS.bump("input_releases")
-        if silence:
-            STATS.bump("silence_timeouts")
-
-        # ⚠️ Та сама вимога протоколу, що й до справжнього моста: розрив має
-        # відпускати ввід за мілісекунди, а не за тайм-аутом у 1000 мс.
-        try:
-            self.server.radio.send(proto.encode_input_state(0, 0, False, 0, 0))
-        except OSError:
-            pass
-        print(f"  клієнт {my_id} зник ({'мовчання' if silence else 'розрив'}) — "
-              f"ввід на пульті відпущено")
-
-    def pump(self, my_id):
-        radio = self.server.radio
-        sock = self.connection
-        send_lock = threading.Lock()
-        stop = threading.Event()
-
-        last_input = [None]   # коли востаннє прийшов пакет із вводом
-
-        def radio_to_ws():
-            """Пульт → браузер. Двійник нічого не відкидає, лише рахує."""
-            decoder = proto.Decoder()
-            while not stop.is_set():
-                data = radio.recv()
-                if data is None:
-                    stop.set()
-                    break
-                if not data:
-                    continue
-
-                STATS.bump("uart_bytes", len(data))
-                for ptype, _payload in decoder.feed(data):
-                    STATS.bump("packets")
-                    if ptype == proto.PKT_TILE:
-                        STATS.bump("tiles")
-                    elif ptype == proto.PKT_FRAME_END:
-                        STATS.bump("frames")
-                STATS.d["crc_errors"] = decoder.crc_errors
-                STATS.d["oversized"] = decoder.oversized
-
-                try:
-                    with send_lock:
-                        sock.sendall(ws_encode(data))
-                    STATS.bump("ws_bytes", len(data))
-                    STATS.bump("ws_chunks")
-                except OSError:
-                    STATS.bump("ws_errors")
-                    stop.set()
-                    break
-
-        def watchdog():
-            """Сторож мовчання — третій спосіб помітити втрату клієнта."""
-            while not stop.wait(0.1):
-                t = last_input[0]
-                if t is not None and time.monotonic() - t > CLIENT_SILENCE_S:
-                    self.client_lost(my_id, silence=True)
-                    stop.set()
-                    try:
-                        sock.close()
-                    except OSError:
-                        pass
-                    break
-
-        threading.Thread(target=radio_to_ws, daemon=True).start()
-        threading.Thread(target=watchdog, daemon=True).start()
-
-        # Браузер → пульт. Пересилаємо як є; типи дивимось лише заради живості.
-        client_scan = proto.Decoder()
-        while not stop.is_set():
+    def pump(self, session):
+        """Браузер → пульт. Пересилаємо як є; типи дивимось лише для живості."""
+        while not session.stop.is_set():
             opcode, payload = ws_read(self.rfile)
-            if opcode is None or opcode == OP_CLOSE:
-                break
+            if opcode is None:
+                return "розрив"
+            if opcode == OP_CLOSE:
+                return "сокет закрито"
             if opcode == OP_PING:
-                with send_lock:
-                    sock.sendall(ws_encode(payload, OP_PONG))
+                session.send_frame(payload, OP_PONG)
                 continue
             if opcode not in (OP_BINARY, OP_TEXT, OP_CONT) or not payload:
                 continue
 
-            radio.send(payload)
+            BRIDGE.radio.send(payload)
             STATS.bump("client_bytes", len(payload))
 
-            for ptype, _p in client_scan.feed(payload):
+            for ptype, _p in session.scan.feed(payload):
                 STATS.bump("client_packets")
-                # ⚠️ Той самий перелік, що в прошивці й у мості: PING і
-                # REFRESH вводу не несуть і живим клієнта не роблять.
+                # ⚠️ Той самий перелік, що в прошивці й у мості: `PING` і
+                # `REFRESH` вводу не несуть і живим клієнта не роблять.
                 if ptype in (proto.PKT_KEY, proto.PKT_ENC, proto.PKT_TOUCH,
                              proto.PKT_TRIM, proto.PKT_INPUT_STATE):
                     STATS.bump("client_input")
-                    last_input[0] = time.monotonic()
+                    session.last_input = time.monotonic()
+                    session.input_released = False
 
-        stop.set()
+        return "витіснено"
 
 
 def main():
@@ -368,10 +453,17 @@ def main():
 
     desc, connect = proto.make_connector(args, poll=0.02)
     print(f"пульт: {desc}")
-    radio = connect()
+
+    global BRIDGE
+    BRIDGE = Bridge(connect())
+
+    # Перше, що двійник каже пульту, — «відпусти все»: як і міст при старті.
+    BRIDGE.release_input("старт")
+
+    threading.Thread(target=BRIDGE.radio_reader, daemon=True).start()
+    threading.Thread(target=BRIDGE.watchdog, daemon=True).start()
 
     httpd = ThreadingHTTPServer((args.bind, args.port), Handler)
-    httpd.radio = radio
     httpd.verbose = args.verbose
 
     print(f"сторінка: http://localhost:{args.port}/")
@@ -381,7 +473,8 @@ def main():
     except KeyboardInterrupt:
         print("\nзупиняюсь")
     finally:
-        radio.close()
+        BRIDGE.stop.set()
+        BRIDGE.radio.close()
 
 
 if __name__ == "__main__":

@@ -101,7 +101,7 @@ class Probe {
   onPacket(type, payload) {
     if (type === P.PKT_HELLO) {
       const h = P.parseHello(payload);
-      if (!this.hello) {
+      if (h && !this.hello) {
         this.hello = h;
         this.W = h.width; this.H = h.height;
         this.buf = new Uint8ClampedArray(h.width * h.height * 4);
@@ -357,11 +357,69 @@ async function checkSafety(hello) {
   }
 }
 
+/**
+ * Витіснення: другий телефон виганяє першого.
+ *
+ * ⚠️ Ця перевірка з'явилась через рецензію: двійник моста **стверджував**, що
+ * витісняє клієнта, а насправді лишав потоки старого — тобто пункт «кілька
+ * телефонів одночасно» ніколи не перевірявся й не міг бути перевірений.
+ * Діра була не в мості, а в доказовій базі, і це найгірший вид дірки: вона
+ * мовчить.
+ *
+ * Чому витіснення взагалі має бути: клієнт **шле ввід**, і два джерела
+ * натискань на пульт із розбитим екраном — спосіб зробити щось несподіване,
+ * не побачивши цього.
+ */
+async function checkEviction(hello) {
+  console.log('\nвитіснення: другий телефон виганяє першого');
+
+  const key = keyByName(hello, ['RTN', 'EXIT']);
+
+  const first = new Probe(wsUrl());
+  await first.open();
+  if (!await first.handshake()) { ok(false, 'перший клієнт не привітався'); return; }
+
+  // Перший щось утримує — саме це не можна лишити натиснутим.
+  first.mirror.key(key.code, true);
+  first.send(P.encodeKey(key.code, true));
+  first.send(first.mirror.encode());
+  await sleep(300);
+
+  let firstClosed = false;
+  first.ws.addEventListener('close', () => { firstClosed = true; });
+
+  const before = await stats();
+
+  const second = new Probe(wsUrl());
+  await second.open();
+  const greeted = await second.handshake();
+  await sleep(700);
+  const after = await stats();
+
+  ok(greeted, 'другий клієнт привітався й дістав HELLO');
+  ok(firstClosed, `перший клієнт вигнаний: сокет ${firstClosed ? 'закрито' : 'ЛИШИВСЯ ВІДКРИТИМ'}`);
+  ok(after.session.releases > before.session.releases,
+     `витіснення відпустило ввід: releases ${before.session.releases} → ` +
+     `${after.session.releases}`);
+
+  // І головне: після витіснення працює саме другий.
+  const framesBefore = second.frames;
+  second.send(P.encodeFrame(P.PKT_REFRESH));
+  await sleep(1200);
+  ok(second.frames > framesBefore,
+     `другий клієнт отримує кадри: +${second.frames - framesBefore}`);
+
+  first.close();
+  second.close();
+  await sleep(300);
+}
+
 async function main() {
   console.log(`проба клієнта проти ${base}`);
 
   await checkHttp();
   const hello = await checkStream();
+  if (hello) await checkEviction(hello);
   if (hello) await checkSafety(hello);
 
   console.log('\n' + (failed ? `ПОМИЛКА: невдалих перевірок ${failed}` : 'усе гаразд'));
