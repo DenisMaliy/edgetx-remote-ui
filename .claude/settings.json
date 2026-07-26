@@ -53,7 +53,13 @@
       "Bash(sed -n '/TEST\\(RandomGarbageDoesNotCrash\\)/,/^}/p' firmware/edgetx-patch/remote_ui/test/test_protocol.cpp)",
       "Bash(g++ -std=c++17 -Wall -Wextra -DREMOTE_UI -DREMOTE_UI_STANDALONE -DREMOTE_UI_LCD_W=480 -DREMOTE_UI_LCD_H=272 -I. crc16.cpp protocol.cpp rle16.cpp tile.cpp capture.cpp test/alloc_guard.cpp test/test_crc16.cpp test/test_protocol.cpp test/test_rle16.cpp test/test_capture.cpp test/test_main.cpp -o ../../../build/remote_ui-tests-nosan)",
       "Bash(echo \"код виходу компілятора: $?\")",
-      "Bash(git -C /mnt/D/Works/My/tx16s-remote-ui status --short firmware/edgetx-patch/remote_ui/test/)"
+      "Bash(git -C /mnt/D/Works/My/tx16s-remote-ui status --short firmware/edgetx-patch/remote_ui/test/)",
+      "Bash(grep -nE \"^\\\\*\\\\*\\\\`radio|^## [0-9]\" docs/05-hooks.md)",
+      "Bash(tools/patch-revert.sh)",
+      "Bash(git -C upstream/edgetx status --short --untracked-files=all)",
+      "Bash(sed -i 's/^- \\\\*\\\\*Статус:\\\\*\\\\* нова$/- **Статус:** прийнято 2026-07-26/' tasks/0005-screen-capture.md)",
+      "Bash(sed -i 's#| \\\\[0005\\\\]\\(0005-screen-capture.md\\) | Захоплення екрана: гачок, RLE, транспорт | 1 | виконано |#| [0005]\\(0005-screen-capture.md\\) | Захоплення екрана: гачок, RLE, транспорт | 1 | прийнято |#' tasks/INDEX.md)",
+      "Bash(sed -i 's#^- \\\\[ \\\\] 1.4 Захоплення екрана#- [x] 1.4 Захоплення екрана#' docs/04-plan.md)"
     ],
     "deny": [
       "Bash(git push:*)",
