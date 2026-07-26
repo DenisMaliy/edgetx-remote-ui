@@ -23,7 +23,7 @@ index a89c178..0cd7f2e 100644
    add_definitions(-DPOWER_LED_BLUE)
  endif()
 diff --git a/radio/src/gui/colorlcd/LvglWrapper.cpp b/radio/src/gui/colorlcd/LvglWrapper.cpp
-index f169abd..4541c6a 100644
+index f169abd..41a3948 100644
 --- a/radio/src/gui/colorlcd/LvglWrapper.cpp
 +++ b/radio/src/gui/colorlcd/LvglWrapper.cpp
 @@ -29,6 +29,10 @@
@@ -60,12 +60,13 @@ index f169abd..4541c6a 100644
    if(!touchPanelEventOccured()) {
      memcpy(data, &touch_data_backup, sizeof(lv_indev_data_t));
      return;
-@@ -261,6 +281,9 @@ static void rotaryDriverRead(lv_indev_drv_t *drv, lv_indev_data_t *data)
+@@ -261,6 +281,10 @@ static void rotaryDriverRead(lv_indev_drv_t *drv, lv_indev_data_t *data)
    static uint32_t lastDt = 0;
  
    rotenc_t newPos = rotaryEncoderGetValue();
 +#if defined(REMOTE_UI)
 +  newPos += remoteUiGetEncoderOffset();
++  remoteUiAddEncoderDt(&rotencDt);
 +#endif
    rotenc_t diff = newPos - prevPos;
  
