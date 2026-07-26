@@ -60,8 +60,9 @@
       "Bash(sed -i 's#| \\\\[0005\\\\]\\(0005-screen-capture.md\\) | Захоплення екрана: гачок, RLE, транспорт | 1 | виконано |#| [0005]\\(0005-screen-capture.md\\) | Захоплення екрана: гачок, RLE, транспорт | 1 | прийнято |#' tasks/INDEX.md)",
       "Bash(sed -i 's#^- \\\\[ \\\\] 1.4 Захоплення екрана#- [x] 1.4 Захоплення екрана#' docs/04-plan.md)",
       "Bash(ps -eo pid,etime,pcpu,comm,args --sort=-pcpu)",
-      "Bash(ps -p 336044 -o pid=,pcpu=,stat=)",
-      "Read(//proc/336044/fd/**)"
+      "Bash(git -C upstream/edgetx diff --stat)",
+      "Bash(g++ -std=c++17 -Wall -Wextra -fsanitize=address,undefined -DREMOTE_UI -DREMOTE_UI_STANDALONE -DREMOTE_UI_LCD_W=480 -DREMOTE_UI_LCD_H=272 -I. crc16.cpp protocol.cpp rle16.cpp tile.cpp capture.cpp input.cpp test/alloc_guard.cpp test/test_crc16.cpp test/test_protocol.cpp test/test_rle16.cpp test/test_capture.cpp test/test_input.cpp test/test_main.cpp -o ../../../build/remote_ui-tests)",
+      "Bash(python3 tools/proto_test.py)"
     ],
     "deny": [
       "Bash(git push:*)",
