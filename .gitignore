@@ -22,3 +22,7 @@ firmware/esp32/sdkconfig
 firmware/esp32/sdkconfig.c3
 firmware/esp32/sdkconfig.old
 firmware/esp32/sdkconfig.c3.old
+
+# Пінований компілятор для прошивки пульта (tools/setup-toolchain.sh)
+# — ~150 МБ, тягнеться з ARM щоразу наново, у git їм не місце
+toolchain/
