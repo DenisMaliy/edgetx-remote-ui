@@ -56,27 +56,60 @@ SETTLE_S = 1.5
 
 
 class Link:
-    """Сеанс із пультом: тримає ввід живим і рахує, що прийшло."""
+    """Сеанс із пультом: тримає ввід живим і рахує, що прийшло.
 
-    def __init__(self, device: str, baud: int, verbose: bool):
+    Дві труби, той самий протокол.
+
+    **Дріт** (`--device`): інструмент сам грає роль моста й сам вирішує, чи
+    переходити на нову швидкість. Дає всі три досліди.
+
+    **Міст через WebSocket** (`--ws`): у ролі моста — справжній міст. Він про
+    `BAUD_SET` ще не знає й пересилає потік клієнта не тлумачачи, тобто на нову
+    швидкість не перейде **ніколи**.
+
+    ⚠️ Це не обмеження, а найкращий доступний дослід `betray`: міст, який не
+    перемикається, тут не імітований інструментом, а справжній. Заразом
+    доказом стає те, що видно людині без приладів, — картинка в застосунку
+    завмирає й оживає сама.
+    """
+
+    def __init__(self, device: str | None, ws: str | None, baud: int, verbose: bool):
         self.device = device
+        self.ws = ws
         self.verbose = verbose
         self.dec = proto.Decoder()
-        self.tr = proto.SerialTransport(device, baud=baud)
         self.last_input = 0.0
         self.baud = baud
+        self.tr = self._open(baud)
+
+    def _open(self, baud: int):
+        if self.ws:
+            return proto.WsTransport(self.ws)
+        return proto.SerialTransport(self.device, baud=baud)
+
+    @property
+    def over_bridge(self) -> bool:
+        return self.ws is not None
 
     def close(self):
         self.tr.close()
 
     def reopen(self, baud: int):
-        """Закрити й відкрити порт наново — так виглядає перезавантажений міст."""
+        """Закрити й відкрити трубу наново — так виглядає перезавантажений міст."""
         self.tr.close()
         self.dec.reset()
-        self.tr = proto.SerialTransport(self.device, baud=baud)
+        self.tr = self._open(baud)
         self.baud = baud
 
     def set_baudrate(self, baud: int):
+        # Через міст своєї швидкості в нас немає: нею володіє міст, а він про
+        # перемикання ще не знає. Мовчазне ігнорування тут було б брехнею —
+        # дослід `follow` через міст неможливий, і про це сказано вголос.
+        if self.over_bridge:
+            raise RuntimeError(
+                "через міст перемкнути свій бік неможливо: швидкістю дроту "
+                "володіє міст. Дослід follow вимагає --device."
+            )
         self.tr.set_baudrate(baud)
         self.dec.reset()
         self.baud = baud
@@ -161,10 +194,15 @@ def run(args) -> int:
     home = args.home
     target = args.to
 
-    print(f"Пульт: {args.device}, домашня швидкість {home} бод")
-    print(f"Дослід: {args.mode}, ціль {target} бод\n")
+    where = f"міст {args.ws}" if args.ws else f"дріт {args.device}"
+    print(f"Пульт через: {where}, домашня швидкість {home} бод")
+    print(f"Дослід: {args.mode}, ціль {target} бод")
+    if args.ws:
+        print("⚠️ Через міст: на нову швидкість не переходить НІХТО, крім пульта.")
+        print("   Саме тому це найчесніший betray — міст справжній, не вдаваний.")
+    print()
 
-    link = Link(args.device, home, args.verbose)
+    link = Link(args.device, args.ws, home, args.verbose)
     try:
         # --- Крок 0. Переконатись, що канал узагалі живий ---------------------
         #
@@ -242,35 +280,58 @@ def run(args) -> int:
         #
         # Від цієї миті рахуємо час до першого валідного кадру. Усе, що прийде
         # раніше за відкат, — сміття з чужої швидкості, і CRC його не пропустить.
-        print(f"\n[3] чекаю повернення (стеля {RECOVERY_LIMIT_S} с)…")
-        started = time.monotonic()
+        print(f"\n[3] стежу за потоком {RECOVERY_LIMIT_S} с і шукаю провал…")
 
-        first_ms = None
+        # ⚠️ Міряємо не «час до першого кадру», а **найдовший провал у потоці**.
+        #
+        # Наївний вимір «від підтвердження до наступного валідного кадру» тут
+        # бреше, і особливо через міст: пульт перемикається не в мить
+        # підтвердження, а на кілька мілісекунд пізніше, і всі ці мілісекунди
+        # кадри ще законно йдуть. Інструмент побачив би «повернувся за 3 мс» і
+        # оголосив, що перемикання не сталося.
+        #
+        # Провал у потоці — це і є сліпий проміжок, і він у тому самому місці,
+        # де його міряє сам пульт: від запису дільника до першого почутого
+        # кадру. Заразом він не залежить від того, скільки труб між нами.
+        stamps = []
         revert_report = None
+        started = time.monotonic()
 
         try:
             for ptype, payload in link.pump(RECOVERY_LIMIT_S):
-                if first_ms is None:
-                    first_ms = (time.monotonic() - started) * 1000.0
-                    print(f"  ✓ ЗВ'ЯЗОК ВІДНОВЛЕНО за {first_ms:.0f} мс (пакет 0x{ptype:02X})")
-
+                stamps.append((time.monotonic() - started, ptype))
                 if ptype == proto.PKT_BAUD:
                     rep2 = proto.parse_baud(payload)
                     if rep2 and rep2["verdict"] == proto.BAUD_REVERTED:
                         revert_report = rep2
-                        break
         except RuntimeError as exc:
             print(f"  ✗ {exc}")
             return 1
 
-        if first_ms is None:
-            print(f"  ✗ ПУЛЬТ НЕ ПОВЕРНУВСЯ за {RECOVERY_LIMIT_S} с.")
+        if not stamps:
+            print(f"  ✗ ПУЛЬТ НЕ ПОВЕРНУВСЯ: жодного валідного кадру за {RECOVERY_LIMIT_S} с.")
             print("    Це блокер: запобіжник не працює, і пульт лишився німим.")
             return 1
 
+        # Найбільший проміжок між сусідніми кадрами, з нуля включно.
+        gap_ms, gap_at = stamps[0][0] * 1000.0, 0.0
+        for (t_prev, _), (t_now, _) in zip(stamps, stamps[1:]):
+            if (t_now - t_prev) * 1000.0 > gap_ms:
+                gap_ms, gap_at = (t_now - t_prev) * 1000.0, t_prev
+
+        after = [t for t, _ in stamps if t > gap_at + gap_ms / 1000.0 - 1e-9]
+        print(f"  кадрів за вікно: {len(stamps)}, після провалу: {len(after)}")
+        print(f"  ✓ НАЙДОВШИЙ ПРОВАЛ: {gap_ms:.0f} мс, почався на {gap_at * 1000:.0f} мс")
+
+        if len(after) < 2:
+            print("  ✗ після провалу потік не відновився — пульт не повернувся.")
+            return 1
+
+        first_ms = gap_ms
+
         # --- Крок 4. Що з цього випливає --------------------------------------
         print("\n[4] підсумок:")
-        print(f"    зв'язок відновлено за:  {first_ms:.0f} мс")
+        print(f"    провал у потоці:        {first_ms:.0f} мс")
         print(f"    вікно повернення:       {rep['revert_window_ms']} мс")
 
         if revert_report is not None:
@@ -304,7 +365,9 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    ap.add_argument("--device", required=True, help="послідовний порт до пульта")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--device", help="послідовний порт до пульта (перетворювач USB-UART на AUX1)")
+    src.add_argument("--ws", help="WebSocket до моста, напр. ws://192.168.4.1/ws")
     ap.add_argument(
         "--mode",
         choices=("follow", "betray", "reboot"),
