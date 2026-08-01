@@ -659,6 +659,10 @@ function sendTouch(event, pt) {
 let pointerId = null;
 
 canvas.addEventListener('pointerdown', (ev) => {
+  // ⚠️ Тільки основна кнопка. Палець і стилус дають `button === 0` так само,
+  // як ліва кнопка миші, а права зайнята клавішею «назад» — без цієї умови
+  // вона слала б у пульт ще й дотик у ту саму точку.
+  if (ev.button !== 0) return;
   if (pointerId !== null) return;         // один палець: пульт другого не знає
   if (hello && !hello.hasTouch) return;   // сенсора немає — клавіші дасть етап 3
   pointerId = ev.pointerId;
@@ -674,6 +678,9 @@ canvas.addEventListener('pointermove', (ev) => {
 });
 
 function endTouch(ev) {
+  // Мишу браузер віддає одним `pointerId` на всі кнопки, тож без перевірки
+  // відпускання правої закривало б дотик, початий лівою.
+  if (ev.button !== 0 && ev.type === 'pointerup') return;
   if (ev.pointerId !== pointerId) return;
   sendTouch(P.TOUCH_UP, toRadio(ev));
   pointerId = null;
@@ -683,12 +690,108 @@ function endTouch(ev) {
 canvas.addEventListener('pointerup', endTouch);
 canvas.addEventListener('pointercancel', endTouch);
 
-/* Вкладку сховали або телефон заблокували — палець на екрані лишатись не має. */
+/* --- Права кнопка миші як «назад» ------------------------------------------
+ *
+ * ⚠️ Код клавіші **не вписаний числом**: правило проєкту — специфіки
+ * конкретного пульта в коді нуль рядків. Клавіша шукається за міткою, яку
+ * пульт сам назвав у `HELLO` (`keysGetLabel`). На TX16S це `RTN`, на інших
+ * цілях мітка може бути інша — тому перелік, а не одне слово.
+ *
+ * Не знайшлась — кнопка просто нічого не робить: вигадувати код навмання
+ * означало б натиснути на чужому пульті випадкову клавішу.
+ */
+const BACK_KEY_LABELS = ['RTN', 'EXIT'];
+
+function backKeyCode() {
+  if (!hello) return null;
+  const k = hello.keys.find((k) => BACK_KEY_LABELS.includes(k.name));
+  return k ? k.code : null;
+}
+
+function sendBack(pressed) {
+  const code = backKeyCode();
+  if (code === null) return;
+  mirror.key(code, pressed);       // рівень — інакше повтор стану її «відпустить»
+  send(P.encodeKey(code, pressed));
+}
+
+canvas.addEventListener('pointerdown', (ev) => {
+  if (ev.button !== 2) return;
+  sendBack(true);
+  ev.preventDefault();
+});
+
+function releaseBack(ev) {
+  if (ev.button !== 2) return;
+  sendBack(false);
+  ev.preventDefault();
+}
+
+canvas.addEventListener('pointerup', releaseBack);
+canvas.addEventListener('pointercancel', releaseBack);
+
+/* Меню правої кнопки над картинкою тільки заважає: клавіша пульта тут
+ * важливіша за пункт «зберегти зображення». */
+canvas.addEventListener('contextmenu', (ev) => ev.preventDefault());
+
+/* --- Колесо миші як енкодер ------------------------------------------------
+ *
+ * Напрямок узгоджений із клієнтом ПК (`tools/test_client.py:642`): колесо вниз
+ * — це `+1`, вгору — `-1`. Розійтись тут не можна, бо людина ганяє те саме
+ * меню то з вікна ПК, то з браузера.
+ *
+ * ⚠️ **Одна подія колеса = рівно одне клацання, хоч би що казала `deltaY`.**
+ * Це не спрощення, а виправлення: величина `deltaY` **не** означає кількості
+ * зарубок і в різних браузерах різна за побудовою — Firefox шле `deltaMode`
+ * «рядки» з `deltaY = 3`, Chrome — «пікселі» з `deltaY ≈ 100`. Переклад
+ * «стільки одиниць — стільки клацань» перетворював одну зарубку на два-три
+ * клацання в одному пакеті, і меню стрибало через пункти.
+ *
+ * Накопичення лишилось **тільки для тачпада**: він сипле десятками дрібних
+ * дельт на один рух пальцем, і там одна подія клацанням бути не може.
+ *
+ * Енкодер лишається **накопичувальним приростом**, а не рівнем, і в повтор
+ * стану (`INPUT_STATE`) не входить — записане рішення від 2026-07-26: втрата
+ * клацання коштує клацання, а рівень дав би фантомний оберт назад. */
+const WHEEL_NOTCH_PX = 25;   // від цього модуля дельта вважається зарубкою
+const WHEEL_TRACKPAD_PX = 40;  // скільки дрібних пікселів складають клацання
+
+let wheelAcc = 0;
+
+canvas.addEventListener('wheel', (ev) => {
+  if (hello && !hello.hasEncoder) return;
+  ev.preventDefault();          // інакше сторінка поїде під картинкою
+
+  const dir = Math.sign(ev.deltaY);
+  if (!dir) return;
+
+  // deltaMode 1/2 — рядки й сторінки: вже дискретні, це зарубка.
+  // deltaMode 0 з великим модулем — класичне колесо, теж зарубка.
+  if (ev.deltaMode !== 0 || Math.abs(ev.deltaY) >= WHEEL_NOTCH_PX) {
+    wheelAcc = 0;               // зарубка перебиває недобрані пікселі тачпада
+    send(P.encodeEnc(dir));
+    return;
+  }
+
+  // Дрібні дельти — тачпад. Тільки тут має сенс складати.
+  wheelAcc += ev.deltaY;
+  if (Math.abs(wheelAcc) >= WHEEL_TRACKPAD_PX) {
+    wheelAcc -= Math.sign(wheelAcc) * WHEEL_TRACKPAD_PX;
+    send(P.encodeEnc(Math.sign(ev.deltaY)));
+  }
+}, { passive: false });
+
+/* Вкладку сховали або телефон заблокували — палець на екрані лишатись не має.
+ * Те саме стосується правої кнопки: `pointerup` над схованою вкладкою може не
+ * прийти зовсім, а утримана клавіша пульта — це вже не косметика. */
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden && mirror.down) {
+  if (!document.hidden) return;
+  if (mirror.down) {
     sendTouch(P.TOUCH_UP, { x: mirror.x, y: mirror.y });
     pointerId = null;
   }
+  const back = backKeyCode();
+  if (back !== null && (mirror.keys & (1 << back))) sendBack(false);
 });
 
 // ------------------------------------------------------------- керування ---
