@@ -53,7 +53,7 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
          * станцій, міг під'єднатися вже інший телефон. */
         const int fd = ws_bridge_client_fd();
         if (fd >= 0) {
-            ws_bridge_client_lost(fd, false);
+            ws_bridge_client_lost(fd, BRIDGE_LOST_WIFI);
         }
     }
 }

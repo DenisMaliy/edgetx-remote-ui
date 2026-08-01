@@ -83,7 +83,7 @@ int uart_link_write(const uint8_t *data, size_t len)
     return uart_write_bytes(BRIDGE_UART_PORT, data, len);
 }
 
-void uart_link_send_input_release(bool silence)
+void uart_link_send_input_release(bridge_lost_t reason)
 {
     uint8_t frame[RUI_INPUT_STATE_FRAME];
     const size_t n = rui_build_input_state_zero(frame);
@@ -91,10 +91,20 @@ void uart_link_send_input_release(bool silence)
     uart_link_write(frame, n);
 
     g_stats.input_releases++;
-    if (silence) {
+    if (reason == BRIDGE_LOST_SILENCE) {
         g_stats.silence_timeout++;
     }
 
-    ESP_LOGW(TAG, "телефон зник (%s) — відпускаю ввід на пульті",
-             silence ? "мовчання" : "розрив");
+    /* Три різні події — три різні рядки. Раніше всі троє друкувались як
+     * «телефон зник», і чистий старт моста повідомляв про розрив, якого не
+     * було: телефона не існувало жодного разу. */
+    if (reason == BRIDGE_LOST_BOOT) {
+        ESP_LOGI(TAG, "старт: відпускаю ввід на пульті — він міг лишитись натиснутим "
+                      "від сеансу до перезавантаження моста");
+    } else if (reason == BRIDGE_LOST_SILENCE) {
+        ESP_LOGW(TAG, "ввід застарів (мовчання клієнта) — відпускаю на пульті, сокет лишаю");
+    } else {
+        ESP_LOGW(TAG, "телефон зник (%s) — відпускаю ввід на пульті",
+                 bridge_lost_name(reason));
+    }
 }

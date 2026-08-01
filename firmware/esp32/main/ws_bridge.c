@@ -56,11 +56,75 @@ static bool s_input_released;
 /** Скільки відправлень поспіль не вдалося. Пише лише `ws_tx_task`. */
 static uint32_t s_send_fails;
 
+/**
+ * Скільки було `ws_errors` у мить під'єднання цього телефона.
+ *
+ * Потрібно рівно для одного висновку: сокет помер **мовчки**. Якщо `close_fn`
+ * спрацював, а лічильник помилок за весь сеанс не зрушив, то міст не робив
+ * нічого — сеанс помер піді мною. Саме цей випадок у задачі 0012 не мав
+ * жодної ознаки, і причину шукали б у живленні.
+ */
+static uint32_t s_errors_at_attach;
+
 /** Розбирач напрямку «телефон → пульт». Потрібен лише щоб бачити типи. */
 static rui_scanner_t s_client_scan;
 
 static inline void lock(void) { xSemaphoreTake(s_lock, portMAX_DELAY); }
 static inline void unlock(void) { xSemaphoreGive(s_lock); }
+
+/* ------------------------------------------------- биття задачі вводу -----*/
+
+/** Коли задача сервера востаннє прокидалась на наше биття, мкс. */
+static int64_t s_hb_last_us;
+
+/**
+ * @brief Виконується **в задачі сервера httpd** — саме в тій, що чує ввід.
+ *
+ * Нічого не робить, крім позначки часу. Уся цінність у тому, **коли** вона
+ * виконалась: різниця між двома позначками — це затримка планування задачі,
+ * яка розбирає пакети телефона.
+ */
+static void hb_work(void *arg)
+{
+    (void)arg;
+    const int64_t now = esp_timer_get_time();
+
+    if (s_hb_last_us != 0) {
+        const uint32_t dt = (uint32_t)((now - s_hb_last_us) / 1000);
+        if (dt > g_stats.beat_interval_max_ms) {
+            g_stats.beat_interval_max_ms = dt;
+        }
+    }
+    s_hb_last_us = now;
+    g_stats.hb_beats++;
+}
+
+void ws_bridge_heartbeat(void)
+{
+    if (!s_server) {
+        return;
+    }
+
+    /* ⚠️ Виклик **не безкоштовний і не миттєвий**, хоч і зветься чергою.
+     * `httpd_queue_work()` шле дейтаграму на керівний сокет, а без
+     * `CONFIG_LWIP_TCPIP_CORE_LOCKING` lwIP кладе її в чергу задачі tcpip і
+     * чекає на семафорі, доки та виконає. Тобто `rx_task`, про яку сказано
+     * «не має права чекати», десять разів на секунду таки чекає на
+     * мережевому стеку.
+     *
+     * Зараз це поглинається: пріоритет tcpip (18) вищий за наш, а приймальне
+     * кільце UART тримає ~178 мс потоку на 921600. ⚠️ **На 2 Мбод запас падає
+     * удвічі**, а прилад планують лишити саме для того переходу — тоді це
+     * треба переміряти, а не припустити.
+     *
+     * `CONFIG_HTTPD_QUEUE_WORK_BLOCKING` мусить лишатись вимкненим
+     * (закріплено в `sdkconfig.defaults`): з ним семафор віддається лише
+     * **після** виконання роботи в задачі httpd, тобто приймання UART
+     * зупинялося б рівно на той час, який ми міряємо. */
+    if (httpd_queue_work(s_server, hb_work, NULL) != ESP_OK) {
+        g_stats.hb_queue_full++;
+    }
+}
 
 /* ------------------------------------------------------ стан з'єднання ----*/
 
@@ -98,7 +162,7 @@ bool ws_bridge_release_if_silent(uint32_t silence_ms)
     }
 
     /* Сокет лишається живим — телефон міг просто згасити екран. */
-    uart_link_send_input_release(true);
+    uart_link_send_input_release(BRIDGE_LOST_SILENCE);
     return true;
 }
 
@@ -114,7 +178,7 @@ bool ws_bridge_release_if_silent(uint32_t silence_ms)
  * ставав би «загубленим», сторінка на ньому завмирала б, а причину шукали б
  * у Wi-Fi.
  */
-static void client_drop(int expect_fd, bool silence, bool close_socket)
+static void client_drop(int expect_fd, bridge_lost_t reason, bool close_socket)
 {
     lock();
     const int fd = s_client_fd;
@@ -132,18 +196,43 @@ static void client_drop(int expect_fd, bool silence, bool close_socket)
 
     g_stats.clients_lost++;
 
+    /* Називаємо причину. Сума цих шести дорівнює `clients_lost` — розбіжність
+     * означала б шлях втрати, про який ми не знаємо. */
+    switch (reason) {
+    case BRIDGE_LOST_EVICTED:   g_stats.lost_evicted++; break;
+    case BRIDGE_LOST_SEND_FAIL: g_stats.lost_send_fail++; break;
+    case BRIDGE_LOST_OVERSIZED: g_stats.lost_oversized++; break;
+    case BRIDGE_LOST_WS_CLOSE:  g_stats.lost_ws_close++; break;
+    case BRIDGE_LOST_WIFI:
+        g_stats.lost_wifi++;
+        break;
+    case BRIDGE_LOST_SOCKET:
+        g_stats.lost_socket++;
+        /* ⚠️ Той самий випадок, що в 0012 не мав жодної ознаки: сокет помер, а
+         * міст за весь сеанс не мав **жодної** невдачі відправлення. Отже це
+         * не затор і не наша дія — сеанс помер піді мною. */
+        if (g_stats.ws_errors == s_errors_at_attach) {
+            g_stats.lost_socket_silent++;
+        }
+        break;
+    case BRIDGE_LOST_BOOT:
+    case BRIDGE_LOST_SILENCE:
+        /* Сюди не потрапляють: старт не має сеансу, а сторож сокет не рве. */
+        break;
+    }
+
     /* ⚠️ Найважливіші два рядки в усьому мості. Пульт відпускає ввід сам лише
      * через 1000 мс тиші; ми зобов'язані зробити це негайно. */
-    uart_link_send_input_release(silence);
+    uart_link_send_input_release(reason);
 
     if (close_socket && s_server) {
         httpd_sess_trigger_close(s_server, fd);
     }
 }
 
-void ws_bridge_client_lost(int expect_fd, bool silence)
+void ws_bridge_client_lost(int expect_fd, bridge_lost_t reason)
 {
-    client_drop(expect_fd, silence, true);
+    client_drop(expect_fd, reason, true);
 }
 
 /**
@@ -158,7 +247,7 @@ static void on_sock_close(httpd_handle_t hd, int sockfd)
 
     /* Сокет уже закривається сам — нам лишається скинути стан і відпустити
      * ввід, і то лише якщо телефоном був саме цей сокет. */
-    client_drop(sockfd, false, false);
+    client_drop(sockfd, BRIDGE_LOST_SOCKET, false);
     close(sockfd);
 }
 
@@ -172,6 +261,7 @@ static void client_attach(int fd)
     unlock();
 
     s_send_fails = 0;
+    s_errors_at_attach = g_stats.ws_errors;
     rui_scanner_reset(&s_client_scan);
     g_stats.clients_seen++;
 
@@ -180,8 +270,9 @@ static void client_attach(int fd)
          * утримувати, а новий заявить власний стан не пізніше ніж за 250 мс
          * (docs/03-protocol.md, INPUT_STATE — рівень, а не перехід). */
         ESP_LOGW(TAG, "новий телефон витісняє попередній (сокет %d → %d)", old, fd);
-        uart_link_send_input_release(false);
+        uart_link_send_input_release(BRIDGE_LOST_EVICTED);
         g_stats.clients_lost++;
+        g_stats.lost_evicted++;
         if (s_server) {
             httpd_sess_trigger_close(s_server, old);
         }
@@ -228,7 +319,7 @@ esp_err_t ws_bridge_send(const uint8_t *data, size_t len)
             s_send_fails = 0;
             /* Саме `fd`, а не «поточний»: доки ми відправляли, телефон міг
              * уже змінитися, і гасити треба той сокет, на якому впало. */
-            client_drop(fd, false, true);
+            client_drop(fd, BRIDGE_LOST_SEND_FAIL, true);
         }
         return err;
     }
@@ -253,14 +344,50 @@ static void on_client_packet(void *ctx, uint8_t type, const uint8_t *frame, size
      * `REFRESH` — ні, і це те саме правило, що діє в прошивці пульта. Інакше
      * достатньо було б, щоб телефон лишався «живим» на самих лише пінгах,
      * тримаючи натиснутою клавішу, яку вже ніхто не відпустить. */
-    if (rui_carries_input(type)) {
-        g_stats.client_input++;
-        lock();
-        s_last_input_us = esp_timer_get_time();
-        /* Ввід повернувся — засувка знімається, наступне мовчання буде
-         * новим епізодом і знову дасть відпускання. */
-        s_input_released = false;
-        unlock();
+    if (!rui_carries_input(type)) {
+        return;
+    }
+
+    g_stats.client_input++;
+
+    lock();
+    const int64_t now = esp_timer_get_time();
+    const int64_t prev = s_last_input_us;
+    /* Чи це перший пакет після того, як сторож відпустив ввід. Знімаємо
+     * засувку тут-таки: наступне мовчання буде новим епізодом. */
+    const bool after_release = s_input_released;
+    s_last_input_us = now;
+    s_input_released = false;
+    unlock();
+
+    if (prev == 0) {
+        return; /* перший пакет сеансу — паузи ще немає */
+    }
+
+    /* ⚠️ Це і є прилад для питання «чому сторож спрацював посеред живої
+     * сесії». Пауза міряється тут, тобто в момент, коли пакет **розібрала
+     * задача httpd**. Якщо клієнт стверджує, що слав рівно раз на 250 мс, а
+     * тут стоїть 900 — час загубився між ними, і шукати треба в мережі або в
+     * мості. Якщо обидва боки кажуть 900 — не слав і клієнт. */
+    const uint32_t gap = (uint32_t)((now - prev) / 1000);
+
+    if (gap > g_stats.gap_max_ms) {
+        g_stats.gap_max_ms = gap;
+    }
+    if (gap <= 300) {
+        g_stats.gap_le_300++;
+    } else if (gap <= 500) {
+        g_stats.gap_le_500++;
+    } else if (gap <= BRIDGE_CLIENT_SILENCE_MS) {
+        g_stats.gap_le_750++;
+    } else {
+        g_stats.gap_over++;
+    }
+
+    if (after_release) {
+        /* Тільки тепер пауза, що спричинила відпускання, відома цілком:
+         * сторож знав про неї лише «більше за поріг». */
+        g_stats.gap_after_release_ms = gap;
     }
 }
 
@@ -281,7 +408,7 @@ static esp_err_t ws_handler(httpd_req_t *req)
     const int fd = httpd_req_to_sockfd(req);
 
     if (frame.type == HTTPD_WS_TYPE_CLOSE) {
-        ws_bridge_client_lost(fd, false);
+        ws_bridge_client_lost(fd, BRIDGE_LOST_WS_CLOSE);
         return ESP_OK;
     }
 
@@ -301,7 +428,7 @@ static esp_err_t ws_handler(httpd_req_t *req)
          * означає, що на тому кінці не наш клієнт. */
         ESP_LOGW(TAG, "кадр від клієнта %u Б понад стелю — рву з'єднання",
                  (unsigned)frame.len);
-        ws_bridge_client_lost(fd, false);
+        ws_bridge_client_lost(fd, BRIDGE_LOST_OVERSIZED);
         return ESP_FAIL;
     }
 
@@ -356,7 +483,9 @@ static esp_err_t css_get(httpd_req_t *req)
 
 static esp_err_t stats_get(httpd_req_t *req)
 {
-    char json[768];
+    /* Росте разом із набором лічильників. Замалий буфер більше не обрізає
+     * JSON мовчки — `bridge_stats_json()` скаржиться в журнал. */
+    char json[1280];
     const size_t n = bridge_stats_json(json, sizeof(json));
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -420,6 +549,14 @@ esp_err_t ws_bridge_start(void)
 #if CONFIG_IDF_TARGET_ESP32
     cfg.core_id = 0; /* разом із Wi-Fi; приймання UART живе на ядрі 1 */
 #endif
+
+    /* Пріоритет задачі httpd — чуже число, а ввід від телефона розбирає саме
+     * вона. Друкуємо його поруч із нашими, щоб на стенді не доводилось лізти
+     * в джерела ESP-IDF: у задачі 0013 цей розклад був першим підозрюваним, і
+     * ніде в коді його не було видно цілком. Чи він на щось впливає, показує
+     * `input_task.beat_interval_max_ms` у `/api/stats`, а не міркування. */
+    ESP_LOGI(TAG, "пріоритети: приймання %d, ввід (httpd) %d, сторож %d, пікселі %d",
+             BRIDGE_PRIO_RX, cfg.task_priority, BRIDGE_PRIO_WATCHDOG, BRIDGE_PRIO_WS_TX);
 
     ESP_ERROR_CHECK(httpd_start(&s_server, &cfg));
 

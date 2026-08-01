@@ -125,6 +125,7 @@ static void rx_task(void *arg)
     (void)arg;
     static uint8_t rd[2048];
     int64_t last_byte_us = esp_timer_get_time();
+    int64_t last_beat_us = last_byte_us;
 
     for (;;) {
         const int n = uart_link_read(rd, sizeof(rd), 10);
@@ -160,6 +161,15 @@ static void rx_task(void *arg)
         /* Наприкінці кожного читання: дрібна зміна не має чекати, доки
          * набереться повна пачка. */
         chunk_flush();
+
+        /* Биття для заміру затримки задачі, що чує ввід. Джерелом часу мусить
+         * бути задача, яка процесор отримує **завжди**, — інакше замір
+         * замовкне разом із тим, що він міряє. Ця саме така: найвищий із
+         * наших пріоритетів і власне ядро. */
+        if ((now - last_beat_us) / 1000 >= BRIDGE_HEARTBEAT_MS) {
+            last_beat_us = now;
+            ws_bridge_heartbeat();
+        }
     }
 }
 
@@ -229,7 +239,7 @@ void app_main(void)
      * кнопка) — це теж «втратив телефон», просто з іншого боку: пульт про
      * той розрив не дізнався й досі тримає натиснутим те, що тримав. Один
      * пакет на 20 байтів закриває цей випадок назавжди. */
-    uart_link_send_input_release(false);
+    uart_link_send_input_release(BRIDGE_LOST_BOOT);
 
     /* Стан моста готуємо **до** підняття Wi-Fi: інакше подія в проміжку
      * візьме ще не створений замок (знахідка рецензії). */
@@ -264,10 +274,12 @@ void app_main(void)
      * непоміченою — шаблону більше немає ніде в проєкті, перевірено пошуком.
      */
     bool ok = true;
-    ok = ok && (xTaskCreatePinnedToCore(rx_task, "rui_rx", 4096, NULL, 12, NULL,
+    ok = ok && (xTaskCreatePinnedToCore(rx_task, "rui_rx", 4096, NULL, BRIDGE_PRIO_RX, NULL,
                                         BRIDGE_RX_CORE) == pdPASS);
-    ok = ok && (xTaskCreate(ws_tx_task, "rui_ws_tx", 4096, NULL, 6, NULL) == pdPASS);
-    ok = ok && (xTaskCreate(watchdog_task, "rui_wd", 3072, NULL, 4, NULL) == pdPASS);
+    ok = ok && (xTaskCreate(ws_tx_task, "rui_ws_tx", 4096, NULL, BRIDGE_PRIO_WS_TX, NULL)
+                == pdPASS);
+    ok = ok && (xTaskCreate(watchdog_task, "rui_wd", 3072, NULL, BRIDGE_PRIO_WATCHDOG, NULL)
+                == pdPASS);
 
     /* Мовчазна відмова — найгірший вид відмови в цьому проєкті. Не вистачило
      * купи на сторож — і міст працює **без головного механізму безпеки**, а в
