@@ -52,6 +52,32 @@ const counters = {
   autoRefresh: 0,   // скільки разів просили REFRESH через втрати на мості
 };
 
+/* --- скільки головний потік зайнятий нами ---------------------------------
+ *
+ * ⚠️ Прилад, без якого «міст не встигає віддати» неможливо відрізнити від
+ * «клієнт не встигає забрати». Різниця не тонка: приймання і малювання тут
+ * живуть в **одному** потоці, і поки він рахує, сокет ніхто не вичитує —
+ * вікно TCP зачиняється, міст упирається в нас і викидає пачки. Знадвору це
+ * виглядає точно як вузький ефір.
+ *
+ * Задача 0018 заміряла 123 КБ/с у телефон проти 155 КБ/с потреби і мало не
+ * записала винним Wi-Fi. Стенд `tools/webui_bench.js` показав, що розбір і
+ * малювання плиток коштують у сто разів менше, ніж потрібно, — отже, якщо
+ * винен клієнт, то `putImageData` або стек браузера, а їх без браузера не
+ * поміряти. Оце їх і міряє.
+ *
+ * `busy` читати як частку секунди: 1.0 означає, що головний потік не
+ * простоював зовсім.
+ */
+const prof = {
+  msFeed: 0,    // весь обробник повідомлення WebSocket, разом із плитками
+  msTile: 0,    // з нього — decodeTile + blitTile
+  msDraw: 0,    // putImageData
+  bytes: 0,
+  // Останній зведений знімок за секунду — його показує панель.
+  last: { feed: 0, tile: 0, draw: 0, kbs: 0, busy: 0 },
+};
+
 function resizeTo(w, h) {
   W = w; H = h;
   canvas.width = w;
@@ -84,11 +110,15 @@ function onTile(payload) {
   // саме тому, що інакше нормальна робота виглядала б як втрата пікселів.
   if (!frameBuf) { counters.beforeHello++; return; }
 
+  const t0 = performance.now();
   const tile = P.decodeTile(payload);
-  if (!tile) { counters.badTiles++; return; }
-
-  if (P.blitTile(frameBuf.data, W, H, tile)) counters.tiles++;
-  else counters.outOfBounds++;
+  if (tile) {
+    if (P.blitTile(frameBuf.data, W, H, tile)) counters.tiles++;
+    else counters.outOfBounds++;
+  } else {
+    counters.badTiles++;
+  }
+  prof.msTile += performance.now() - t0;
 }
 
 /* Кадр показуємо лише на FRAME_END: до нього картинка неповна. Саме тому
@@ -96,7 +126,9 @@ function onTile(payload) {
  * на сторінку, яка оновлюється безперервно. */
 function showFrame() {
   if (!frameBuf) return;
+  const t0 = performance.now();
   ctx.putImageData(frameBuf, 0, 0);
+  prof.msDraw += performance.now() - t0;
   counters.frames++;
   lastFrameAt = performance.now();
   veil(null);
@@ -248,7 +280,16 @@ function connect() {
     startGreeting();
   };
 
-  ws.onmessage = (ev) => decoder.feed(new Uint8Array(ev.data), onPacket);
+  /* ⚠️ Увесь розбір і все малювання відбуваються **тут**, у головному
+   * потоці. Поки цей обробник виконується, браузер сокет не вичитує — тому
+   * час, витрачений тут, безпосередньо звужує вікно TCP. Саме це й міряємо. */
+  ws.onmessage = (ev) => {
+    const data = new Uint8Array(ev.data);
+    const t0 = performance.now();
+    decoder.feed(data, onPacket);
+    prof.msFeed += performance.now() - t0;
+    prof.bytes += data.length;
+  };
 
   ws.onclose = () => {
     chip('link', 'немає зв’язку', 'bad');
@@ -507,6 +548,13 @@ async function updateInfo() {
     `  до HELLO       ${counters.beforeHello}`,
     `  кадрів         ${counters.frames}`,
     `  REFRESH через втрати на мості  ${counters.autoRefresh}`,
+    '',
+    'головний потік, мс за секунду',
+    `  feed (кадрування+CRC) ${prof.last.feed.toFixed(1)}`,
+    `  плитки (RLE+RGBA)     ${prof.last.tile.toFixed(1)}`,
+    `  putImageData          ${prof.last.draw.toFixed(1)}`,
+    `  РАЗОМ зайнято         ${Math.round(prof.last.busy * 100)}%` +
+    `  при ${prof.last.kbs.toFixed(0)} КБ/с`,
   ];
 
   if (hello) {
@@ -529,11 +577,38 @@ async function updateInfo() {
 
 setInterval(updateInfo, 1000);
 
-/* Частота кадрів — раз на секунду, щоб не смикати сторінку щокадрово. */
+/* Частота кадрів і зайнятість головного потоку — раз на секунду, щоб не
+ * смикати сторінку щокадрово.
+ *
+ * ⚠️ `busy` показується поруч із кадрами навмисно, а не ховається в панель:
+ * це єдине число, яким людина зі стенда може відрізнити «міст не встигає
+ * віддати» від «телефон не встигає забрати». Близьке до 100% означає, що
+ * шукати треба тут, а не в ефірі.
+ */
 let lastFrames = 0;
+let lastProfAt = performance.now();
 setInterval(() => {
   chip('fps', (counters.frames - lastFrames) + ' кадр/с');
   lastFrames = counters.frames;
+
+  const now = performance.now();
+  const dt = Math.max(1, now - lastProfAt);
+  lastProfAt = now;
+
+  prof.last = {
+    // `feed` без вкладених плиток: інакше розбір «коштував» би разом із
+    // розтисканням і малюванням, і розкладка ні на що не вказувала б.
+    feed: prof.msFeed - prof.msTile,
+    tile: prof.msTile,
+    draw: prof.msDraw,
+    kbs: prof.bytes / 1024 / (dt / 1000),
+    busy: (prof.msFeed + prof.msDraw) / dt,
+  };
+  prof.msFeed = prof.msTile = prof.msDraw = prof.bytes = 0;
+
+  const pct = Math.round(prof.last.busy * 100);
+  chip('busy', `потік ${pct}% · ${Math.round(prof.last.kbs)} КБ/с`,
+       pct >= 80 ? 'bad' : pct >= 50 ? 'warn' : 'ok');
 }, 1000);
 
 window.addEventListener('resize', fitCanvas);

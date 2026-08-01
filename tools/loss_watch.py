@@ -185,6 +185,12 @@ class Runner:
         # інструменті — те саме порушення, що специфіка в коді (CLAUDE.md).
         self.tile_px = 0
 
+        # Сирий потік на диск — щоб той самий трафік можна було потім
+        # прогнати через справжній `webui/proto.js` під node і поміряти, що
+        # саме коштує браузеру. Синтетичний трафік тут не годиться: вартість
+        # розтискання RLE залежить від кількості серій, тобто від картинки.
+        self.dump = open(args.dump, "wb") if getattr(args, "dump", None) else None
+
     def pump(self) -> None:
         """Вичитати все, що прийшло. ⚠️ Обов'язково і безперервно.
 
@@ -201,6 +207,8 @@ class Runner:
             raise SocketDied("міст закрив з'єднання")
         if not data:
             return
+        if self.dump is not None:
+            self.dump.write(data)
         self.rx_bytes += len(data)
         for ptype, payload in self.dec.feed(data):
             if ptype == PKT_TILE:
@@ -471,6 +479,10 @@ def run(args) -> int:
              "args": vars(args)}, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"\nзнімки збережено: {args.out}")
 
+    if r.dump is not None:
+        r.dump.close()
+        print(f"сирий потік записано: {args.dump}")
+
     link.close()
     # ⚠️ Обірваний прогін мусить відрізнятись кодом виходу: інакше зовні він
     # не відрізняється від цілого, і числа підуть у задачу як заміряні.
@@ -671,6 +683,8 @@ def main(argv=None):
     ap.add_argument("--observe", type=float, default=None, metavar="СЕКУНД",
                     help="не ставати клієнтом: гортає людина з телефона, "
                          "інструмент лише знімає /api/stats")
+    ap.add_argument("--dump", default=None, metavar="ФАЙЛ",
+                    help="записати сирий потік від моста — для tools/webui_bench.js")
     ap.add_argument("--out", default=None, help="куди скласти знімки JSON")
     args = ap.parse_args(argv)
     return observe(args) if args.observe else run(args)
