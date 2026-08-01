@@ -59,9 +59,10 @@ size_t bridge_stats_json(char *out, size_t cap)
         "\"ws_close\":%u,\"socket\":%u,\"socket_silent\":%u,\"wifi\":%u},"
         "\"input_gap\":{\"max_ms\":%u,\"le300\":%u,\"le500\":%u,\"le750\":%u,"
         "\"over\":%u,\"after_release_ms\":%u},"
-        "\"input_task\":{\"beat_interval_max_ms\":%u,\"beats\":%u,\"queue_full\":%u}"
+        "\"input_task\":{\"beat_interval_max_ms\":%u,\"beats\":%u,\"queue_full\":%u},"
+        "\"baud_reverts\":{\"bridge\":%u,\"radio\":%u}"
         "}",
-        (unsigned long long)(esp_timer_get_time() / 1000000), BRIDGE_BAUDRATE,
+        (unsigned long long)(esp_timer_get_time() / 1000000), U(s->baud_current),
         U(esp_get_free_heap_size()), U(esp_get_minimum_free_heap_size()),
         ws_bridge_has_client() ? "true" : "false", U(s->uart_bytes), U(s->packets_ok),
         U(s->tiles_in), U(s->frames_in), U(s->crc_errors), U(s->oversized), U(s->uart_dropped),
@@ -73,7 +74,8 @@ size_t bridge_stats_json(char *out, size_t cap)
         U(s->lost_socket), U(s->lost_socket_silent), U(s->lost_wifi), U(s->gap_max_ms),
         U(s->gap_le_300),
         U(s->gap_le_500), U(s->gap_le_750), U(s->gap_over), U(s->gap_after_release_ms),
-        U(s->beat_interval_max_ms), U(s->hb_beats), U(s->hb_queue_full));
+        U(s->beat_interval_max_ms), U(s->hb_beats), U(s->hb_queue_full),
+        U(s->baud_bridge_reverts), U(s->baud_radio_reverts));
 
     if (n < 0) {
         return 0;

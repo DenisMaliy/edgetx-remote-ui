@@ -150,6 +150,24 @@ class Link:
         return None, None, None
 
 
+def bridge_baud(ws_url: str):
+    """Питає в моста, на якій швидкості насправді дріт.
+
+    ⚠️ Єдине джерело правди при роботі через міст. Сам потік пакетів цього не
+    каже: після відкоту обох боків кадри йдуть так само справно, як і на новій
+    швидкості, тільки вдома.
+    """
+    import json
+    import urllib.request
+
+    host = ws_url.split("://", 1)[-1].split("/", 1)[0]
+    try:
+        with urllib.request.urlopen(f"http://{host}/api/stats", timeout=3) as r:
+            return json.load(r).get("baud")
+    except Exception:
+        return None
+
+
 def describe_baud(value):
     return "не застосовне" if value is None else f"{value} бод"
 
@@ -198,8 +216,8 @@ def run(args) -> int:
     print(f"Пульт через: {where}, домашня швидкість {home} бод")
     print(f"Дослід: {args.mode}, ціль {target} бод")
     if args.ws:
-        print("⚠️ Через міст: на нову швидкість не переходить НІХТО, крім пульта.")
-        print("   Саме тому це найчесніший betray — міст справжній, не вдаваний.")
+        print("⚠️ Через міст швидкості дроту не видно — вона питається в /api/stats.")
+        print("   Самі кадри її не доводять: після відкоту обох боків вони йдуть так само.")
     print()
 
     link = Link(args.device, args.ws, home, args.verbose)
@@ -239,10 +257,38 @@ def run(args) -> int:
 
         # --- Крок 2. Дослід ----------------------------------------------------
         if args.mode == "follow":
-            print(f"\n[2] чекаю {rep['switch_delay_ms']} мс і йду за пультом…")
-            time.sleep(switch_delay)
-            link.set_baudrate(target)
-            print(f"  свій бік перемкнуто на {target} бод")
+            if link.over_bridge:
+                # ⚠️ Через міст перемикати нам нічого: міст іде за пультом сам,
+                # помітивши підтвердження в потоці. Ми тут спостерігач, і це
+                # правильний розподіл ролей — швидкість замовляє клієнт,
+                # дозволяє пульт, виконує міст.
+                print(f"\n[2] міст іде за пультом сам; чекаю "
+                      f"{rep['switch_delay_ms']} мс + запас…")
+                time.sleep(switch_delay + 0.4)
+
+                # ⚠️ Через WebSocket ми НЕ БАЧИМО швидкості дроту.
+                #
+                # Валідні кадри тут доводять лише те, що ланцюг живий, — а він
+                # однаково живий і після того, як обидва боки повернулись
+                # додому. Перший прогін на 2 625 000 саме так і збрехав:
+                # інструмент оголосив успіх, а насправді обидва відкотились.
+                #
+                # Єдине джерело правди про дріт — сам міст.
+                actual = bridge_baud(args.ws)
+                if actual is None:
+                    print("  ⚠️ не дістав /api/stats — швидкість дроту НЕ перевірена")
+                elif actual != target:
+                    print(f"  ✗ МІСТ НА {actual} БОД, А НЕ НА {target}.")
+                    print("    Перемикання не втрималось: обидва боки повернулись додому.")
+                    print("    Валідні кадри тут нічого не доводять — вони йдуть і вдома.")
+                    return 1
+                else:
+                    print(f"  ✓ міст підтверджує: дріт на {actual} бод")
+            else:
+                print(f"\n[2] чекаю {rep['switch_delay_ms']} мс і йду за пультом…")
+                time.sleep(switch_delay)
+                link.set_baudrate(target)
+                print(f"  свій бік перемкнуто на {target} бод")
 
             elapsed, ptype, payload = link.wait_for_any_frame(RECOVERY_LIMIT_S)
             if elapsed is None:
@@ -251,15 +297,21 @@ def run(args) -> int:
                 return 1
             print(f"  ✓ пульт говорить на {target} бод, перший кадр за {elapsed * 1000:.0f} мс")
 
+            if args.stay:
+                print(f"\n  → лишаюсь на {target} бод (--stay). "
+                      f"Повернути: --mode follow --to {home}")
+                return 0
+
             # ⚠️ Повертаємось додому свідомо, а не лишаємо стенд на новій
             # швидкості: наступний інструмент відкриє порт на домашній і не
             # зрозуміє, чому пульт мовчить.
             print(f"\n[3] повертаю обидва боки додому на {home} бод…")
-            link.tr.send(proto.encode_baud_set(home, args.nonce + 1))
+            link.tr.send(proto.encode_baud_set(home, (args.nonce % 255) + 1))
             for _ in link.pump(0.3):
                 pass
-            time.sleep(switch_delay)
-            link.set_baudrate(home)
+            time.sleep(switch_delay + (0.4 if link.over_bridge else 0.0))
+            if not link.over_bridge:
+                link.set_baudrate(home)
             elapsed, _, _ = link.wait_for_any_frame(RECOVERY_LIMIT_S)
             print(
                 "  ✓ вдома" if elapsed is not None else "  ⚠️ додому не повернулись автоматично"
@@ -381,6 +433,11 @@ def main() -> int:
         "--expect-refusal",
         action="store_true",
         help="дослід вважається вдалим, якщо пульт відмовився (перевірка переліку)",
+    )
+    ap.add_argument(
+        "--stay",
+        action="store_true",
+        help="після вдалого follow лишитись на новій швидкості, не вертаючись додому",
     )
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()

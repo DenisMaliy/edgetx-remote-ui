@@ -44,6 +44,7 @@
 #define RUI_PKT_FRAME_END 0x03
 #define RUI_PKT_STATE 0x04
 #define RUI_PKT_LOG 0x05
+#define RUI_PKT_BAUD 0x06
 
 /* Клієнт → пульт */
 #define RUI_PKT_KEY 0x81
@@ -53,6 +54,17 @@
 #define RUI_PKT_TRIM 0x85
 #define RUI_PKT_PING 0x86
 #define RUI_PKT_INPUT_STATE 0x87
+#define RUI_PKT_BAUD_SET 0x88
+
+/** Вантаж `0x06 BAUD` — 16 Б. Розкладка в `remote_ui/baudrate.h`. */
+#define RUI_BAUD_PAYLOAD 16
+
+/** Вердикти пакета `BAUD`. Дзеркало `remote_ui::BaudVerdict`. */
+#define RUI_BAUD_ACCEPTED 0
+#define RUI_BAUD_UNSUPPORTED 1
+#define RUI_BAUD_BUSY 2
+#define RUI_BAUD_NOT_APPLICABLE 3
+#define RUI_BAUD_REVERTED 4
 
 /** Корисний вантаж `INPUT_STATE` — 13 Б, разом із обгорткою 20 Б. */
 #define RUI_INPUT_STATE_PAYLOAD 13

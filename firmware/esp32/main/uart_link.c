@@ -6,6 +6,7 @@
 #include "uart_link.h"
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "bridge_cfg.h"
 #include "driver/uart.h"
@@ -14,6 +15,23 @@
 #include "stats.h"
 
 static const char *TAG = "uart";
+
+/**
+ * ⚠️ Буфер приймання мусить пережити найгіршу заміряну затримку задачі на
+ * найвищій швидкості, яку міст узагалі може погодитись прийняти.
+ *
+ * Це не запас «про всяк випадок». На 921600 старий буфер у 16 КіБ тримав
+ * 178 мс проти заміряних 132 — і рівно тому все працювало. На 2 Мбод той
+ * самий буфер дає 82 мс, на 2 625 000 — 62 мс, тобто **менше за затримку**, і
+ * `uart_dropped` перестав би бути нулем. Причина була б не в дроті й не в
+ * пульті, а тут.
+ *
+ * 10 біт на байт — старт і стоп на дроті, а не 8.
+ */
+_Static_assert((uint64_t)BRIDGE_UART_RX_BUF * 10 * 1000 >=
+                   (uint64_t)BRIDGE_UART_MAX_BAUD * BRIDGE_UART_WORST_LATENCY_MS,
+               "приймальний буфер менший за заміряну затримку задачі на "
+               "найвищій швидкості — підніми буфер або опусти стелю");
 
 /** Черга подій драйвера. Потрібна лише щоб побачити переповнення. */
 static QueueHandle_t s_events;
@@ -33,8 +51,8 @@ esp_err_t uart_link_init(void)
      * інакше переповнення буфера ніяк не побачити, і втрачені на вході байти
      * виглядали б як помилки CRC.
      *
-     * Буфер приймання вміщає щонайменше два найбільші кадри — при 921600 це
-     * ще й ~170 мс запасу на випадок, коли Wi-Fi надовго забирає процесор. */
+     * Розмір буфера приймання виводиться з найгіршої заміряної затримки
+     * задачі — див. _Static_assert вище. */
     ESP_ERROR_CHECK(uart_driver_install(BRIDGE_UART_PORT, BRIDGE_UART_RX_BUF, 0, 16, &s_events, 0));
     ESP_ERROR_CHECK(uart_param_config(BRIDGE_UART_PORT, &cfg));
     ESP_ERROR_CHECK(uart_set_pin(BRIDGE_UART_PORT, BRIDGE_PIN_TX, BRIDGE_PIN_RX,
@@ -45,7 +63,13 @@ esp_err_t uart_link_init(void)
      * На 921600 апаратна черга в 128 байтів наповнюється за 1.4 мс. При
      * порозі 120 в обробника лишається 87 мкс запасу — під Wi-Fi це мало.
      * Поріг 64 дає 694 мкс, тобто на порядок більше, ціною вдвічі частіших
-     * переривань (1400 на секунду — дрібниця). */
+     * переривань (1400 на секунду — дрібниця).
+     *
+     * ⚠️ На 2 625 000 той самий поріг дає **244 мкс**, бо черга наповнюється
+     * утричі швидше. Це вже не «на порядок більше», а просто «достатньо», і
+     * саме цей запас перевіряється дослідом: якщо `uart_dropped` росте при
+     * достатньому буфері, наступний підозрюваний — цей поріг, а не розмір
+     * буфера. Переривань при цьому 4100 на секунду. */
     ESP_ERROR_CHECK(uart_set_rx_full_threshold(BRIDGE_UART_PORT, 64));
 
     ESP_LOGI(TAG, "AUX1 ↔ UART%d: RX=GPIO%d, TX=GPIO%d, %d бод", BRIDGE_UART_PORT, BRIDGE_PIN_RX,
@@ -81,6 +105,32 @@ int uart_link_write(const uint8_t *data, size_t len)
      * не треба: пишуть і задача httpd (ввід від клієнта), і сторож
      * (обнулений INPUT_STATE). */
     return uart_write_bytes(BRIDGE_UART_PORT, data, len);
+}
+
+void uart_link_set_baudrate(uint32_t baud)
+{
+    /* 1. Дочекатись, поки відправлене зійде з дроту. Це єдине місце в мості,
+     *    де ми свідомо чекаємо: недописаний кадр, дожований на новій
+     *    швидкості, став би сміттям на тому кінці саме тоді, коли пульт
+     *    найуважніше слухає. Черги передачі в драйвера немає
+     *    (`tx_buffer_size = 0`), тож чекати доводиться лише апаратну чергу —
+     *    128 байтів, тобто одиниці мілісекунд навіть на найповільнішій
+     *    швидкості переліку. */
+    uart_wait_tx_done(BRIDGE_UART_PORT, pdMS_TO_TICKS(20));
+
+    /* 2. Новий дільник. */
+    ESP_ERROR_CHECK(uart_set_baudrate(BRIDGE_UART_PORT, baud));
+
+    /* 3. І аж тепер викидаємо прийняте: байти, що ловилися в мить запису,
+     *    спотворені за побудовою. Порядок 2 -> 3, не навпаки. */
+    uart_flush_input(BRIDGE_UART_PORT);
+}
+
+void uart_link_send_ping(void)
+{
+    uint8_t frame[RUI_FRAME_OVERHEAD];
+    const size_t n = rui_build(frame, RUI_PKT_PING, NULL, 0);
+    uart_link_write(frame, n);
 }
 
 void uart_link_send_input_release(bridge_lost_t reason)

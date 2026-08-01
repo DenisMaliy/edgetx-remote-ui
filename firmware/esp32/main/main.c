@@ -23,6 +23,7 @@
 
 #include <string.h>
 
+#include "baud_follow.h"
 #include "bridge_cfg.h"
 #include "esp_app_desc.h"
 #include "esp_log.h"
@@ -96,6 +97,13 @@ static void on_uart_packet(void *ctx, uint8_t type, const uint8_t *frame, size_t
 {
     (void)ctx;
 
+    /* ⚠️ Стежець за швидкістю дивиться на **вантаж**, а не на кадр: обгортка
+     * йому ні до чого, а зсуви полів у неї інші. Сюди приходить цілий кадр,
+     * тож вантаж — це frame + 5, а його довжина на RUI_FRAME_OVERHEAD менша. */
+    if (len >= RUI_FRAME_OVERHEAD) {
+        baud_follow_on_packet(type, frame + 5, len - RUI_FRAME_OVERHEAD);
+    }
+
     if (type == RUI_PKT_TILE) {
         g_stats.tiles_in++;
     } else if (type == RUI_PKT_FRAME_END) {
@@ -157,6 +165,15 @@ static void rx_task(void *arg)
         }
 
         uart_link_poll_events();
+
+        /* ⚠️ Перемикання швидкості робиться тут, а не в обробнику пакета:
+         * там воно скинуло б розбирач посеред його ж роботи. Скинути розбирач
+         * після перемикання обов'язково — усе, що в ньому лежало, приймалось
+         * на іншій швидкості й на новій означає сміття. */
+        if (baud_follow_tick(now)) {
+            rui_scanner_reset(&s_uart_scan);
+            last_byte_us = now;
+        }
 
         /* Наприкінці кожного читання: дрібна зміна не має чекати, доки
          * набереться повна пачка. */
@@ -246,6 +263,7 @@ void app_main(void)
     ESP_ERROR_CHECK(ws_bridge_init());
 
     rui_scanner_reset(&s_uart_scan);
+    baud_follow_init();
     s_ring = xRingbufferCreate(BRIDGE_WS_RING_BYTES, RINGBUF_TYPE_NOSPLIT);
     if (!s_ring) {
         ESP_LOGE(TAG, "не вистачило пам'яті на чергу до Wi-Fi");
