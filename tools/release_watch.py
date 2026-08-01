@@ -51,6 +51,7 @@ import argparse
 import fcntl
 import glob
 import os
+import statistics
 import struct
 import sys
 import threading
@@ -60,7 +61,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import remote_ui_proto as proto  # noqa: E402
 
 # Скільки тримати тример, щоб переконатися, що канал справді повзе.
-HOLD_S = 1.5
+#
+# ⚠️ Було 1.5 с — і цього **не вистачало**. Авто-повтор тримера в EdgeTX
+# розганяється не одразу (довге натискання 320 мс, потім повтор), а перші
+# кроки міняють канал менше ніж на `MOVE_EPS`. Заміряно на живому пульті:
+# утримання 2 с давало **нуль** подій руху на всіх 12 напрямках, тоді як
+# 12 с — від 60 до 415. Тобто інструмент виглядав зламаним там, де просто
+# не дочекався.
+HOLD_S = 4.0
+
+# Скільки утримувати кожен напрямок, підбираючи найкращий.
+PROBE_S = 2.5
 
 # Скільки чекати після втрати телефона. Більше і за сторожа моста (750 мс),
 # і за тайм-аут відпускання в прошивці (1000 мс), із запасом.
@@ -68,6 +79,34 @@ WATCH_AFTER_S = 3.0
 
 # Рух каналу менший за це вважаємо шумом АЦП, а не тримером.
 MOVE_EPS = 2
+
+# ⚠️ Головна перевірка дійсності заміру.
+#
+# Тример **доїжджає до упору** і після цього канал завмирає, хоча ввід
+# утримують далі. Тоді «остання мить руху» — це мить упору, а не мить
+# відпускання, і різниця з `t0` перетворюється на випадкове число: у задачі
+# 0012 воно давало розкид 0…1829 мс, а від'ємне значення затискалось у нуль,
+# тобто **впор виглядав як відмінний результат**.
+#
+# Тому перед тим, як втрачати телефон, ми вимагаємо доказу, що канал живий
+# **саме зараз**: остання подія руху має бути не старша за цей поріг. Джойстик
+# віддає рух тримера десятками подій за секунду на швидких напрямках, але на
+# повільних — раз на ~200 мс. Тому поріг 400 мс: удвічі більший за найповільніший
+# спостережений період повтору, тобто «стоїть» упевнено, і водночас удвічі
+# менший за 750 мс, які ми міряємо.
+#
+# Правити треба саме доказовість, а не спосіб: обхід «повертати тример у
+# вихідне між прогонами» лікує симптом і лишає можливим тихий недостовірний
+# результат, а перевірка робить його неможливим.
+STALL_EPS_MS = 400.0
+
+# ⚠️ Межа роздільності всього заміру.
+#
+# Ми бачимо не «мить відпускання», а «мить останнього руху каналу», і частіше
+# за повтор тримера канал не рухається. Заміряно: найповільніший напрямок дає
+# подію раз на ~200 мс, найшвидший — раз на ~29 мс. Тому інструмент обирає
+# **найрухливіший** напрямок, а не перший-ліпший: це прямо покращує точність
+# числа, яке він потім друкує.
 
 
 def find_joystick():
@@ -98,6 +137,7 @@ class AxisWatcher:
         self.lock = threading.Lock()
         self.last = {}          # вісь → останнє значення
         self.last_move_t = None  # коли востаннє щось рухалось
+        self.move_times = []    # позначки часу всіх подій руху
         self.moves = 0
         self.moved_axes = set()
         self.stop = threading.Event()
@@ -128,6 +168,7 @@ class AxisWatcher:
                 # Перша подія по осі — це початкове значення, а не рух.
                 if prev is not None and abs(val - prev) >= MOVE_EPS:
                     self.last_move_t = now
+                    self.move_times.append(now)
                     self.moves += 1
                     self.moved_axes.add(num)
 
@@ -135,12 +176,24 @@ class AxisWatcher:
         """Забути попередню історію руху."""
         with self.lock:
             self.last_move_t = None
+            self.move_times = []
             self.moves = 0
             self.moved_axes = set()
 
     def snapshot(self):
         with self.lock:
             return self.last_move_t, self.moves, set(self.moved_axes)
+
+    def moves_since(self, t):
+        """Скільки подій руху сталося після моменту `t`.
+
+        Потрібне, щоб відрізнити «канал зупинився, бо ввід відпустили» від
+        «канал зупинився, бо тример доїхав до упору **вже під час заміру**».
+        Перший випадок дає кілька подій після команди й тоді тишу; другий —
+        жодної або одну, і при цьому число виходить меншим за справжнє.
+        """
+        with self.lock:
+            return sum(1 for ts in self.move_times if ts > t)
 
     def close(self):
         self.stop.set()
@@ -215,36 +268,85 @@ class Client:
         self.t.close()
 
 
-def find_live_trim(client, watcher, count):
-    """Підібрати тример, який справді рухає якийсь канал.
+def find_live_trim(client, watcher, count, probe_s=PROBE_S, retry=False):
+    """Підібрати напрямок тримера, який рухає канал **найчастіше**.
 
     Не вгадуємо: у моделі може не бути мікшера на потрібний канал, і тоді
     тример нічого не зрушить — а виглядало б це як «ввід не доходить».
+
+    ⚠️ Перебираємо **всі** напрямки і беремо найрухливіший, а не перший, що
+    ворухнувся. Причина не в акуратності, а в точності: роздільність усього
+    заміру дорівнює періоду повтору тримера, і різниця між напрямками на
+    цьому пульті — сім разів (подія раз на 29 мс проти раз на 200 мс).
+    Взявши перший-ліпший, ми б додали до кожного числа похибку, якої легко
+    уникнути.
+
+    Індекс — це номер **напрямку** (0..2*кількість-1), як `trim_keys` в
+    EdgeTX, а не номер тримера.
     """
-    for index in range(max(1, count)):
+    best_index, best_moves, best_axes = None, 0, set()
+
+    for index in range(max(2, count * 2)):
         watcher.mark()
         client.trim(index, True)
-        time.sleep(0.8)
+        time.sleep(probe_s)
         _, moves, axes = watcher.snapshot()
         client.trim(index, False)
         time.sleep(0.4)
-        if moves > 0:
-            return index, axes
-        print(f"  тример {index}: канал не ворухнувся")
-    return None, set()
+
+        rate = moves / probe_s
+        if moves == 0:
+            print(f"  напрямок {index}: канал не ворухнувся")
+            continue
+        print(f"  напрямок {index}: {moves} подій ({rate:.0f}/с), осі {sorted(axes)}")
+        if moves > best_moves:
+            best_index, best_moves, best_axes = index, moves, axes
+
+    if best_index is None and not retry:
+        # ⚠️ Перш ніж оголошувати «жоден тример не рухає каналів», спробувати
+        # ще раз і довше. Саме ця хибна діагностика вже коштувала окремого
+        # розслідування: тример працював, а проба була закоротка для розгону
+        # авто-повтору EdgeTX.
+        print("  жоден напрямок не ворухнув каналу — повторюю з утриманням "
+              f"{PROBE_S * 3:.0f} с, перш ніж здаватись")
+        return find_live_trim(client, watcher, count, probe_s=PROBE_S * 3, retry=True)
+
+    if best_index is not None:
+        print(f"  беру напрямок {best_index}: найрухливіший, "
+              f"{best_moves / probe_s:.0f} подій/с")
+    return best_index, best_axes
 
 
-def run_case(client, watcher, trim_index, how):
-    """Один замір: тримаємо тример, втрачаємо телефон, дивимось, коли завмре."""
+def run_case(client, watcher, trim_index, how, pre_hold_s=0.0):
+    """Один замір: тримаємо тример, втрачаємо телефон, дивимось, коли завмре.
+
+    Повертає `(delay_ms, note)`. `delay_ms is None` означає **прогін відкинуто**:
+    інструмент не має права віддати число, якого він не міряв. Ні великого, ні
+    нульового — саме нуль і був найнебезпечнішою формою брехні.
+    """
     watcher.mark()
     client.trim(trim_index, True)
+    if pre_hold_s > 0:
+        # Навмисне доведення тримера до упору — щоб показати, що інструмент
+        # це помічає. Використовується тільки прапорцем `--pre-hold`.
+        time.sleep(pre_hold_s)
     time.sleep(HOLD_S)
 
     last_before, moves, axes = watcher.snapshot()
-    if moves == 0:
-        return None, "канал не рухався навіть під час утримання — замір беззмістовний"
-
     t0 = time.monotonic()
+
+    if moves == 0:
+        client.trim(trim_index, False)
+        return None, ("канал не ворухнувся жодного разу за час утримання — "
+                      "міряти нічого")
+
+    stale_ms = (t0 - last_before) * 1000.0
+    if stale_ms > STALL_EPS_MS:
+        client.trim(trim_index, False)
+        return None, (f"канал завмер за {stale_ms:.0f} мс ДО команди відпускання "
+                      f"(поріг {STALL_EPS_MS:.0f}) — тример у впорі, і «остання мить "
+                      f"руху» показала б упор, а не відпускання")
+
     if how == "close":
         client.close()
     elif how == "silence":
@@ -259,9 +361,31 @@ def run_case(client, watcher, trim_index, how):
     if last_after is None:
         return None, "історія руху зникла — це вада інструмента"
 
-    delay_ms = (last_after - t0) * 1000
+    # ⚠️ Друга половина перевірки дійсності, і без неї перша марна.
+    #
+    # Перевірка перед `t0` доводить лише те, що канал був живий **у мить
+    # команди**. Але тример тримають ще й далі, і він цілком може доїхати до
+    # упору **всередині вікна заміру**. Тоді «остання мить руху» — це знову
+    # мить упору, число виходить додатним, меншим за справжнє, і проходить
+    # усі перевірки як відмінний результат.
+    #
+    # Розрізняє їх кількість подій після команди: справжнє відпускання дає
+    # кілька рухів і тоді тишу, упор — жодного або один. Це не теорія: у
+    # першому наборі цієї ж задачі так проскочило 15 мс при медіані 89.
+    after = watcher.moves_since(t0)
+    if after < 2:
+        return None, (f"після команди відпускання канал ворухнувся {after} раз(и) — "
+                      f"замало, щоб відрізнити відпускання від упору всередині "
+                      f"вікна заміру")
+
+    delay_ms = (last_after - t0) * 1000.0
     if delay_ms < 0:
-        delay_ms = 0.0
+        # Рух скінчився раніше за команду, хоч перевірка вище пройшла. Це вже
+        # не «майже нуль», а суперечність — і затискати її в нуль означало б
+        # видати за відмінний результат саме те, чого ми не поміряли.
+        return None, (f"останній рух каналу на {-delay_ms:.0f} мс раніший за команду "
+                      f"відпускання — замір суперечливий")
+
     return delay_ms, f"осей рухалось: {sorted(axes)}, подій руху {moves_after}"
 
 
@@ -270,9 +394,18 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     proto.add_transport_args(ap)
     ap.add_argument("--js", metavar="ПРИСТРІЙ", help="джойстик пульта (типово — пошук)")
-    ap.add_argument("--trim", type=int, help="номер тримера (типово — підібрати)")
+    ap.add_argument("--trim", type=int, metavar="НАПРЯМОК",
+                    help="номер **напрямку** тримера (0..2*кількість-1, як `trim_keys` "
+                         "в EdgeTX), а не номер тримера. Типово — підібрати найрухливіший")
     ap.add_argument("--manual", action="store_true",
                     help="замість автоматичного розриву чекати, поки Wi-Fi вимкнуть руками")
+    ap.add_argument("--runs", type=int, default=5, metavar="N",
+                    help="скільки прогонів на кожен спосіб (типово 5). Один прогін "
+                         "нічого не доводить: саме розкид викрив ваду інструмента")
+    ap.add_argument("--pre-hold", type=float, default=0.0, metavar="СЕК",
+                    help="утримувати тример стільки секунд ДО заміру. Потрібно, щоб "
+                         "навмисно довести його до упору й показати, що прогін буде "
+                         "відкинуто, а не порахований")
     args = ap.parse_args()
 
     desc, connect = proto.make_connector(args, poll=0.02)
@@ -297,57 +430,101 @@ def main():
         ("silence", "телефон замовк при живому сокеті"),
     ]
 
-    results = []
+    results = {}   # спосіб → список дійсних чисел
+    rejected = {}  # спосіб → список причин відкидання
+    base_trim = args.trim
+
     try:
         for how, title in cases:
             print(f"\n=== {title}")
-            client = Client(connect)
-            hello = client.greet()
-            if not hello:
-                print("  пульт не привітався — перевір ланцюг")
-                client.close()
-                return 1
-            print(f"  HELLO: {hello['target']} {hello['fw']}, тримерів {hello['trims']}, "
-                  f"біт3 {'є' if hello['has_input_state'] else 'НЕМАЄ'}")
-            client.start_hold()
+            results[title] = []
+            rejected[title] = []
 
-            index = args.trim
-            if index is None:
-                index, _ = find_live_trim(client, watcher, hello["trims"])
-                if index is None:
-                    print("  ⚠️ жоден тример не рухає каналів. У моделі мають бути мікшери")
-                    print("     на канали — інакше джойстик не побачить нічого (DECISIONS,")
-                    print("     «джойстик віддає канали після мікшера»).")
+            for run_no in range(args.runs):
+                client = Client(connect)
+                hello = client.greet()
+                if not hello:
+                    print("  пульт не привітався — перевір ланцюг")
                     client.close()
                     return 1
-                print(f"  міряю тримером {index}")
+                if run_no == 0:
+                    print(f"  HELLO: {hello['target']} {hello['fw']}, "
+                          f"тримерів {hello['trims']}, "
+                          f"біт3 {'є' if hello['has_input_state'] else 'НЕМАЄ'}")
+                client.start_hold()
 
-            delay, note = run_case(client, watcher, index, how)
-            client.close()
-            time.sleep(0.5)
+                if base_trim is None:
+                    base_trim, _ = find_live_trim(client, watcher, hello["trims"])
+                    if base_trim is None:
+                        print("  ⚠️ жоден тример не рухає каналів. У моделі мають бути")
+                        print("     мікшери на канали — інакше джойстик не побачить")
+                        print("     нічого (DECISIONS, «джойстик віддає канали після")
+                        print("     мікшера»).")
+                        client.close()
+                        return 1
+                    print(f"  міряю напрямком {base_trim}")
 
-            if delay is None:
-                print(f"  ✗ {note}")
-                results.append((title, None))
-            else:
-                print(f"  ввід завмер через {delay:.0f} мс після втрати телефона ({note})")
-                results.append((title, delay))
+                # ⚠️ Напрямок чергується між прогонами. Це не косметика: тример
+                # односпрямовано доїжджає до упору за кілька прогонів, і далі
+                # кожен наступний був би відкинутий перевіркою дійсності. Так
+                # він гуляє туди-сюди й лишається в робочій частині ходу.
+                index = base_trim if run_no % 2 == 0 else base_trim ^ 1
+
+                delay, note = run_case(client, watcher, index, how, args.pre_hold)
+                client.close()
+                time.sleep(0.5)
+
+                if delay is None:
+                    print(f"  прогін {run_no + 1}: ✗ ВІДКИНУТО — {note}")
+                    rejected[title].append(note)
+                else:
+                    print(f"  прогін {run_no + 1}: ввід завмер через {delay:.0f} мс "
+                          f"({note})")
+                    results[title].append(delay)
     finally:
         watcher.close()
 
     print("\n=== підсумок")
     ok = True
-    for title, delay in results:
-        if delay is None:
-            print(f"  ✗ {title}: замір не вийшов")
-            ok = False
+    measured = True
+    for _, title in cases:
+        vals = results[title]
+        bad = rejected[title]
+        print(f"\n  {title}")
+        print(f"    відкинуто прогонів: {len(bad)} з {args.runs}")
+        for note in bad:
+            print(f"      ✗ {note}")
+        if not vals:
+            print("    ✗ дійсних чисел немає — міряти не вдалося")
+            measured = False
             continue
+
+        vals_sorted = sorted(vals)
+        median = statistics.median(vals_sorted)
+        print(f"    дійсних {len(vals)}: "
+              f"{', '.join(f'{v:.0f}' for v in vals_sorted)} мс")
+        print(f"    медіана {median:.0f} мс, розкид {min(vals):.0f}…{max(vals):.0f} мс")
+
         # Тайм-аут відпускання в прошивці — 1000 мс. Якщо вклалися помітно
         # раніше, значить спрацював саме міст, а не остання перешкода.
-        verdict = "міст встиг першим" if delay < 900 else "⚠️ схоже, спрацював тайм-аут пульта"
-        print(f"  {title}: {delay:.0f} мс — {verdict}")
-        if delay > 1500:
+        worst = max(vals)
+        if worst < 900:
+            print("    міст встиг першим у всіх прогонах")
+        elif worst < 1500:
+            print("    ⚠️ найгірший прогін близький до тайм-ауту пульта (1000 мс)")
+        else:
+            print("    ⚠️ найгірший прогін НЕ вклався в тайм-аут пульта")
             ok = False
+
+    # ⚠️ «Не поміряли» і «поміряли, і погано» — різні висновки, і плутати їх
+    # не можна саме тут. Прогін із тримером у впорі не дає жодного числа, і
+    # оголошувати через це ввід несправним означало б робити ту саму підміну,
+    # проти якої писалась уся перевірка дійсності.
+    if not measured:
+        print("\nЗАМІРУ НЕ ВИЙШЛО: усі прогони відкинуто, про поведінку вводу "
+              "це не каже нічого.\nПричини вище — найчастіше тример у впорі; "
+              "поверніть його в робочу частину ходу.")
+        return 2
 
     print("\n" + ("усе гаразд" if ok else "ПОМИЛКА: ввід відпускається не так, як обіцяно"))
     return 0 if ok else 1

@@ -68,6 +68,18 @@ from remote_ui_proto import (  # noqa: E402
     parse_hello,
 )
 
+# Поріг, після якого клієнт **сам про себе** каже «я замовк». Копія
+# `BRIDGE_CLIENT_SILENCE_MS` із `firmware/esp32/main/bridge_cfg.h`.
+#
+# ⚠️ Клієнт за цим числом нічого не робить — воно тільки для друку. Сенс у
+# тому, щоб при спрацюванні сторожа на мості одразу було видно, чи клієнт
+# визнає за собою ту саму паузу. Якщо визнає — шукати треба в ньому, а не в
+# Wi-Fi і не в мості.
+CLIENT_SILENCE_REPORT_MS = 750.0
+
+# Як часто друкувати розкид пауз під час прогону.
+GAP_REPORT_PERIOD_S = 30.0
+
 # --- Пікселі --------------------------------------------------------------
 
 # RGB565 → три байти RGB888. Таблиця на 64 Кі записів будується один раз і
@@ -521,6 +533,30 @@ class Link(threading.Thread):
         # читає цей потік — звідси замок усередині InputMirror.
         self.mirror = InputMirror()
 
+        # --- прилад під критерій 4-біс задачі 0013 ------------------------
+        #
+        # Питання, на яке він відповідає: коли міст каже «клієнт мовчав понад
+        # 750 мс», клієнт справді мовчав — чи слав, а мовчання виникло далі
+        # по дорозі? Числа з обох боків мають зійтись, інакше винен не той,
+        # на кого думають.
+        #
+        # ⚠️ Поріг тут — копія `BRIDGE_CLIENT_SILENCE_MS` із моста. Він тільки
+        # для друку: клієнт нічого за ним не робить, лише називає подію.
+        self.state_gap_max_ms = 0.0
+        self.state_gaps_over = 0
+        self.state_sent = 0
+        self.state_worst = ""
+        # Ті самі відра, що в `/api/stats` моста — щоб два боки порівнювались
+        # рядок у рядок, а не «на око».
+        #
+        # ⚠️ Порівняння дійсне лише коли клієнт не шле нічого, крім
+        # `INPUT_STATE`. Міст рахує паузи між **будь-якими** пакетами вводу
+        # (`KEY`, `ENC`, `TOUCH`, `TRIM`, `INPUT_STATE`), а тут — лише між
+        # власними `INPUT_STATE`: те, що йде через `_drain_outbox`, у ці
+        # відра не потрапляє. Тобто під час живого натискання числа
+        # розійдуться, і це не розбіжність приладів.
+        self.state_buckets = {"le300": 0, "le500": 0, "le750": 0, "over": 0}
+
     def send(self, frame: bytes, kind: str) -> None:
         """Кладе кадр вводу в чергу передачі. Викликається потоком вікна."""
         try:
@@ -621,20 +657,33 @@ class Link(threading.Thread):
         last_state = now
         last_rx = now
 
+        # Скільки часу й байтів набігло від попереднього INPUT_STATE. Потрібно
+        # не для звіту, а щоб при довгій паузі одразу було видно, **на що**
+        # вона пішла: на очікування даних чи на їх розпакування.
+        span_recv_s = 0.0
+        span_decode_s = 0.0
+        span_bytes = 0
+        last_report = time.monotonic()
+
         while not self.stop.is_set():
+            t_recv0 = time.monotonic()
             data = transport.recv()
+            t_recv1 = time.monotonic()
+            span_recv_s += t_recv1 - t_recv0
             if data is None:
                 self.status = "пульт закрив з'єднання"
                 self.drops += 1
                 return
-            now = time.monotonic()
+            now = t_recv1
             if data:
                 self.rx_bytes += len(data)
+                span_bytes += len(data)
                 last_rx = now
                 for ptype, payload in decoder.feed(data):
                     session.handle(ptype, payload)
                 self.crc_errors = decoder.crc_errors
                 self.oversized = decoder.oversized
+                span_decode_s += time.monotonic() - now
             elif now - last_rx > SILENCE_RESET_S:
                 # Тиша в каналі. Якщо декодувальник завис посеред обірваного
                 # кадру — звільняємо його, як це робить транспорт у прошивці.
@@ -662,7 +711,57 @@ class Link(threading.Thread):
                         self.drops += 1
                         return
                     self.sent[kind] += 1
-                last_state = now
+
+                    # ⚠️ Час беремо заново, а не `now`: `now` знято **до**
+                    # розпакування, і саме різниця між ними — те, що міст
+                    # бачить як мовчання клієнта.
+                    sent_at = time.monotonic()
+                    gap_ms = (sent_at - last_state) * 1000.0
+                    self.state_sent += 1
+                    if gap_ms <= 300:
+                        self.state_buckets["le300"] += 1
+                    elif gap_ms <= 500:
+                        self.state_buckets["le500"] += 1
+                    elif gap_ms <= CLIENT_SILENCE_REPORT_MS:
+                        self.state_buckets["le750"] += 1
+                    else:
+                        self.state_buckets["over"] += 1
+                    if gap_ms > self.state_gap_max_ms:
+                        self.state_gap_max_ms = gap_ms
+                        self.state_worst = (
+                            f"{gap_ms:.0f} мс: чекав {span_recv_s * 1000:.0f}, "
+                            f"розпаковував {span_decode_s * 1000:.0f}, "
+                            f"{span_bytes} Б"
+                        )
+                    if gap_ms > CLIENT_SILENCE_REPORT_MS:
+                        self.state_gaps_over += 1
+                        print(
+                            f"[пауза] INPUT_STATE через {gap_ms:.0f} мс "
+                            f"(поріг моста {CLIENT_SILENCE_REPORT_MS:.0f}): "
+                            f"чекав {span_recv_s * 1000:.0f} мс, "
+                            f"розпаковував {span_decode_s * 1000:.0f} мс, "
+                            f"прийняв {span_bytes} Б",
+                            flush=True,
+                        )
+                    last_state = sent_at
+                else:
+                    last_state = now
+                span_recv_s = 0.0
+                span_decode_s = 0.0
+                span_bytes = 0
+
+            # Розкид пауз — на екран раз на пів хвилини. Без цього довгий прогін
+            # довелось би читати очима, а порівнювати з мостом — по пам'яті.
+            if now - last_report >= GAP_REPORT_PERIOD_S:
+                b = self.state_buckets
+                print(
+                    f"[паузи клієнта] надіслано {self.state_sent}, "
+                    f"максимум {self.state_gap_max_ms:.0f} мс, "
+                    f"≤300:{b['le300']} ≤500:{b['le500']} "
+                    f"≤750:{b['le750']} понад:{b['over']}",
+                    flush=True,
+                )
+                last_report = now
 
             if not refresh_sent and session.hello_count != hello_mark:
                 # Пульт назвався — тепер є куди класти пікселі.
@@ -895,6 +994,17 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     link.stop.set()
+
+    # Підсумок пауз — на екран, а не в нікуди: без нього довгий прогін довелось
+    # би переглядати очима по рядках «[пауза]».
+    print(
+        f"\nINPUT_STATE: надіслано {link.state_sent}, "
+        f"найдовша пауза {link.state_gap_max_ms:.0f} мс, "
+        f"пауз понад {CLIENT_SILENCE_REPORT_MS:.0f} мс — {link.state_gaps_over}",
+        flush=True,
+    )
+    if link.state_worst:
+        print(f"найгірша: {link.state_worst}", flush=True)
     return 0
 
 
