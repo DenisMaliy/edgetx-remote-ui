@@ -15,6 +15,7 @@
 
 #include "ws_bridge.h"
 
+#include <errno.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -25,6 +26,7 @@
 #include "framing.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "lwip/sockets.h"
 #include "stats.h"
 #include "uart_link.h"
 #include "wifi_ap.h"
@@ -68,6 +70,25 @@ static uint32_t s_errors_at_attach;
 
 /** Розбирач напрямку «телефон → пульт». Потрібен лише щоб бачити типи. */
 static rui_scanner_t s_client_scan;
+
+/** Наша передача з дозаписом залишку. Оголошена тут, бо ставиться при
+ *  під'єднанні, а живе нижче, серед решти передачі. */
+static int send_all(httpd_handle_t hd, int sockfd, const char *buf, size_t buf_len, int flags);
+
+/**
+ * `errno` тієї самої миті, коли `send()` відмовив. Пише `send_all`, читає
+ * `note_send_error`. Обидва — в `ws_tx_task`.
+ *
+ * ⚠️ Живого `errno` там читати не можна, і це не педантизм. Між невдалим
+ * `send()` і поверненням із `httpd_ws_send_frame_async` стоять чужі
+ * `ESP_LOGW` (`httpd_ws.c:449,456`), а журнал у цьому проєкті — синхронний
+ * запис у UART0 на 115200. Тобто до нашого читання `errno` устигає
+ * побувати в чужих руках.
+ */
+static int s_last_send_errno;
+
+/** Потік WebSocket зіпсовано обрізаним кадром — сокет далі не придатний. */
+static bool s_stream_corrupt;
 
 static inline void lock(void) { xSemaphoreTake(s_lock, portMAX_DELAY); }
 static inline void unlock(void) { xSemaphoreGive(s_lock); }
@@ -261,9 +282,26 @@ static void client_attach(int fd)
     unlock();
 
     s_send_fails = 0;
+    s_last_send_errno = 0;
+    s_stream_corrupt = false;
     s_errors_at_attach = g_stats.ws_errors;
     rui_scanner_reset(&s_client_scan);
     g_stats.clients_seen++;
+
+    /* ⚠️ Своя функція відправлення — на цей сокет і тільки на нього. Штатна
+     * мовчки лишає кадр WebSocket недописаним (див. `send_all`), і саме це
+     * найімовірніше вбивало сеанси «без жодної ознаки» в задачі 0012. */
+    if (s_server) {
+        const esp_err_t ov = httpd_sess_set_send_override(s_server, fd, send_all);
+        if (ov != ESP_OK) {
+            /* Не падаємо: міст без дозапису працює так само, як працював
+             * досі. Але мовчати не можна — інакше замір списав би обрізані
+             * кадри на щось інше. */
+            ESP_LOGE(TAG, "не вдалося поставити свою передачу на сокет %d (%s) — "
+                          "обрізані кадри WebSocket лишаються можливими",
+                     fd, esp_err_to_name(ov));
+        }
+    }
 
     if (old >= 0 && old != fd) {
         /* Витісняємо попередній телефон. Ввід обнуляємо: старий міг щось
@@ -283,6 +321,136 @@ static void client_attach(int fd)
 
 /* --------------------------------------------------------- передача -------*/
 
+/**
+ * @brief Відправити **все** або чесно сказати, що не змогло.
+ *
+ * ⚠️ Це не оптимізація, а виправлення мовчазного псування потоку.
+ *
+ * Штатний `httpd_default_send` віддає скільки записалось, а
+ * `httpd_ws_send_frame_async` перевіряє лише `< 0` (`httpd_ws.c:448,455`) —
+ * циклу дозапису в нього немає. При цьому lwIP із виставленим `SO_SNDTIMEO`
+ * (у нас `cfg.send_wait_timeout = 2`) по спливанні тайм-ауту повертає
+ * **часткове відправлення як успіх**: `api_msg.c:1745-1754`, гілка
+ * «partial write → err = ERR_OK».
+ *
+ * Разом це означає, що міст здатен віддати **обрізаний кадр WebSocket** і
+ * зарахувати його в `ws_chunks` як успішний. Кадрування WebSocket
+ * самосинхронізації не має: клієнт дочитає хвіст наступного кадру як вантаж
+ * попереднього, далі прочитає вантаж як заголовок — і потік поїде назавжди.
+ * Наш протокол усередині цього ресинхронізується (маркер + CRC), а от сам
+ * WebSocket — ні, і браузер закриє з'єднання за порушенням.
+ *
+ * ⚠️ Найімовірніше це і є «сокет помер мовчки, `ws_errors` нулі» із задачі
+ * 0012: часткове відправлення успіхом **не рахується як помилка**, тож
+ * лічильникам не було чого показати.
+ *
+ * Тому: дозаписуємо залишок, поки є поступ і поки не вичерпано бюджет часу.
+ * Не встигли, а частина вже пішла — потік зіпсований, і єдине чесне рішення
+ * гасити сокет. Мовчки лишати його живим означало б і далі годувати клієнта
+ * сміттям.
+ *
+ * `send()` кличеться напряму, а не через `httpd_default_send`, рівно з двох
+ * причин: той друкує в журнал на кожній відмові (`httpd_txrx.c:743`, тобто
+ * мілісекунди блокування `ws_tx_task` у найгіршу мить) і затирає `errno`,
+ * заради якого все й робиться.
+ */
+static int send_all(httpd_handle_t hd, int sockfd, const char *buf, size_t buf_len, int flags)
+{
+    (void)hd;
+
+    if (!buf) {
+        return HTTPD_SOCK_ERR_INVALID;
+    }
+
+    const int64_t deadline = esp_timer_get_time() + (int64_t)BRIDGE_WS_SEND_BUDGET_MS * 1000;
+    size_t off = 0;
+
+    while (off < buf_len) {
+        const int n = send(sockfd, buf + off, buf_len - off, flags);
+
+        if (n > 0) {
+            off += (size_t)n;
+            if (off < buf_len) {
+                g_stats.send_partial++;
+            }
+            continue;
+        }
+
+        /* `n == 0` при ненульовій довжині TCP не повертає, але нескінченний
+         * цикл коштував би моста — вважаємо це відмовою без `errno`. */
+        s_last_send_errno = (n == 0) ? 0 : errno;
+
+        if (off > 0) {
+            /* Частина кадру вже на дроті. Обрізаний кадр WebSocket
+             * невиправний — далі говорити в цей сокет нема сенсу. */
+            g_stats.send_truncated++;
+            s_stream_corrupt = true;
+        }
+        if (n == 0) {
+            return HTTPD_SOCK_ERR_FAIL;
+        }
+        return (errno == EAGAIN || errno == EINTR) ? HTTPD_SOCK_ERR_TIMEOUT
+                                                   : HTTPD_SOCK_ERR_FAIL;
+    }
+
+    if (esp_timer_get_time() > deadline && off < buf_len) {
+        g_stats.send_truncated++;
+        s_stream_corrupt = true;
+        return HTTPD_SOCK_ERR_TIMEOUT;
+    }
+
+    return (int)buf_len;
+}
+
+/**
+ * @brief Назвати причину невдалого відправлення.
+ *
+ * ⚠️ Задача 0018 вимагає розрізнити «затор у TCP» і «в мості скінчилась
+ * пам'ять». Обидва приходять сюди однаково — `ESP_FAIL` від
+ * `httpd_ws_send_frame_async`, — але означають протилежне: перше нормальна
+ * робота під навантаженням, друге межа виживання моста.
+ *
+ * ⚠️ Коли `httpd` відмовив **до** самого `send()` — сокет не наш, це не
+ * WebSocket, — збереженого `errno` про цю відмову немає, і причини він не
+ * називає. Такі йдуть у `other`, а `send_err_last` показує, що це був не
+ * `ESP_FAIL`.
+ */
+static void note_send_error(esp_err_t err)
+{
+    const int e = s_last_send_errno;
+
+    g_stats.send_err_last = (int32_t)err;
+    g_stats.send_errno_last = (int32_t)e;
+
+    if (err != ESP_FAIL) {
+        g_stats.send_err_other++;
+        return;
+    }
+
+    switch (e) {
+    case ENOMEM:
+    case ENOBUFS:
+        g_stats.send_err_nomem++;
+        break;
+    case EAGAIN:
+#if defined(EWOULDBLOCK) && (EWOULDBLOCK != EAGAIN)
+    case EWOULDBLOCK:
+#endif
+        g_stats.send_err_again++;
+        break;
+    case EPIPE:
+    case ECONNRESET:
+    case ECONNABORTED:
+    case ENOTCONN:
+    case EBADF:
+        g_stats.send_err_conn++;
+        break;
+    default:
+        g_stats.send_err_other++;
+        break;
+    }
+}
+
 esp_err_t ws_bridge_send(const uint8_t *data, size_t len)
 {
     lock();
@@ -301,7 +469,32 @@ esp_err_t ws_bridge_send(const uint8_t *data, size_t len)
         .len = len,
     };
 
+    /* ⚠️ Час самого відправлення — прилад, без якого розкладка причин
+     * читається навиворіт. `cfg.send_wait_timeout = 2` означає, що
+     * «вікно TCP зачинене» — це не мить, а **дві секунди сну** `ws_tx_task`.
+     * За них при 260 КБ/с надходить понад 500 КБ, а черга — 24 КБ. Тобто
+     * `chunks_dropped` виросте як **наслідок** заснулого відправника, і без
+     * цього числа «винна повна черга» виглядало б доведеним. */
+    const int64_t t_send = esp_timer_get_time();
     const esp_err_t err = httpd_ws_send_frame_async(s_server, fd, &frame);
+    const uint32_t send_ms = (uint32_t)((esp_timer_get_time() - t_send) / 1000);
+    if (send_ms > g_stats.send_ms_max) {
+        g_stats.send_ms_max = send_ms;
+    }
+
+    if (s_stream_corrupt) {
+        /* Кадр WebSocket пішов обрізаним — потік невиправний. Тримати такий
+         * сокет означає годувати клієнта сміттям, тож гасимо його названою
+         * причиною, а не лишаємо помирати мовчки. */
+        ESP_LOGW(TAG, "кадр WebSocket пішов обрізаним — потік зіпсовано, рву сокет %d", fd);
+        s_stream_corrupt = false;
+        g_stats.ws_errors++;
+        g_stats.send_dropped++;
+        note_send_error(err == ESP_OK ? ESP_FAIL : err);
+        client_drop(fd, BRIDGE_LOST_SEND_FAIL, true);
+        return ESP_FAIL;
+    }
+
     if (err != ESP_OK) {
         /* ⚠️ Невдале відправлення — це **викинута пачка**, а не «телефона
          * немає». Серед причин тут банальне переповнення вікна TCP, тобто
@@ -309,6 +502,7 @@ esp_err_t ws_bridge_send(const uint8_t *data, size_t len)
          * коштував би перепідключення й `REFRESH` на 20–40 КБ у той самий
          * затор — і знову розриву. Вирішувати, що телефона немає, має
          * сторож мовчання, а не черга передачі. */
+        note_send_error(err);
         g_stats.ws_errors++;
         g_stats.send_dropped++;
         s_send_fails++;
@@ -485,7 +679,7 @@ static esp_err_t stats_get(httpd_req_t *req)
 {
     /* Росте разом із набором лічильників. Замалий буфер більше не обрізає
      * JSON мовчки — `bridge_stats_json()` скаржиться в журнал. */
-    char json[1280];
+    char json[1792];
     const size_t n = bridge_stats_json(json, sizeof(json));
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -535,6 +729,21 @@ esp_err_t ws_bridge_start(void)
         ESP_LOGE(TAG, "ws_bridge_init() не викликано");
         return ESP_ERR_INVALID_STATE;
     }
+
+    /* ⚠️ Чужі попередження в гарячому шляху — не шум, а затримка.
+     *
+     * `httpd_ws.c:449,456` друкує два рядки на **кожне** невдале
+     * відправлення, а консоль — це UART0 на 115200 без драйвера, тобто
+     * синхронне очікування FIFO в задачі, що друкує. Разом ≈90 Б ≈ 7.5 мс, і
+     * блокує це `ws_tx_task` рівно тоді, коли черга й так переповнюється.
+     * Замір показав би «винна повна черга», а винен був би журнал.
+     *
+     * `httpd_txrx` глушиться за компанію: нашого шляху він більше не
+     * стосується (`send_all` кличе `send()` напряму), але тим самим рядком
+     * закривається і решта його балакучості під навантаженням.
+     */
+    esp_log_level_set("httpd_ws", ESP_LOG_ERROR);
+    esp_log_level_set("httpd_txrx", ESP_LOG_ERROR);
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.stack_size = 8192; /* у обробнику лежить буфер на BRIDGE_WS_RX_MAX */

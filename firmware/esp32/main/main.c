@@ -75,17 +75,38 @@ static void chunk_flush(void)
         return;
     }
 
+    /* ⚠️ Рахуємо **тут**, а не в `ws_bridge_send`: там видно лише те, що
+     * доїхало, а найбільші пачки — саме ті, що гинуть. Середнє по
+     * `ws_bytes/ws_chunks` через це занижене, і саме на ньому будувалось би
+     * рішення про розмір пачки (критерій 3 задачі 0018). */
+    g_stats.chunks_built++;
+    g_stats.chunk_bytes_built += (uint32_t)s_chunk_len;
+    if (s_chunk_len > g_stats.chunk_len_max) {
+        g_stats.chunk_len_max = (uint32_t)s_chunk_len;
+    }
+
     if (!ws_bridge_has_client()) {
         /* Телефона немає. Це не втрата: пульт говорить лише у відповідь на
          * `PING`, тож сюди потрапляє хіба хвіст кадру, початий за мить до
          * розриву. Рахуємо окремо, щоб не псувати мірку заторів. */
         g_stats.chunks_noclient++;
-    } else if (xRingbufferSend(s_ring, s_chunk, s_chunk_len, 0) != pdTRUE) {
-        /* Wi-Fi не встигає. Відкидаємо цілими пакетами — саме заради цього
-         * міст і розбирає кадрування (framing.h). */
-        g_stats.chunks_dropped++;
-        g_stats.tiles_dropped += s_chunk_tiles;
-        g_stats.packets_dropped += s_chunk_packets;
+    } else {
+        /* ⚠️ Вільне місце знімаємо **перед** спробою: саме в цю мить черга
+         * найповніша. Число відповідає на питання, якого досі не було кому
+         * поставити — чи втрати взагалі в черзі. Далеке від нуля означає,
+         * що ні, і тоді шукати треба в передаванні. */
+        const size_t ring_free = xRingbufferGetCurFreeSize(s_ring);
+        if (ring_free < g_stats.ring_free_min) {
+            g_stats.ring_free_min = (uint32_t)ring_free;
+        }
+
+        if (xRingbufferSend(s_ring, s_chunk, s_chunk_len, 0) != pdTRUE) {
+            /* Wi-Fi не встигає. Відкидаємо цілими пакетами — саме заради
+             * цього міст і розбирає кадрування (framing.h). */
+            g_stats.chunks_dropped++;
+            g_stats.tiles_dropped += s_chunk_tiles;
+            g_stats.packets_dropped += s_chunk_packets;
+        }
     }
 
     s_chunk_len = 0;
@@ -269,6 +290,9 @@ void app_main(void)
         ESP_LOGE(TAG, "не вистачило пам'яті на чергу до Wi-Fi");
         abort();
     }
+    /* «Найменше вільне» мусить починатися зі стелі, інакше нуль у знімку
+     * означав би і «черга впиралась», і «жодної пачки ще не було». */
+    g_stats.ring_free_min = xRingbufferGetCurFreeSize(s_ring);
 
     ESP_ERROR_CHECK(wifi_ap_start());
     ESP_ERROR_CHECK(ws_bridge_start());

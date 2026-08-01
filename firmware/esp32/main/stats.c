@@ -8,9 +8,12 @@
 #include <stdio.h>
 
 #include "bridge_cfg.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "ws_bridge.h"
 
 static const char *TAG = "stats";
@@ -36,9 +39,39 @@ const char *bridge_lost_name(bridge_lost_t reason)
     return "невідомо";
 }
 
+/**
+ * @brief Найбільший суцільний вільний шматок купи, з кешем.
+ *
+ * ⚠️ Кеш тут не заради швидкості. `heap_caps_get_largest_free_block()`
+ * зводиться до `tlsf_walk_pool` по **всіх** блоках кожної купи, і робить це
+ * під замком розподільника — того самого, який потрібен lwIP на pbuf.
+ * Клієнт смикає `/api/stats` раз на секунду (`webui/app.js`), тобто поле,
+ * поставлене заради `ENOMEM`, дістало б право його породжувати.
+ *
+ * П'ять секунд — компроміс: фрагментація так швидко не міняється, а прогін
+ * заміру однаково дивиться на мінімум за весь час, а не на мить.
+ */
+static uint32_t largest_free_cached(void)
+{
+    static int64_t taken_us;
+    static uint32_t value;
+
+    const int64_t now = esp_timer_get_time();
+    if (value == 0 || now - taken_us > 5 * 1000 * 1000) {
+        value = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+        taken_us = now;
+    }
+    return value;
+}
+
 size_t bridge_stats_json(char *out, size_t cap)
 {
     const bridge_stats_t *s = &g_stats;
+
+    /* Виконується в задачі httpd, тож питає саме її стек — той, на якому
+     * лежить `json[]` нижче. Найменше значення за весь час: `high water
+     * mark` монотонно спадає, тому просто перезаписуємо. */
+    g_stats.httpd_stack_free = (uint32_t)uxTaskGetStackHighWaterMark(NULL);
 
     const int n = snprintf(
         out, cap,
@@ -47,12 +80,19 @@ size_t bridge_stats_json(char *out, size_t cap)
         "\"baud\":%d,"
         "\"heap_free\":%u,"
         "\"heap_min\":%u,"
+        "\"heap_largest\":%u,"
+        "\"httpd_stack_free\":%u,"
         "\"client\":%s,"
         "\"uart\":{\"bytes\":%u,\"packets\":%u,\"tiles\":%u,\"frames\":%u,"
         "\"crc_errors\":%u,\"oversized\":%u,\"dropped\":%u,\"silence_resets\":%u},"
         "\"ws\":{\"bytes\":%u,\"chunks\":%u,\"errors\":%u,"
         "\"tiles_dropped\":%u,\"packets_dropped\":%u,\"chunks_dropped\":%u,"
-        "\"chunks_noclient\":%u,\"send_dropped\":%u},"
+        "\"chunks_noclient\":%u,\"send_dropped\":%u,"
+        "\"chunks_built\":%u,\"chunk_bytes_built\":%u,\"chunk_len_max\":%u,"
+        "\"ring_free_min\":%u},"
+        "\"send_err\":{\"nomem\":%u,\"again\":%u,\"conn\":%u,\"other\":%u,"
+        "\"last\":%d,\"errno_last\":%d,\"ms_max\":%u,"
+        "\"partial\":%u,\"truncated\":%u},"
         "\"client_to_radio\":{\"bytes\":%u,\"packets\":%u,\"input\":%u},"
         "\"session\":{\"seen\":%u,\"lost\":%u,\"releases\":%u,\"silence_timeouts\":%u},"
         "\"lost_by\":{\"evicted\":%u,\"send_fail\":%u,\"oversized\":%u,"
@@ -64,11 +104,16 @@ size_t bridge_stats_json(char *out, size_t cap)
         "}",
         (unsigned long long)(esp_timer_get_time() / 1000000), U(s->baud_current),
         U(esp_get_free_heap_size()), U(esp_get_minimum_free_heap_size()),
+        U(largest_free_cached()), U(s->httpd_stack_free),
         ws_bridge_has_client() ? "true" : "false", U(s->uart_bytes), U(s->packets_ok),
         U(s->tiles_in), U(s->frames_in), U(s->crc_errors), U(s->oversized), U(s->uart_dropped),
         U(s->silence_resets), U(s->ws_bytes), U(s->ws_chunks), U(s->ws_errors),
         U(s->tiles_dropped), U(s->packets_dropped), U(s->chunks_dropped), U(s->chunks_noclient),
-        U(s->send_dropped), U(s->client_bytes), U(s->client_packets), U(s->client_input),
+        U(s->send_dropped), U(s->chunks_built), U(s->chunk_bytes_built), U(s->chunk_len_max),
+        U(s->ring_free_min), U(s->send_err_nomem), U(s->send_err_again), U(s->send_err_conn),
+        U(s->send_err_other), (int)s->send_err_last, (int)s->send_errno_last,
+        U(s->send_ms_max), U(s->send_partial), U(s->send_truncated),
+        U(s->client_bytes), U(s->client_packets), U(s->client_input),
         U(s->clients_seen), U(s->clients_lost), U(s->input_releases), U(s->silence_timeout),
         U(s->lost_evicted), U(s->lost_send_fail), U(s->lost_oversized), U(s->lost_ws_close),
         U(s->lost_socket), U(s->lost_socket_silent), U(s->lost_wifi), U(s->gap_max_ms),
