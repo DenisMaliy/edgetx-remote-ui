@@ -994,7 +994,13 @@ void transmit()
   // Цикл міг вийти й за лічильником — на цілі, де вся сітка влазить в одну
   // пачку, це рівно шлях REFRESH. Тоді карта вже порожня, але `drained` цього
   // не побачив, і кадр закрився б на прохід пізніше.
-  if (!drained && captureDirtyCount() == 0) {
+  //
+  // ⚠️ Карта читається рівно **один раз на прохід**: це саме число і вирішує,
+  // чи кадр цілісний, і їде клієнту у FRAME_END. Два окремі читання дали б два
+  // різні числа — гачок працює паралельно, — і кадр, закритий як цілісний,
+  // поїхав би з dirtyTiles > 0, змусивши клієнта чекати того, що вже приїхало.
+  const uint32_t dirtyTiles = captureDirtyCount();
+  if (!drained && dirtyTiles == 0) {
     drained = true;
   }
 
@@ -1026,13 +1032,21 @@ void transmit()
   //    тріпотінні Wi-Fi, потрапив би саме туди, і картинка застигла б назовсім.
   //    Коли на дріт поїхав цілий екран плиток, показувати вже безпечно.
   //
+  // ⚠️ Причини 2 і 3 закривають кадр, який цілісним **не є**: у карті лишаються
+  // непослані плитки, і клієнт покаже картинку, зшиту з двох митей. Момент
+  // закриття від цього не міняється — міняється те, що клієнт про нього знає:
+  // у вантажі FRAME_END їде `dirtyTiles`, і за цим числом клієнт вирішує,
+  // показувати негайно чи дочекатись решти (docs/03-protocol.md, 0x03).
+  //
   // Не влізло — `s_lastFrameSent` і `s_tilesSinceFrameEnd` лишаються як були,
   // тому наступний прохід спробує знову. Окремого прапорця для цього не
   // потрібно.
   if (s_tilesSinceFrameEnd > 0 &&
       (drained || framesBefore != s_lastFrameSent ||
        s_tilesSinceFrameEnd >= static_cast<uint32_t>(TILE_COUNT))) {
-    if (appendFrame(PKT_FRAME_END, nullptr, 0)) {
+    uint8_t frameEnd[FRAME_END_PAYLOAD_SIZE];
+    buildFrameEnd(frameEnd, dirtyTiles);
+    if (appendFrame(PKT_FRAME_END, frameEnd, sizeof(frameEnd))) {
       s_lastFrameSent = framesBefore;
       s_tilesSinceFrameEnd = 0;
     }

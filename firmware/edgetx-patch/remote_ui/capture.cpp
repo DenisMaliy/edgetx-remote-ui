@@ -240,14 +240,40 @@ uint32_t captureFrameCount()
 
 uint32_t captureDirtyCount()
 {
+  // Рахуємо по словах, а не по плитках: 5 читань замість 135. Це гарячий шлях
+  // — задача транспорту проходить його щодві мілісекунди, — а читання того
+  // самого слова по 32 рази нічого не додає.
+  //
+  // Біти понад TILE_COUNT у старшому слові завжди нульові (markTile ставить
+  // лише дійсні індекси, captureReset обнуляє все), але маска стоїть явно:
+  // покладатись тут на «ніхто не поставить» означало б, що одна майбутня
+  // помилка в чужому місці тихо завищить лічильник, а він тепер їде клієнту.
   uint32_t count = 0;
-  for (int i = 0; i < TILE_COUNT; ++i) {
-    const uint32_t bit = 1u << (i & 31);
-    if (s_dirty[i >> 5].load(std::memory_order_relaxed) & bit) {
-      ++count;
+  for (size_t w = 0; w < DIRTY_WORDS; ++w) {
+    uint32_t bits = s_dirty[w].load(std::memory_order_relaxed);
+
+    const size_t firstBit = w * 32;
+    if (firstBit + 32 > static_cast<size_t>(TILE_COUNT)) {
+      const size_t valid = static_cast<size_t>(TILE_COUNT) - firstBit;
+      bits &= (valid >= 32) ? 0xFFFFFFFFu : ((1u << valid) - 1u);
     }
+
+    count += static_cast<uint32_t>(__builtin_popcount(bits));
   }
   return count;
+}
+
+// Сітка рахується з LCD_W/LCD_H, а не прибита до TX16S (де вона 15×9 = 135).
+// Якщо колись з'явиться ціль, де плиток більше за 65535, `dirtyTiles` мовчки
+// обрізався б — і «дуже багато незасланого» перетворилось би на «нуль, кадр
+// цілісний, показуй». Це найгірший з можливих збоїв, тому зупиняємо збірку.
+static_assert(TILE_COUNT <= 0xFFFF, "dirtyTiles у FRAME_END — uint16");
+
+void buildFrameEnd(uint8_t (&out)[FRAME_END_PAYLOAD_SIZE], uint32_t dirtyTiles)
+{
+  const uint16_t n = static_cast<uint16_t>(dirtyTiles);
+  out[0] = static_cast<uint8_t>(n & 0xFF);
+  out[1] = static_cast<uint8_t>(n >> 8);
 }
 
 void captureReset(bool shadowReady)

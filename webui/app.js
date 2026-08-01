@@ -50,6 +50,11 @@ const counters = {
   beforeHello: 0,
   frames: 0,
   autoRefresh: 0,   // скільки разів просили REFRESH через втрати на мості
+
+  // Звідки взявся кожен показаний кадр — три взаємовиключні причини.
+  framesWhole: 0,     // FRAME_END сказав dirtyTiles = 0: кадр цілісний
+  framesTimeout: 0,   // решта не доїхала за строк — показали як є
+  framesLegacy: 0,    // прошивка без ознаки повноти (до задачі 0019)
 };
 
 /* --- скільки головний потік зайнятий нами ---------------------------------
@@ -79,6 +84,10 @@ const prof = {
 };
 
 function resizeTo(w, h) {
+  // Буфер зараз підміниться на порожній — відкладений показ малював би вже не
+  // той кадр, якого чекав.
+  cancelPendingFrame();
+
   W = w; H = h;
   canvas.width = w;
   canvas.height = h;
@@ -132,6 +141,91 @@ function showFrame() {
   counters.frames++;
   lastFrameAt = performance.now();
   veil(null);
+}
+
+/* --- кадр, який ще не цілий ------------------------------------------------
+ *
+ * `FRAME_END` каже, скільки плиток лишилось незасланими. Пульт закриває кадр за
+ * подією «LVGL домалював», не чекаючи, доїхали всі плитки чи ні, — і на великій
+ * перемальовці лишається приблизно половина. Показаний такий кадр — це картинка,
+ * зшита з двох митей: на гортанні списку людина бачить дві рамки виділення
+ * одночасно.
+ *
+ * Момент закриття кадру в прошивці навмисний і не міняється (без нього картинка
+ * застигала б саме тоді, коли рухається). Міняється те, що клієнт про кадр
+ * **знає**: при N > 0 він чекає доїзду решти, і показує зшите лише тоді, коли
+ * решта не доїхала за строк.
+ */
+let pendingFrameTimer = null;
+let waitingSince = 0;   // мить першого FRAME_END у поточній низці з N > 0
+
+function cancelPendingFrame() {
+  if (pendingFrameTimer !== null) {
+    clearTimeout(pendingFrameTimer);
+    pendingFrameTimer = null;
+  }
+}
+
+function onFrameEnd(payload) {
+  // FRAME_END до HELLO законний рівно так само, як плитка до нього: над TCP
+  // пульт вітається сам. Класти пікселі нікуди, тож і чекати нема на що —
+  // інакше звели б таймер, який за 50–250 мс покличе показ у порожнечу.
+  if (!frameBuf) return;
+
+  const dirty = P.parseFrameEnd(payload);
+
+  // Стара прошивка: ознаки повноти немає — поводимось рівно як досі.
+  if (dirty === null) {
+    cancelPendingFrame();
+    counters.framesLegacy++;
+    showFrame();
+    return;
+  }
+
+  // ⚠️ Цілий кадр показуємо **в цьому ж обробнику**, без setTimeout і без
+  // requestAnimationFrame. Будь-яке відкладання тут — це зростання затримки від
+  // дотику до зміни на екрані, а саме її задача обіцяла не чіпати.
+  if (dirty === 0) {
+    cancelPendingFrame();
+    counters.framesWhole++;
+    showFrame();
+    return;
+  }
+
+  // ⚠️ Стеля рахується від початку **поточної низки** очікування, а не від
+  // кожного FRAME_END окремо і не від останнього показаного кадру.
+  //
+  // Від кожного FRAME_END — безперервне гортання, де dirtyTiles не спадає до
+  // нуля ніколи, відсувало б показ щоразу, і екран замерз би назавжди: рівно те,
+  // від чого стеля й існує.
+  //
+  // Від останнього показаного кадру — теж хибно, і хибно тихо: після паузи на
+  // нерухомому екрані запас уже вичерпаний, тож перший же неповний кадр
+  // показався б негайно, без очікування. А це і є головний випадок задачі —
+  // людина починає гортати список після того, як дивилась на нього.
+  const now = performance.now();
+  if (pendingFrameTimer === null) {
+    waitingSince = now;   // низка починається
+  }
+  const wait = Math.min(P.frameWaitMs(dirty),
+                        waitingSince + P.FRAME_WAIT_MAX_MS - now);
+
+  cancelPendingFrame();
+
+  if (wait <= 0) {
+    counters.framesTimeout++;
+    showFrame();
+    return;
+  }
+
+  pendingFrameTimer = setTimeout(() => {
+    pendingFrameTimer = null;
+    counters.framesTimeout++;
+    showFrame();
+  }, wait);
+
+  // Плитки тим часом як лягали у frameBuf, так і лягають: накопичення не
+  // спиняється ніколи, чекає лише показ.
 }
 
 // ------------------------------------------------------------ з'єднання ----
@@ -313,6 +407,11 @@ function stopTimers() {
   clearInterval(holdTimer); holdTimer = null;
   clearInterval(pingTimer); pingTimer = null;
   clearInterval(greetTimer); greetTimer = null;
+
+  // Відкладений неповний кадр помирає разом зі з'єднанням: решта плиток уже не
+  // доїде ніколи, а показувати зшите поверх завіси «зв'язок обірвано» —
+  // брехати про те, що зв'язок є.
+  cancelPendingFrame();
 }
 
 /**
@@ -388,7 +487,7 @@ function onPacket(type, payload) {
       break;
 
     case P.PKT_FRAME_END:
-      showFrame();
+      onFrameEnd(payload);
       break;
 
     case P.PKT_LOG:
@@ -547,6 +646,9 @@ async function updateInfo() {
     `  поза екраном   ${counters.outOfBounds}`,
     `  до HELLO       ${counters.beforeHello}`,
     `  кадрів         ${counters.frames}`,
+    `    цілих (dirtyTiles = 0)       ${counters.framesWhole}`,
+    `    показано за строком          ${counters.framesTimeout}`,
+    `    без ознаки повноти           ${counters.framesLegacy}`,
     `  REFRESH через втрати на мості  ${counters.autoRefresh}`,
     '',
     'головний потік, мс за секунду',
@@ -586,10 +688,17 @@ setInterval(updateInfo, 1000);
  * шукати треба тут, а не в ефірі.
  */
 let lastFrames = 0;
+let lastWhole = 0;
 let lastProfAt = performance.now();
 setInterval(() => {
-  chip('fps', (counters.frames - lastFrames) + ' кадр/с');
+  // ⚠️ Частка цілих кадрів стоїть поруч із частотою, а не в панелі під
+  // кнопкою: обидва критерії задачі 0019 (скільки кадрів цілі, і чого коштувало
+  // очікування) людина зі стенда звіряє очима, тримаючи телефон у руках.
+  const shown = counters.frames - lastFrames;
+  const whole = counters.framesWhole - lastWhole;
   lastFrames = counters.frames;
+  lastWhole = counters.framesWhole;
+  chip('fps', `${shown} кадр/с · ${whole} цілих`);
 
   const now = performance.now();
   const dt = Math.max(1, now - lastProfAt);

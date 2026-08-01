@@ -78,6 +78,13 @@ class GoldenVectors(unittest.TestCase):
             bytes.fromhex("E77E870D001000000002000000016400C800B36E"),
         )
 
+    def test_frame_end_with_dirty_tiles(self):
+        # Той самий вектор перевіряють webui/proto_test.js і test_capture.cpp.
+        self.assertEqual(
+            proto.encode_frame(proto.PKT_FRAME_END, b"\x2A\x00"),
+            bytes.fromhex("E77E0302002A009BFB"),
+        )
+
     def test_crc_of_check_string(self):
         # Класичний вектор CRC-16/CCITT-FALSE: "123456789" -> 0x29B1.
         self.assertEqual(proto.crc16_ccitt_false(b"123456789"), 0x29B1)
@@ -91,6 +98,33 @@ class GoldenVectors(unittest.TestCase):
         # періоди INPUT_STATE. Числа пов'язані й міняються тільки разом.
         self.assertEqual(proto.INPUT_STATE_PERIOD_S, 0.25)
         self.assertEqual(proto.PING_PERIOD_S, 2.0)
+
+
+class FrameEnd(unittest.TestCase):
+    """Чи цілий кадр — і скільки чекати, якщо ні (docs/03-protocol.md, 0x03)."""
+
+    def test_parses_little_endian(self):
+        self.assertEqual(proto.parse_frame_end(b"\x2A\x00"), 42)
+        self.assertEqual(proto.parse_frame_end(b"\x00\x00"), 0)
+        self.assertEqual(proto.parse_frame_end(b"\x01\x01"), 257)
+
+    def test_tail_is_ignored(self):
+        # Правило сумісності: поля лише в кінець, невідомий хвіст не заважає.
+        self.assertEqual(proto.parse_frame_end(b"\x05\x00\xFF\xFF"), 5)
+
+    def test_missing_field_is_none_not_zero(self):
+        # ⚠️ Найважливіша перевірка файлу. Порожній FRAME_END шле прошивка до
+        # задачі 0019, і це «не знаю», а не «нуль». Сплутати їх означає показати
+        # зшитий кадр як цілісний — рівно той розлам, який лікуємо.
+        self.assertIsNone(proto.parse_frame_end(b""))
+        self.assertIsNone(proto.parse_frame_end(b"\x07"))
+
+    def test_wait_is_linear_up_to_the_ceiling(self):
+        self.assertEqual(proto.frame_wait_ms(0), 50)
+        self.assertEqual(proto.frame_wait_ms(10), 80)
+        self.assertEqual(proto.frame_wait_ms(60), 230)
+        self.assertEqual(proto.frame_wait_ms(67), 250)
+        self.assertEqual(proto.frame_wait_ms(1000), 250)
 
 
 class Framing(unittest.TestCase):
@@ -256,6 +290,100 @@ class SessionBehaviour(unittest.TestCase):
         session.handle(proto.PKT_FRAME_END, b"")
         self.assertEqual(len(shown), 1)
         self.assertEqual(session.last_frame_tiles, 1)
+
+    def whole_tile(self, session):
+        """Одна плитка на весь екран 2×1 — щоб було що показувати."""
+        session.handle(
+            proto.PKT_TILE,
+            tile_payload(0, 0, 2, 1, proto.TILE_METHOD_RAW, struct.pack("<2H", 0xFFFF, 0)),
+        )
+
+    def test_whole_frame_is_shown_immediately(self):
+        # dirtyTiles = 0: чекати нема чого, показ у тому самому обробнику.
+        shown = []
+        session = Session(on_frame=lambda s: shown.append(bytes(s.buf)))
+        self.hello(session, 2, 1)
+        self.whole_tile(session)
+        session.handle(proto.PKT_FRAME_END, b"\x00\x00", now=100.0)
+        self.assertEqual(len(shown), 1)
+        self.assertEqual(session.frames_whole, 1)
+        self.assertEqual(session.frames_timeout, 0)
+
+    def test_incomplete_frame_waits_then_shows_on_zero(self):
+        # Решта плиток доїхала — показуємо цілий кадр, а не зшитий.
+        shown = []
+        session = Session(on_frame=lambda s: shown.append(bytes(s.buf)))
+        self.hello(session, 2, 1)
+        self.whole_tile(session)
+
+        session.handle(proto.PKT_FRAME_END, b"\x0A\x00", now=100.0)  # 10 плиток
+        self.assertEqual(shown, [])  # чекаємо
+
+        session.flush_stale(100.05)  # строк 80 мс ще не вийшов
+        self.assertEqual(shown, [])
+
+        self.whole_tile(session)
+        session.handle(proto.PKT_FRAME_END, b"\x00\x00", now=100.06)
+        self.assertEqual(len(shown), 1)
+        self.assertEqual(session.frames_whole, 1)
+        self.assertEqual(session.frames_timeout, 0)
+
+    def test_lost_tiles_do_not_freeze_the_screen(self):
+        # ⚠️ Критерій 2.3 задачі 0019, і перевіряється він **навмисною** втратою:
+        # FRAME_END каже «10 плиток ще в дорозі», і далі не приходить нічого.
+        # Клієнт зобов'язаний показати як є, а не завмерти назавжди.
+        shown = []
+        session = Session(on_frame=lambda s: shown.append(bytes(s.buf)))
+        self.hello(session, 2, 1)
+        self.whole_tile(session)
+
+        session.handle(proto.PKT_FRAME_END, b"\x0A\x00", now=100.0)
+        self.assertEqual(shown, [])
+
+        session.flush_stale(100.079)  # строк 50 + 3×10 = 80 мс
+        self.assertEqual(shown, [])
+
+        session.flush_stale(100.081)
+        self.assertEqual(len(shown), 1)
+        self.assertEqual(session.frames_timeout, 1)
+        self.assertEqual(session.frames_whole, 0)
+
+        # Показувати нема чого — вдруге не спрацьовує.
+        session.flush_stale(200.0)
+        self.assertEqual(len(shown), 1)
+
+    def test_ceiling_stops_endless_scrolling_from_freezing_the_screen(self):
+        # Безперервне гортання: dirtyTiles не спадає до нуля ніколи. Якби строк
+        # зводився від кожного FRAME_END наново, екран замерз би назавжди —
+        # стеля рахується від початку низки очікування й це обриває.
+        shown = []
+        session = Session(on_frame=lambda s: shown.append(bytes(s.buf)))
+        self.hello(session, 2, 1)
+        self.whole_tile(session)
+
+        t = 100.0
+        for _ in range(40):  # 40 × 10 мс = 400 мс > стелі 250 мс
+            session.handle(proto.PKT_FRAME_END, b"\x64\x00", now=t)  # 100 плиток
+            session.flush_stale(t)
+            t += 0.010
+
+        self.assertGreaterEqual(len(shown), 1)
+        self.assertEqual(session.frames_whole, 0)
+        # Не частіше ніж раз на стелю: 400 мс дають щонайбільше два покази.
+        self.assertLessEqual(len(shown), 2)
+
+    def test_old_firmware_frame_end_shows_at_once(self):
+        # Порожній FRAME_END — прошивка до задачі 0019. Ознаки повноти немає,
+        # поводимось рівно як досі: показуємо. Помилка в бік «чекаю» дала б
+        # мертву картинку на кожному кадрі.
+        shown = []
+        session = Session(on_frame=lambda s: shown.append(bytes(s.buf)))
+        self.hello(session, 2, 1)
+        self.whole_tile(session)
+        session.handle(proto.PKT_FRAME_END, b"", now=100.0)
+        self.assertEqual(len(shown), 1)
+        self.assertEqual(session.frames_legacy, 1)
+        self.assertEqual(session.frames_whole, 0)
 
     def test_stale_tiles_are_shown_without_frame_end(self):
         # Запобіжник проти реальної поведінки прошивки: на нерухомому екрані

@@ -179,6 +179,26 @@ TEST(EncodeRejectsBadArguments)
            remote_ui::FRAME_OVERHEAD);
 }
 
+TEST(EncodeGoldenFrameEndWithDirtyTiles)
+{
+  // Той самий вектор перевіряють tools/proto_test.py і webui/proto_test.js:
+  // FRAME_END із dirtyTiles = 42 (docs/03-protocol.md, 0x03).
+  //
+  // Порожній FRAME_END вище лишається законним назавжди — так шле прошивка до
+  // задачі 0019, і клієнт зобов'язаний розрізняти «не знаю» і «нуль».
+  const uint8_t payload[] = {0x2A, 0x00};
+  const uint8_t expected[] = {0xE7, 0x7E, 0x03, 0x02, 0x00,
+                              0x2A, 0x00, 0x9B, 0xFB};
+
+  const size_t len = remote_ui::encodeFrame(remote_ui::PKT_FRAME_END, payload,
+                                            sizeof(payload), g_frame,
+                                            sizeof(g_frame));
+  CHECK_EQ(len, sizeof(expected));
+  for (size_t i = 0; i < sizeof(expected); ++i) {
+    CHECK_EQ(g_frame[i], expected[i]);
+  }
+}
+
 // --- Туди й назад ---------------------------------------------------------
 
 TEST(RoundTripEmptyPayload)

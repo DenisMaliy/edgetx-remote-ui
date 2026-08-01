@@ -13,8 +13,10 @@
 #include "../capture.h"
 #include "test_harness.h"
 
+using remote_ui::buildFrameEnd;
 using remote_ui::captureDirtyCount;
 using remote_ui::captureFrameCount;
+using remote_ui::FRAME_END_PAYLOAD_SIZE;
 using remote_ui::captureMarkAllDirty;
 using remote_ui::captureOnFlush;
 using remote_ui::captureReset;
@@ -328,4 +330,38 @@ TEST(CaptureMarkAllDirtyRefusesBeforeFirstFlush)
 
   // Наступний виклик повторно вже нічого не блокує.
   CHECK(captureMarkAllDirty());
+}
+
+TEST(BuildFrameEndTellsHowMuchIsStillOnTheWay)
+{
+  // Вантаж FRAME_END — те, за чим клієнт вирішує, показувати кадр негайно чи
+  // дочекатись решти плиток (docs/03-protocol.md, 0x03).
+  captureReset();
+
+  uint8_t out[FRAME_END_PAYLOAD_SIZE];
+
+  // Порожня карта — кадр цілісний.
+  buildFrameEnd(out, captureDirtyCount());
+  CHECK_EQ(out[0], 0);
+  CHECK_EQ(out[1], 0);
+
+  // Уся сітка брудна — число мусить збігтися з лічильником, і саме
+  // little-endian, як усе інше в протоколі.
+  captureMarkAllDirty();
+  buildFrameEnd(out, captureDirtyCount());
+  CHECK_EQ(static_cast<uint32_t>(out[0] | (out[1] << 8)),
+           static_cast<uint32_t>(TILE_COUNT));
+  CHECK_EQ(captureDirtyCount(), static_cast<uint32_t>(TILE_COUNT));
+
+  // Забрана плитка з числа зникає: клієнт має чекати рівно тих, що ще в дорозі.
+  TileRef tile;
+  CHECK(captureTakeTile(tile, g_tileBuf, TILE_MAX_PIXELS));
+  buildFrameEnd(out, captureDirtyCount());
+  CHECK_EQ(static_cast<uint32_t>(out[0] | (out[1] << 8)),
+           static_cast<uint32_t>(TILE_COUNT - 1));
+
+  // Порядок байтів на числі, що не вміщається в один байт: 300 = 0x012C.
+  buildFrameEnd(out, 300);
+  CHECK_EQ(out[0], 0x2C);
+  CHECK_EQ(out[1], 0x01);
 }

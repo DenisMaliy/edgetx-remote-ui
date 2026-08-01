@@ -335,7 +335,11 @@ void serveClient(int fd)
 
     // Цикл міг вийти й за лічильником — тоді карта вже порожня, але `drained`
     // цього не побачив, і кадр закрився б на прохід пізніше.
-    if (!drained && captureDirtyCount() == 0) {
+    //
+    // Карта читається один раз на прохід — те саме число вирішує «цілісний» і
+    // їде клієнту. Правило дослівно те саме, що в transport_uart.cpp.
+    const uint32_t dirtyTiles = captureDirtyCount();
+    if (!drained && dirtyTiles == 0) {
       drained = true;
     }
 
@@ -356,11 +360,16 @@ void serveClient(int fd)
     //    REFRESH частіше, ніж карта порожніє.
     //
     // Правило дослівно те саме, що в transport_uart.cpp: транспорти не мають
-    // права розходитись у тому, коли клієнту показувати кадр.
+    // права розходитись ані в тому, **коли** клієнту показувати кадр, ані в
+    // тому, **що** вони при цьому кажуть про його цілісність. Причини 2 і 3
+    // закривають кадр із неспорожнілою картою — `dirtyTiles` у вантажі й каже
+    // клієнту, скільки плиток ще в дорозі (docs/03-protocol.md, 0x03).
     if (s_tilesSinceFrameEnd > 0 &&
         (drained || framesBefore != lastFrameSent ||
          s_tilesSinceFrameEnd >= static_cast<uint32_t>(TILE_COUNT))) {
-      if (!sendPacket(fd, PKT_FRAME_END, nullptr, 0)) {
+      uint8_t frameEnd[FRAME_END_PAYLOAD_SIZE];
+      buildFrameEnd(frameEnd, dirtyTiles);
+      if (!sendPacket(fd, PKT_FRAME_END, frameEnd, sizeof(frameEnd))) {
         break;
       }
       lastFrameSent = framesBefore;

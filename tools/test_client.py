@@ -36,6 +36,7 @@ import tkinter as tk
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from remote_ui_proto import (  # noqa: E402
+    FRAME_WAIT_MAX_MS,
     HELLO_FLAG_ENCODER,
     HELLO_FLAG_INPUT_STATE,
     HELLO_FLAG_TOUCH,
@@ -63,8 +64,10 @@ from remote_ui_proto import (  # noqa: E402
     encode_frame,
     encode_key,
     encode_touch,
+    frame_wait_ms,
     hold_packet,
     make_connector,
+    parse_frame_end,
     parse_hello,
 )
 
@@ -189,11 +192,34 @@ class Session:
         self.bad_tiles = 0
         self.unknown = 0
         self.forced = 0  # кадрів, показаних без FRAME_END
+        # ⚠️ Дві різні величини, і плутати їх не можна.
+        #
+        # `frames` — скільки кадрів **показано**, тобто що бачила людина.
+        # `frame_ends` — скільки `FRAME_END` **прийшло по дроту**.
+        #
+        # До задачі 0019 вони збігалися: кожен FRAME_END одразу показував кадр.
+        # Тепер між ними лежить очікування, і саме різниця між ними — ціна
+        # задачі. Критерій 4.1 («кадрів за секунду до і після») питає про
+        # `frames`: частота на дроті не змінилась і збрехала б у потрібний бік.
+        self.frame_ends = 0
+        # Звідки взявся кожен показаний кадр (крім `forced`);
+        # сума трьох дорівнює `frames` рівно.
+        self.frames_whole = 0  # dirtyTiles = 0 — кадр цілісний
+        self.frames_timeout = 0  # решта не доїхала за строк
+        self.frames_legacy = 0  # прошивка без ознаки повноти
+        self.pending_since = None  # початок поточної низки очікування
+        self.pending_until = None  # коли показати неповний кадр як є
         self.logs = 0
         self.hello_at = None  # час останнього HELLO — відповідь на PING
         self.hello_count = 0
 
-    def handle(self, ptype: int, payload: bytes):
+    def handle(self, ptype: int, payload: bytes, now: float | None = None):
+        """`now` передає транспорт — він його вже має. None означає «зараз».
+
+        Час приходить ззовні заради тестів строку очікування: без цього їх
+        довелося б писати зі справжніми паузами, і вони або гальмували б прогін,
+        або мигали б залежно від навантаження машини.
+        """
         if ptype == PKT_HELLO:
             self.hello_at = time.monotonic()
             if len(payload) < 13:
@@ -237,8 +263,7 @@ class Session:
         elif ptype == PKT_FRAME_END:
             if self.screen is None:
                 return
-            self.frames += 1
-            self._show()
+            self._frame_end(parse_frame_end(payload), now)
 
         elif ptype == PKT_LOG:
             self.logs += 1
@@ -250,20 +275,82 @@ class Session:
         else:
             self.unknown += 1
 
+    def _frame_end(self, dirty, now=None):
+        """FRAME_END прийшов. `dirty` — скільки плиток ще в дорозі, або None.
+
+        Дзеркало правила з `webui/app.js`: цілий кадр показуємо негайно,
+        неповний — чекаємо доїзду решти зі строком. Клієнти не мають права
+        розходитись у тому, що людина бачить на екрані: саме цим вікном знімали
+        доказ розламу (дві рамки виділення в одному кадрі), ним же його й
+        знімають назад.
+        """
+        if now is None:
+            now = time.monotonic()
+
+        self.frame_ends += 1
+
+        if dirty is None:
+            # Стара прошивка: ознаки повноти немає — поводимось як досі.
+            self.frames += 1
+            self.frames_legacy += 1
+            self.pending_since = None
+            self._show()
+            return
+
+        if dirty == 0:
+            self.frames += 1
+            self.frames_whole += 1
+            self.pending_since = None
+            self._show()
+            return
+
+        # Низка очікування починається з першого неповного кадру, і стеля
+        # рахується від неї — не від кожного FRAME_END окремо (екран замерз би)
+        # і не від останнього показаного кадру (після паузи запас був би вже
+        # вичерпаний, тобто саме на гортанні після зупинки очікування не було б
+        # зовсім).
+        if self.pending_since is None:
+            self.pending_since = now
+
+        wait_s = min(
+            frame_wait_ms(dirty),
+            FRAME_WAIT_MAX_MS - (now - self.pending_since) * 1000.0,
+        ) / 1000.0
+
+        if wait_s <= 0:
+            self.frames += 1
+            self.frames_timeout += 1
+            self.pending_since = None
+            self._show()
+            return
+
+        self.pending_until = now + wait_s
+
     def _show(self):
         self.last_frame_tiles = self.tiles_in_frame
         self.tiles_in_frame = 0
+        self.pending_until = None
         if self.on_frame:
             self.on_frame(self.screen)
 
     def flush_stale(self, now: float):
-        """Показати кадр, якщо плитки прийшли, а FRAME_END так і не прийшов.
+        """Показати кадр, який зачекався. Дві різні причини, обидві — дефекти.
 
-        Викликається транспортом на кожному проході. Лічильник `forced` росте,
-        щоб дефект було видно у вікні, а не заметено під килим.
+        Викликається транспортом на кожному проході. Лічильники ростуть, щоб
+        дефекти було видно у вікні, а не заметено під килим.
         """
+        # 1. Кадр неповний, і решта плиток не доїхала за строк.
+        if self.pending_until is not None and now >= self.pending_until:
+            self.frames += 1
+            self.frames_timeout += 1
+            self.pending_since = None
+            self._show()
+            return
+
+        # 2. Плитки прийшли, а FRAME_END так і не прийшов узагалі.
         if self.tiles_in_frame and now - self.last_tile_at > FORCE_SHOW_S:
             self.forced += 1
+            self.pending_since = None
             self._show()
 
 
@@ -680,7 +767,7 @@ class Link(threading.Thread):
                 span_bytes += len(data)
                 last_rx = now
                 for ptype, payload in decoder.feed(data):
-                    session.handle(ptype, payload)
+                    session.handle(ptype, payload, now)
                 self.crc_errors = decoder.crc_errors
                 self.oversized = decoder.oversized
                 span_decode_s += time.monotonic() - now
@@ -936,7 +1023,7 @@ class Window:
         if elapsed >= 0.5:
             session = link.session
             fps_shown = self.window_shown / elapsed
-            fps_got = (session.frames - self.window_frames) / elapsed
+            fps_got = (session.frame_ends - self.window_frames) / elapsed
             kib = (link.rx_bytes - self.window_rx) / elapsed / 1024
             hello = session.hello
             head = (
@@ -948,11 +1035,12 @@ class Window:
             sent = link.sent
             self.line = (
                 f"{head}   {link.status}",
-                f"кадрів/с {fps_shown:4.1f} (прийнято {fps_got:4.1f})   "
+                f"кадрів/с {fps_shown:4.1f} (FRAME_END/с {fps_got:4.1f})   "
                 f"{kib:6.1f} КіБ/с   плиток {session.last_frame_tiles:3d}   "
                 f"затримка {self.lag_ms:4.1f} мс (макс {self.lag_max_ms:.0f})   "
                 f"CRC {link.crc_errors}  довж {link.oversized}  "
                 f"биті плитки {session.bad_tiles}  "
+                f"цілих {session.frames_whole}  за строком {session.frames_timeout}  "
                 f"без FRAME_END {session.forced}  "
                 f"застарілі {self.skipped}  розриви {link.drops}",
                 f"надіслано: клавіш {sent['key']:4d}  енкодер {sent['enc']:4d}  "
@@ -964,7 +1052,7 @@ class Window:
             self.window_started = now
             self.window_shown = 0
             self.window_rx = link.rx_bytes
-            self.window_frames = session.frames
+            self.window_frames = session.frame_ends
         self.stats.configure(text="\n".join(self.line))
 
 

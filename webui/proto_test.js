@@ -360,6 +360,37 @@ console.log('дзеркало вводу і вибір пакета утрима
         'дзеркало кодує так само, як пряма функція');
 }
 
+// -------------------------------------------------------------- FRAME_END --
+
+console.log('FRAME_END: чи цілий кадр');
+
+{
+  // Вектор, спільний із tools/proto_test.py і test_capture.cpp: FRAME_END із
+  // dirtyTiles = 42.
+  const fe = proto.encodeFrame(proto.PKT_FRAME_END, new Uint8Array([0x2A, 0x00]));
+  check(hex(fe) === 'E77E0302002A009BFB', 'FRAME_END з dirtyTiles=42: ' + hex(fe));
+
+  check(proto.parseFrameEnd(new Uint8Array([0x2A, 0x00])) === 42, 'dirtyTiles=42');
+  check(proto.parseFrameEnd(new Uint8Array([0x00, 0x00])) === 0, 'dirtyTiles=0');
+  // Little-endian, як усе інше в протоколі.
+  check(proto.parseFrameEnd(new Uint8Array([0x01, 0x01])) === 257, 'порядок байтів LE');
+  // Хвіст ігнорується — правило сумісності «поля лише в кінець».
+  check(proto.parseFrameEnd(new Uint8Array([0x05, 0x00, 0xFF, 0xFF])) === 5,
+        'зайвий хвіст не заважає');
+
+  // ⚠️ Порожній вантаж — це «не знаю», а не «нуль». Сплутати їх означає
+  // показати зшитий кадр як цілісний, тобто саме той розлам, який лікуємо.
+  check(proto.parseFrameEnd(new Uint8Array(0)) === null, 'порожній FRAME_END → null');
+  check(proto.parseFrameEnd(new Uint8Array([0x07])) === null, 'один байт → null');
+
+  // Строк очікування: лінійний до стелі, далі стала.
+  check(proto.frameWaitMs(0) === 50, 'строк при 0 плитках');
+  check(proto.frameWaitMs(10) === 80, 'строк при 10 плитках');
+  check(proto.frameWaitMs(60) === 230, 'строк при 60 плитках');
+  check(proto.frameWaitMs(67) === 250, 'стеля рівно на 67 плитках');
+  check(proto.frameWaitMs(1000) === 250, 'понад стелю строк не росте');
+}
+
 // ------------------------------------------------------------ координати ---
 
 console.log('знаковість координат');
