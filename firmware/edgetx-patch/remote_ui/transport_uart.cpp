@@ -300,7 +300,7 @@ uint16_t s_tilePixels[TILE_MAX_PIXELS];
 
 // Розмір рахується з MAX_KEYS, а не береться зі стелі: коли upstream додасть
 // клавіш, буфер виросте сам, а не почне мовчки не вміщати пакет.
-uint8_t s_helloPayload[helloMaxSize(MAX_KEYS)];
+uint8_t s_helloPayload[helloMaxSize(MAX_KEYS, BAUD_ALLOWED_COUNT)];
 
 Decoder s_decoder;
 
@@ -939,7 +939,8 @@ void transmit()
   // Вітання йде першим: інакше пачка плиток могла б відсувати його
   // проходами, а клієнт до HELLO не знає навіть розміру екрана.
   if (s_helloPending) {
-    const size_t helloLen = buildHello(s_helloPayload, sizeof(s_helloPayload));
+    const size_t helloLen = buildHello(s_helloPayload, sizeof(s_helloPayload),
+                                    baudSwitchSupported() ? s_baudCurrent : 0);
     if (helloLen > 0 && appendFrame(PKT_HELLO, s_helloPayload, helloLen)) {
       s_helloPending = false;
     }

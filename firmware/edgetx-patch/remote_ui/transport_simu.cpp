@@ -80,7 +80,7 @@ uint16_t s_tilePixels[TILE_MAX_PIXELS];
 //
 // Розмір рахується з MAX_KEYS, а не береться зі стелі: коли upstream додасть
 // клавіш, буфер виросте сам, а не почне мовчки не вміщати пакет.
-uint8_t s_helloPayload[helloMaxSize(MAX_KEYS)];
+uint8_t s_helloPayload[helloMaxSize(MAX_KEYS, BAUD_ALLOWED_COUNT)];
 
 Decoder s_decoder;
 
@@ -178,7 +178,7 @@ void onPacket(uint8_t type, const uint8_t* payload, size_t length, void* context
       break;
 
     case PKT_PING: {
-      const size_t helloLen = buildHello(s_helloPayload, sizeof(s_helloPayload));
+      const size_t helloLen = buildHello(s_helloPayload, sizeof(s_helloPayload), 0);
       const int fd = s_clientFd.load(std::memory_order_relaxed);
       if (helloLen > 0 && fd >= 0) {
         sendPacket(fd, PKT_HELLO, s_helloPayload, helloLen);
@@ -235,7 +235,7 @@ void serveClient(int fd)
   // Новий клієнт не відповідає за те, що встиг натиснути попередній.
   inputState().onDisconnect();
 
-  const size_t helloLen = buildHello(s_helloPayload, sizeof(s_helloPayload));
+  const size_t helloLen = buildHello(s_helloPayload, sizeof(s_helloPayload), 0);
   if (helloLen == 0) {
     fprintf(stderr, "Remote UI: HELLO не вліз у %zu байтів — клієнта відпускаю\n",
             sizeof(s_helloPayload));

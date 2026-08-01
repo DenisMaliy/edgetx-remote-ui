@@ -394,6 +394,28 @@ def parse_hello(payload: bytes) -> dict:
     target = payload[pos : pos + 32].split(b"\0")[0].decode("utf-8", "replace")
     pos += 32
     fw = payload[pos : pos + 16].split(b"\0")[0].decode("utf-8", "replace")
+    pos += 16
+
+    # --- Швидкість каналу (ADR-0005) --------------------------------------
+    #
+    # Хвіст, якого стара прошивка не шле. Його відсутність — не помилка, а
+    # відповідь: перемикання ця прошивка не вміє. Тому все під перевіркою
+    # довжини, і жодного винятку.
+    baud_current = baud_home = None
+    baud_list = []
+    if len(payload) >= pos + 9:
+        cur, home, n = struct.unpack_from("<IIB", payload, pos)
+        pos += 9
+        # ⚠️ Нуль означає «поняття не застосовне» (TCP, USB CDC), а не
+        # швидкість нуль: нуля в переліку немає й бути не може.
+        baud_current = cur or None
+        baud_home = home or None
+        for _ in range(n):
+            if pos + 4 > len(payload):
+                break
+            baud_list.append(struct.unpack_from("<I", payload, pos)[0])
+            pos += 4
+
     return {
         "version": version,
         "width": width,
@@ -412,6 +434,13 @@ def parse_hello(payload: bytes) -> dict:
         "has_encoder": bool(flags & HELLO_FLAG_ENCODER),
         "has_file_ops": bool(flags & HELLO_FLAG_FILE_OPS),
         "has_input_state": bool(flags & HELLO_FLAG_INPUT_STATE),
+        # Швидкість каналу. `baud_list` порожній означає рівно одне:
+        # перемикання ця прошивка або цей транспорт не підтримують. Окремого
+        # прапорця немає навмисно — два сигнали про одну річ розійшлися б.
+        "baud_current": baud_current,
+        "baud_home": baud_home,
+        "baud_list": baud_list,
+        "can_switch_baud": bool(baud_list),
     }
 
 

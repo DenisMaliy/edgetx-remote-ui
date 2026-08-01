@@ -137,6 +137,98 @@ function send(frame) {
   return false;
 }
 
+// ------------------------------------------------- швидкість каналу --------
+//
+// ⚠️ Клієнт тут нічого не вирішує і нічого не знає наперед. Перелік приходить
+// із пульта в `HELLO`, бо залежить від тактової шини конкретного пульта;
+// дозволяє швидкість теж пульт; виконує перемикання міст. Наша справа —
+// показати, що є, і передати вибір.
+//
+// Через це ж у файлі немає жодного числа швидкості: вписане тут, воно одного
+// дня розійшлося б із прошивкою й показувало б людині неіснуючий вибір.
+
+let baudNonce = 0;
+let baudPending = null;   // на що чекаємо відповіді
+let baudNoteTimer = null;
+
+function baudLabel(v) {
+  return v >= 1000000 ? `${(v / 1000000).toFixed(v % 1000000 ? 2 : 0)} Мбод`
+                      : `${Math.round(v / 1000)}k`;
+}
+
+function baudNote(text, cls) {
+  chip('link', text, cls);
+  clearTimeout(baudNoteTimer);
+  // Напис не висить вічно: за кілька секунд повертаємо звичайний стан зв'язку,
+  // інакше «перемикаюсь…» лишилось би на екрані назавжди.
+  baudNoteTimer = setTimeout(() => {
+    chip('link', ws && ws.readyState === WebSocket.OPEN ? "зв'язок є" : 'немає зв\'язку',
+         ws && ws.readyState === WebSocket.OPEN ? 'ok' : 'bad');
+  }, 4000);
+}
+
+function baudRefresh(h) {
+  const wrap = document.getElementById('baud-wrap');
+  const sel = document.getElementById('baud');
+
+  // Порожній перелік — єдина ознака «перемикання тут немає». Ховаємо орган
+  // керування цілком: показувати непрацездатну випадайку гірше, ніж не
+  // показувати нічого.
+  if (!h.canSwitchBaud) { wrap.hidden = true; return; }
+
+  wrap.hidden = false;
+  const want = h.baudList.join(',');
+  if (sel.dataset.list !== want) {
+    sel.dataset.list = want;
+    sel.innerHTML = '';
+    for (const b of h.baudList) {
+      const o = document.createElement('option');
+      o.value = String(b);
+      o.textContent = baudLabel(b) + (b === h.baudHome ? ' (базова)' : '');
+      sel.appendChild(o);
+    }
+  }
+  if (h.baudCurrent) sel.value = String(h.baudCurrent);
+}
+
+function onBaudPick(ev) {
+  const target = Number(ev.target.value);
+  if (!target || (hello && hello.baudCurrent === target)) return;
+
+  baudNonce = (baudNonce % 255) + 1;
+  baudPending = { target, nonce: baudNonce };
+  send(P.encodeBaudSet(target, baudNonce));
+  baudNote(`перемикаю на ${baudLabel(target)}…`);
+}
+
+function onBaudReport(payload) {
+  const r = P.parseBaud(payload);
+  if (!r) return;
+
+  // Чужий nonce — відповідь на стару команду, що доїхала із запізненням.
+  // Прийняти її за свою означало б розійтися з пультом, не помітивши цього.
+  // ⚠️ Виняток — незапрошений звіт (nonce 0): його ніхто не замовляв, і саме
+  // ним пульт повідомляє, що дослід провалився.
+  if (r.nonce !== 0 && baudPending && r.nonce !== baudPending.nonce) return;
+
+  if (r.verdict === P.BAUD_ACCEPTED) {
+    // Ще не успіх: пульт лише пообіцяв. Успіхом буде наступний HELLO із
+    // новою поточною швидкістю.
+    baudNote(`пульт перемикається на ${baudLabel(r.target)}…`);
+    return;
+  }
+
+  baudPending = null;
+
+  // ⚠️ Невдале перемикання показане як невдале. Мовчазне повернення на
+  // попередню швидкість без напису — вада, а не поведінка: людина натиснула,
+  // нічого не змінилось, і вона не знає чому.
+  baudNote(r.text, 'bad');
+  if (hello && hello.baudCurrent) {
+    document.getElementById('baud').value = String(hello.baudCurrent);
+  }
+}
+
 function connect() {
   clearTimeout(reconnectTimer);
   reconnectTimer = null;
@@ -215,6 +307,10 @@ function startGreeting() {
 
 function onPacket(type, payload) {
   switch (type) {
+    case P.PKT_BAUD:
+      onBaudReport(payload);
+      break;
+
     case P.PKT_HELLO: {
       const h = P.parseHello(payload);
       if (!h) break;   // обрізаний HELLO — відкинути, а не вгадувати розмір
@@ -225,6 +321,14 @@ function onPacket(type, payload) {
         resizeTo(h.width, h.height);
       }
       hello = h;
+      baudRefresh(h);
+
+      // Успіхом перемикання вважається саме це: пульт назвав нову поточну
+      // швидкість у HELLO. Обіцянка в підтвердженні успіхом не була.
+      if (baudPending && h.baudCurrent === baudPending.target) {
+        baudNote(`швидкість каналу: ${baudLabel(h.baudCurrent)}`, 'ok');
+        baudPending = null;
+      }
 
       if (first) {
         chip('link', "зв'язок є", 'ok');
@@ -337,6 +441,8 @@ document.addEventListener('visibilitychange', () => {
 });
 
 // ------------------------------------------------------------- керування ---
+
+document.getElementById('baud').addEventListener('change', onBaudPick);
 
 document.getElementById('btn-refresh').addEventListener('click', () => {
   send(P.encodeFrame(P.PKT_REFRESH));

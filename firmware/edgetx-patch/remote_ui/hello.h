@@ -45,14 +45,25 @@ constexpr size_t HELLO_VERSION_LEN = 16;
 // `maxKeys`, а не прибита числом: перелік клавіш належить EdgeTX і може
 // вирости при оновленні. Викликач бере звідси розмір буфера — інакше
 // `buildHello()` одного дня почав би тихо повертати 0.
-constexpr size_t helloMaxSize(size_t maxKeys)
+constexpr size_t helloMaxSize(size_t maxKeys, size_t bauds)
 {
   return 13 + maxKeys * (1 + HELLO_KEY_NAME_LEN) + HELLO_TARGET_LEN +
-         HELLO_VERSION_LEN;
+         HELLO_VERSION_LEN +
+         // Хвіст про швидкість каналу: поточна, домашня, N і сам перелік.
+         4 + 4 + 1 + bauds * 4;
 }
 
 // Складає PAYLOAD пакета HELLO за docs/03-protocol.md.
 // Повертає довжину або 0, якщо в буфері не вистачило місця.
-size_t buildHello(uint8_t* out, size_t outSize);
+//
+// `currentBaud` — поточна швидкість каналу; **0 означає «поняття не
+// застосовне»** (TCP у симуляторі, USB CDC). Тоді перелік іде порожнім, і
+// клієнт за `N == 0` розуміє, що перемикання тут немає.
+//
+// ⚠️ Швидкість приходить параметром, а не питається зсередини, і це не примха.
+// Цей файл — єдиний, крім гачків, що звертається до API EdgeTX, і його справа
+// описувати **залізо**. Поточна швидкість — стан транспорту, а транспортів у
+// нас два; знати, який із них зараз працює, тут нема звідки й не треба.
+size_t buildHello(uint8_t* out, size_t outSize, uint32_t currentBaud);
 
 }  // namespace remote_ui

@@ -29,6 +29,11 @@
   <span id="link" class="chip">—</span>
   <span id="fps" class="chip">—</span>
   <span id="radio" class="chip">—</span>
+  <!-- Поточна швидкість каналу видно ЗАВЖДИ, а не тільки в мить зміни:
+       людина має бачити, де вона зараз, не питаючи. -->
+  <label id="baud-wrap" hidden>
+    <select id="baud" title="швидкість каналу пульт ↔ міст"></select>
+  </label>
   <button id="btn-refresh" type="button">Оновити</button>
   <button id="btn-info" type="button">Стан</button>
 </div>

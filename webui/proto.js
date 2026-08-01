@@ -25,6 +25,7 @@ const PKT_TILE = 0x02;
 const PKT_FRAME_END = 0x03;
 const PKT_STATE = 0x04;
 const PKT_LOG = 0x05;
+const PKT_BAUD = 0x06;
 
 const PKT_KEY = 0x81;
 const PKT_ENC = 0x82;
@@ -33,6 +34,7 @@ const PKT_REFRESH = 0x84;
 const PKT_TRIM = 0x85;
 const PKT_PING = 0x86;
 const PKT_INPUT_STATE = 0x87;
+const PKT_BAUD_SET = 0x88;
 
 const TILE_RAW = 0;
 const TILE_RLE16 = 1;
@@ -238,6 +240,49 @@ const HELLO_MIN = 13;
  *
  * @return {object|null}
  */
+// --- Швидкість каналу (ADR-0005) -------------------------------------------
+
+// Вердикти пакета `0x06 BAUD`. Дзеркало `remote_ui::BaudVerdict`.
+const BAUD_ACCEPTED = 0;
+const BAUD_UNSUPPORTED = 1;
+const BAUD_BUSY = 2;
+const BAUD_NOT_APPLICABLE = 3;
+const BAUD_REVERTED = 4;
+
+const BAUD_VERDICT_TEXT = {
+  0: 'перемикаюсь…',
+  1: 'пульт не знає такої швидкості',
+  2: 'уже триває перемикання',
+  3: 'для цього з\'єднання швидкість не має сенсу',
+  4: 'не вдалося — пульт повернувся сам',
+};
+
+// ⚠️ `nonce` потрібен, щоб не сплутати відповідь на стару команду з
+// відповіддю на нову. Людина тисне двічі, перше підтвердження запізнюється —
+// і без nonce клієнт вирішив би, що домовився про друге.
+function encodeBaudSet(baud, nonce) {
+  const p = new Uint8Array(5);
+  new DataView(p.buffer).setUint32(0, baud >>> 0, true);
+  p[4] = nonce & 0xFF;
+  return encodeFrame(PKT_BAUD_SET, p);
+}
+
+// Розбирає `0x06 BAUD`. Коротший вантаж — null: половина числа гірша за жодне.
+function parseBaud(p) {
+  if (p.length < 16) return null;
+  const dv = new DataView(p.buffer, p.byteOffset, p.byteLength);
+  return {
+    verdict: dv.getUint8(0),
+    nonce: dv.getUint8(1),
+    target: dv.getUint32(2, true),
+    current: dv.getUint32(6, true) || null,
+    switchDelayMs: dv.getUint16(10, true),
+    revertWindowMs: dv.getUint16(12, true),
+    reverts: dv.getUint16(14, true),
+    text: BAUD_VERDICT_TEXT[dv.getUint8(0)] || 'невідома відповідь',
+  };
+}
+
 function parseHello(p) {
   if (p.length < HELLO_MIN) return null;
 
@@ -263,7 +308,34 @@ function parseHello(p) {
   }
 
   h.target = cstr(p, pos, 32); pos += 32;
-  h.fw = cstr(p, pos, 16);
+  h.fw = cstr(p, pos, 16); pos += 16;
+
+  // --- Швидкість каналу (ADR-0005) ---------------------------------------
+  //
+  // Хвіст, якого стара прошивка не шле. Його відсутність — не помилка, а
+  // відповідь: перемикання ця прошивка не вміє. Тому все під перевіркою
+  // довжини.
+  //
+  // ⚠️ Нуль у полі швидкості означає «поняття не застосовне» (TCP у
+  // симуляторі, USB CDC), а не швидкість нуль: нуля в переліку немає й бути
+  // не може.
+  h.baudCurrent = null;
+  h.baudHome = null;
+  h.baudList = [];
+  if (pos + 9 <= p.length) {
+    h.baudCurrent = dv.getUint32(pos, true) || null;
+    h.baudHome = dv.getUint32(pos + 4, true) || null;
+    const n = dv.getUint8(pos + 8);
+    pos += 9;
+    for (let i = 0; i < n && pos + 4 <= p.length; i++) {
+      h.baudList.push(dv.getUint32(pos, true));
+      pos += 4;
+    }
+  }
+  // Єдине джерело правди про підтримку перемикання — непорожній перелік.
+  // Окремого біта прапорців немає навмисно: два сигнали про одну річ рано чи
+  // пізно розійдуться.
+  h.canSwitchBaud = h.baudList.length > 0;
 
   // Розібрані прапорці лежать поруч із сирим байтом, а не замість нього:
   // сире значення потрібне, щоб побачити біт, якого ця версія ще не знає.
@@ -412,8 +484,8 @@ function holdPacket(mirror, fwInputState) {
 
 const RemoteUI = {
   MARKER0, MARKER1,
-  PKT_HELLO, PKT_TILE, PKT_FRAME_END, PKT_STATE, PKT_LOG,
-  PKT_KEY, PKT_ENC, PKT_TOUCH, PKT_REFRESH, PKT_TRIM, PKT_PING, PKT_INPUT_STATE,
+  PKT_HELLO, PKT_TILE, PKT_FRAME_END, PKT_STATE, PKT_LOG, PKT_BAUD,
+  PKT_KEY, PKT_ENC, PKT_TOUCH, PKT_REFRESH, PKT_TRIM, PKT_PING, PKT_INPUT_STATE, PKT_BAUD_SET,
   TILE_RAW, TILE_RLE16,
   TOUCH_DOWN, TOUCH_MOVE, TOUCH_UP,
   HELLO_FLAG_TOUCH, HELLO_FLAG_ENCODER, HELLO_FLAG_FILE_OPS, HELLO_FLAG_INPUT_STATE,
@@ -421,6 +493,8 @@ const RemoteUI = {
   PING_PERIOD_MS, PING_TIMEOUT_MS, INPUT_STATE_PERIOD_MS, LEGACY_HOLD_PERIOD_MS,
   HELLO_MIN,
   crc16, encodeFrame, encodeKey, encodeEnc, encodeTouch, encodeTrim, encodeInputState,
+  BAUD_ACCEPTED, BAUD_UNSUPPORTED, BAUD_BUSY, BAUD_NOT_APPLICABLE, BAUD_REVERTED,
+  encodeBaudSet, parseBaud,
   Decoder, parseHello, decodeTile, blitTile, InputMirror, holdPacket,
 };
 

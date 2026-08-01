@@ -10,9 +10,11 @@
 
 #include <string.h>
 
+#include "baudrate.h"        // BAUD_ALLOWED — перелік їде клієнту в HELLO
 #include "board.h"           // LCD_W/LCD_H, HARDWARE_TOUCH, ROTARY_ENCODER_NAVIGATION
 #include "geometry.h"
 #include "hal/key_driver.h"  // keysGetSupported, keysGetLabel, keysGetMaxTrims
+#include "remote_ui.h"       // REMOTE_UI_BAUDRATE — домашня швидкість
 #include "stamp.h"           // VERSION, VERSION_SUFFIX
 
 // FLAVOUR приходить не зі stamp.h, а прапорцем компілятора:
@@ -76,7 +78,7 @@ struct Writer {
 
 }  // namespace
 
-size_t buildHello(uint8_t* out, size_t outSize)
+size_t buildHello(uint8_t* out, size_t outSize, uint32_t currentBaud)
 {
   if (out == nullptr) {
     return 0;
@@ -143,6 +145,34 @@ size_t buildHello(uint8_t* out, size_t outSize)
   // "2.12.2-remoteui" рівно, а суфікс — це ознака нашої збірки, і клієнту
   // корисніше бачити саме її.
   w.text(VERSION VERSION_SUFFIX, HELLO_VERSION_LEN);
+
+  // --- Швидкість каналу (ADR-0005) ------------------------------------------
+  //
+  // ⚠️ Перелік їде **з пульта**, а не живе в клієнті, і це той самий принцип,
+  // що й для клавіш: він залежить від тактової шини конкретного пульта, тобто
+  // це специфіка заліза, яку код клієнта знати не має (CLAUDE.md, правило 5).
+  // Ціна — 29 байтів раз на кілька секунд проти сотень кілобайтів картинки.
+  //
+  // ⚠️ Окремого біта прапорців для «вміє перемикатись» навмисно немає, хоч
+  // форма біт3 (`INPUT_STATE`) напрошується. Два незалежні сигнали про одну річ
+  // рано чи пізно розійдуться: біт стоїть, перелік порожній — і що робити
+  // клієнту? Джерело правди одне — `N > 0`.
+  w.u32(currentBaud);
+
+  const bool switchable = currentBaud != 0;
+
+  // Домашня швидкість передається попри те, що міст знає її зі своєї
+  // константи, — саме тому, що «знає ту саму» це угода, яку ніхто не
+  // перевіряє. Розійдуться константи — міст ходитиме додому не туди, і
+  // зламається це мовчки.
+  w.u32(switchable ? static_cast<uint32_t>(REMOTE_UI_BAUDRATE) : 0u);
+
+  w.u8(switchable ? static_cast<uint8_t>(BAUD_ALLOWED_COUNT) : 0u);
+  if (switchable) {
+    for (size_t i = 0; i < BAUD_ALLOWED_COUNT; ++i) {
+      w.u32(BAUD_ALLOWED[i]);
+    }
+  }
 
   return w.ok ? w.pos : 0;
 }
