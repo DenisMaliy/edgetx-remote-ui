@@ -175,7 +175,24 @@ import lz4.block          # noqa: F401
 import yaml               # noqa: F401  (системний, через --system-site-packages)
 import jinja2             # noqa: F401  (там само)
 from clang.cindex import Index
-Index.create()
+index = Index.create()
+
+# ⚠️ Імпорту мало, і це не теорія: 2026-08-01 збірка симулятора впала на
+# `fatal error: 'stdbool.h' file not found`, коли `Index.create()` проходив
+# бездоганно.
+#
+# Причина: пакет `libclang` із pip дає саме `libclang.so` і **не дає
+# вбудованих заголовків** clang (`stdbool.h`, `stddef.h` і решта). Вони
+# приходять тільки із системним clang. `radio/util/find_clang.py` шукає їх у
+# `/usr/lib/clang` і сусідніх місцях; не знайшовши — тихо йде далі, і падає
+# аж генератор `datacopy.inc`, за кілька хвилин збірки й у чужому файлі.
+#
+# Тому перевіряємо те саме, що перевіряє сам EdgeTX: чи розбирається
+# найпростіший файл із `#include <stdbool.h>`.
+tu = index.parse("probe.c", ["-x", "c"],
+                 [("probe.c", "#include <stdbool.h>\nbool b;\n")])
+if any(d.severity >= 3 for d in tu.diagnostics):
+    sys.exit(2)
 EOF
 }
 
@@ -196,7 +213,33 @@ else
     "Pillow==$PY_PILLOW" "lz4==$PY_LZ4" "libclang==$PY_LIBCLANG"
 
   if ! py_deps_ok; then
-    echo "Залежності поставились, але перевірка не пройшла — щось не імпортується." >&2
+    # ⚠️ Розрізняємо дві різні біди, бо лікуються вони по-різному, а виглядають
+    # однаково. Брак пакета лікується цим скриптом; брак заголовків clang —
+    # ні, і сказати про це треба прямо, а не залишати людину з «щось не
+    # імпортується».
+    if ! "$VENV_PY" -c "from clang.cindex import Index; Index.create()" >/dev/null 2>&1; then
+      echo "Залежності поставились, але перевірка не пройшла — щось не імпортується." >&2
+      exit 1
+    fi
+
+    cat >&2 <<'MSG'
+
+⚠️ libclang є, а його вбудованих заголовків немає.
+
+Пакет libclang із pip дає лише саму бібліотеку. Заголовки (stdbool.h,
+stddef.h і решта) приходять тільки із системним clang, і без них збірка
+СИМУЛЯТОРА падає на генераторі datacopy.inc:
+
+    fatal error: 'stdbool.h' file not found
+
+Прошивку пульта це не зачіпає — вона збирається й так.
+
+Полагодити (Arch), одна команда, і вона потребує sudo, тому цей скрипт її
+не виконує:
+
+    sudo pacman -S clang
+
+MSG
     exit 1
   fi
   echo "Python-залежності поставлено: $VENV"
