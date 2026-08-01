@@ -65,6 +65,7 @@ from remote_ui_proto import (  # noqa: E402
     encode_key,
     encode_touch,
     frame_wait_ms,
+    frame_wait_tile_limit,
     hold_packet,
     make_connector,
     parse_frame_end,
@@ -176,8 +177,14 @@ class Session:
     росте, розбір триває далі.
     """
 
-    def __init__(self, on_frame=None, mask_input_state_bit=False):
+    def __init__(self, on_frame=None, mask_input_state_bit=False, wait_enabled=True):
         self.on_frame = on_frame
+        # ⚠️ Прилад для порівняння оком, не налаштування (прапорець --no-wait).
+        # Вимкнене очікування = поведінка до задачі 0019: показ на кожному
+        # FRAME_END, розлам і всі кадри. У браузері те саме дає кнопка «чек»;
+        # без цього прапорця режим «до» був би доступний лише з телефона, і
+        # порівняти на стенді вікном ПК не вийшло б.
+        self.wait_enabled = wait_enabled
         # Тестова підміна: викинути біт3 з прийнятого HELLO і тим самим вдати
         # стару прошивку. Підмінюється саме байт на дроті, а не рішення клієнта,
         # тому запасний шлях вибирає той самий код, що й у житті.
@@ -203,9 +210,10 @@ class Session:
         # `frames`: частота на дроті не змінилась і збрехала б у потрібний бік.
         self.frame_ends = 0
         # Звідки взявся кожен показаний кадр (крім `forced`);
-        # сума трьох дорівнює `frames` рівно.
+        # сума дорівнює `frames` рівно — це стереже tearDown у proto_test.py.
         self.frames_whole = 0  # dirtyTiles = 0 — кадр цілісний
         self.frames_timeout = 0  # решта не доїхала за строк
+        self.frames_too_many = 0  # чекати не було сенсу: залишок понад поріг
         self.frames_legacy = 0  # прошивка без ознаки повноти
         self.pending_since = None  # початок поточної низки очікування
         self.pending_until = None  # коли показати неповний кадр як є
@@ -300,6 +308,18 @@ class Session:
         if dirty == 0:
             self.frames += 1
             self.frames_whole += 1
+            self.pending_since = None
+            self._show()
+            return
+
+        # Запобіжник: залишок не встигне доїхати раніше, ніж пульт перемалює
+        # кадр наново, тож чекати нема сенсу — те, чого ми чекаємо, застаріє
+        # швидше, ніж прийде. Правило дослівно те саме, що в `webui/app.js`:
+        # два клієнти не мають права показувати різне.
+        baud = self.hello.get("baud_current") if self.hello else None
+        if not self.wait_enabled or dirty > frame_wait_tile_limit(baud):
+            self.frames += 1
+            self.frames_too_many += 1
             self.pending_since = None
             self._show()
             return
@@ -592,11 +612,13 @@ class Link(threading.Thread):
 
     daemon = True
 
-    def __init__(self, connect, on_frame, mask_input_state_bit=False):
+    def __init__(self, connect, on_frame, mask_input_state_bit=False,
+                 wait_enabled=True):
         super().__init__(name="remote-ui-link")
         self.connect = connect
         self.session = Session(on_frame=on_frame,
-                               mask_input_state_bit=mask_input_state_bit)
+                               mask_input_state_bit=mask_input_state_bit,
+                               wait_enabled=wait_enabled)
         self.stop = threading.Event()
         # Декодувальник один на всі з'єднання: `reset()` чистить лише
         # недочитаний кадр, тому лічильники помилок не обнуляються при
@@ -1041,6 +1063,7 @@ class Window:
                 f"CRC {link.crc_errors}  довж {link.oversized}  "
                 f"биті плитки {session.bad_tiles}  "
                 f"цілих {session.frames_whole}  за строком {session.frames_timeout}  "
+                f"понад поріг {session.frames_too_many}  "
                 f"без FRAME_END {session.forced}  "
                 f"застарілі {self.skipped}  розриви {link.drops}",
                 f"надіслано: клавіш {sent['key']:4d}  енкодер {sent['enc']:4d}  "
@@ -1067,6 +1090,14 @@ def main() -> int:
         "прошивку — клієнт має перейти на PING раз на 250 мс, поки щось "
         "утримується",
     )
+    ap.add_argument(
+        "--no-wait",
+        action="store_true",
+        help="не чекати доїзду решти плиток — поведінка до задачі 0019. "
+        "Це прилад для порівняння оком: розлам і ривки неможливо порівняти "
+        "по пам'яті, обидва режими треба побачити поспіль. У браузері те саме "
+        "робить кнопка «чек»",
+    )
     args = ap.parse_args()
 
     # 5 мс, а не типові 50: цим вікном ще й керують, і кожна мілісекунда тут
@@ -1075,7 +1106,8 @@ def main() -> int:
 
     window = Window(f"Remote UI — {where}", max(1, args.scale))
     link = Link(connect, window.submit,
-                mask_input_state_bit=args.mask_input_state_bit)
+                mask_input_state_bit=args.mask_input_state_bit,
+                wait_enabled=not args.no_wait)
     link.start()
     try:
         window.run(link)

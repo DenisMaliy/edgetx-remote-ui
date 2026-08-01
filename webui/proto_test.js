@@ -389,6 +389,16 @@ console.log('FRAME_END: чи цілий кадр');
   check(proto.frameWaitMs(60) === 230, 'строк при 60 плитках');
   check(proto.frameWaitMs(67) === 250, 'стеля рівно на 67 плитках');
   check(proto.frameWaitMs(1000) === 250, 'понад стелю строк не росте');
+
+  // Поріг «чекати вже немає сенсу»: плитка ≈286 Б, кадр пульта 50 мс.
+  // На 2 625 000 дріт устигає 13 125 Б за кадр → 45 плиток.
+  check(proto.frameWaitTileLimit(2625000) === 45, 'поріг на 2.625 Мбод = 45');
+  // ⚠️ Мусить їхати за швидкістю: вона тут міняється на ходу.
+  check(proto.frameWaitTileLimit(921600) === 16, 'поріг на 921600 = 16');
+  check(proto.frameWaitTileLimit(null) === proto.FRAME_WAIT_TILE_LIMIT_FALLBACK,
+        'швидкість не застосовна → запасне значення');
+  check(proto.frameWaitTileLimit(0) === proto.FRAME_WAIT_TILE_LIMIT_FALLBACK,
+        'нуль — це «не застосовно», а не швидкість нуль');
 }
 
 // ------------------------------------------------------------ координати ---

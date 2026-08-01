@@ -23,8 +23,13 @@ import remote_ui_proto as proto  # noqa: E402
 from test_client import Input, Link, Session, tile_rgb  # noqa: E402
 
 
-def hello_payload(width, height, keys=(), target="X10", fw="2.12.2-remoteui", flags=0x03):
-    """Синтетичний HELLO — щоб тести не залежали від запущеного симулятора."""
+def hello_payload(width, height, keys=(), target="X10", fw="2.12.2-remoteui", flags=0x03,
+                  baud_current=None):
+    """Синтетичний HELLO — щоб тести не залежали від запущеного симулятора.
+
+    `baud_current` додає хвіст зі швидкістю каналу. Без нього хвоста немає —
+    так шле прошивка до ADR-0005, і саме цей випадок тут типовий.
+    """
     out = bytearray()
     out.append(1)
     out += struct.pack("<HH", width, height)
@@ -38,6 +43,11 @@ def hello_payload(width, height, keys=(), target="X10", fw="2.12.2-remoteui", fl
         out += name.encode()[:16].ljust(16, b"\0")
     out += target.encode()[:32].ljust(32, b"\0")
     out += fw.encode()[:16].ljust(16, b"\0")
+    if baud_current is not None:
+        # поточна, домашня, перелік із однієї швидкості
+        out += struct.pack("<II", baud_current, baud_current)
+        out.append(1)
+        out += struct.pack("<I", baud_current)
     return bytes(out)
 
 
@@ -118,6 +128,20 @@ class FrameEnd(unittest.TestCase):
         # зшитий кадр як цілісний — рівно той розлам, який лікуємо.
         self.assertIsNone(proto.parse_frame_end(b""))
         self.assertIsNone(proto.parse_frame_end(b"\x07"))
+
+    def test_tile_limit_follows_the_baudrate(self):
+        # Виведення: плитка ≈286 Б, кадр пульта 50 мс. На 2 625 000 дріт дає
+        # 262 500 Б/с → за кадр устигає 13 125 Б → ≈45 плиток. Це те число,
+        # яке ухвалила людина за критерієм 4.1 задачі 0019.
+        self.assertEqual(proto.frame_wait_tile_limit(2_625_000), 45)
+        # ⚠️ Поріг мусить їхати за швидкістю: вона тут міняється на ходу.
+        # Прибитий до 2 625 000, на 921600 він завищив би очікування втричі.
+        self.assertEqual(proto.frame_wait_tile_limit(921_600), 16)
+        self.assertLess(proto.frame_wait_tile_limit(921_600),
+                        proto.frame_wait_tile_limit(2_625_000))
+        # Нуль і None — «поняття не застосовне» (TCP, USB CDC), не швидкість.
+        self.assertEqual(proto.frame_wait_tile_limit(None), proto.FRAME_WAIT_TILE_LIMIT_FALLBACK)
+        self.assertEqual(proto.frame_wait_tile_limit(0), proto.FRAME_WAIT_TILE_LIMIT_FALLBACK)
 
     def test_wait_is_linear_up_to_the_ceiling(self):
         self.assertEqual(proto.frame_wait_ms(0), 50)
@@ -231,8 +255,32 @@ class Rle16(unittest.TestCase):
 class SessionBehaviour(unittest.TestCase):
     """Поведінка клієнта поверх протоколу. Без вікна."""
 
-    def hello(self, session, width, height):
-        session.handle(proto.PKT_HELLO, hello_payload(width, height))
+    def hello(self, session, width, height, baud_current=None):
+        session.handle(proto.PKT_HELLO,
+                       hello_payload(width, height, baud_current=baud_current))
+
+    def tearDown(self):
+        """Рівність «сума причин = показаних кадрів» стереже кожен тест класу.
+
+        ⚠️ Вона заявлена в коментарях обох клієнтів, але трималась лише на
+        дисципліні: наступна причина показу зламала б її мовчки — і зламала б
+        саме той лічильник, за яким людина читатиме діагноз на стенді.
+        `forced` сюди не входить навмисно: показ без FRAME_END — не справжній
+        кадр.
+        """
+        s = getattr(self, "_session_under_test", None)
+        if s is None:
+            return
+        self.assertEqual(
+            s.frames,
+            s.frames_whole + s.frames_timeout + s.frames_too_many + s.frames_legacy,
+            "сума причин показу розійшлася з кількістю показаних кадрів",
+        )
+
+    def watch(self, session):
+        """Взяти сесію під нагляд tearDown. Повертає її ж, щоб було зручно."""
+        self._session_under_test = session
+        return session
 
     def test_screen_size_comes_from_hello(self):
         # Жодного 480x272 у коді: клієнт бере розмір із пакета. Перевіряємо
@@ -262,7 +310,7 @@ class SessionBehaviour(unittest.TestCase):
         # Правило сумісності docs/03-protocol.md. Перевіряємо не «не впало», а
         # що розбір триває далі й кадр збирається правильно.
         shown = []
-        session = Session(on_frame=lambda s: shown.append(bytes(s.buf)))
+        session = self.watch(Session(on_frame=lambda s: shown.append(bytes(s.buf))))
         self.hello(session, 4, 1)
         session.handle(0x7F, "майбутній пакет".encode())
         session.handle(0xF0, b"")
@@ -280,7 +328,7 @@ class SessionBehaviour(unittest.TestCase):
 
     def test_frame_shown_only_on_frame_end(self):
         shown = []
-        session = Session(on_frame=lambda s: shown.append(bytes(s.buf)))
+        session = self.watch(Session(on_frame=lambda s: shown.append(bytes(s.buf))))
         self.hello(session, 2, 1)
         session.handle(
             proto.PKT_TILE,
@@ -301,7 +349,7 @@ class SessionBehaviour(unittest.TestCase):
     def test_whole_frame_is_shown_immediately(self):
         # dirtyTiles = 0: чекати нема чого, показ у тому самому обробнику.
         shown = []
-        session = Session(on_frame=lambda s: shown.append(bytes(s.buf)))
+        session = self.watch(Session(on_frame=lambda s: shown.append(bytes(s.buf))))
         self.hello(session, 2, 1)
         self.whole_tile(session)
         session.handle(proto.PKT_FRAME_END, b"\x00\x00", now=100.0)
@@ -312,7 +360,7 @@ class SessionBehaviour(unittest.TestCase):
     def test_incomplete_frame_waits_then_shows_on_zero(self):
         # Решта плиток доїхала — показуємо цілий кадр, а не зшитий.
         shown = []
-        session = Session(on_frame=lambda s: shown.append(bytes(s.buf)))
+        session = self.watch(Session(on_frame=lambda s: shown.append(bytes(s.buf))))
         self.hello(session, 2, 1)
         self.whole_tile(session)
 
@@ -333,7 +381,7 @@ class SessionBehaviour(unittest.TestCase):
         # FRAME_END каже «10 плиток ще в дорозі», і далі не приходить нічого.
         # Клієнт зобов'язаний показати як є, а не завмерти назавжди.
         shown = []
-        session = Session(on_frame=lambda s: shown.append(bytes(s.buf)))
+        session = self.watch(Session(on_frame=lambda s: shown.append(bytes(s.buf))))
         self.hello(session, 2, 1)
         self.whole_tile(session)
 
@@ -352,23 +400,74 @@ class SessionBehaviour(unittest.TestCase):
         session.flush_stale(200.0)
         self.assertEqual(len(shown), 1)
 
-    def test_ceiling_stops_endless_scrolling_from_freezing_the_screen(self):
-        # Безперервне гортання: dirtyTiles не спадає до нуля ніколи. Якби строк
-        # зводився від кожного FRAME_END наново, екран замерз би назавжди —
-        # стеля рахується від початку низки очікування й це обриває.
+    def test_huge_remainder_is_not_waited_for_at_all(self):
+        # ⚠️ Запобіжник, ухвалений людиною за критерієм 4.1. Залишок понад поріг
+        # не встигне доїхати раніше, ніж пульт перемалює кадр наново, тож
+        # чекати нема сенсу — те, чого ми чекаємо, застаріє швидше, ніж прийде.
+        #
+        # Без цього безперервне гортання давало б ~4 кадр/с, і кадри однаково
+        # лишалися б зшитими: строго гірше, ніж було до задачі.
         shown = []
-        session = Session(on_frame=lambda s: shown.append(bytes(s.buf)))
+        session = self.watch(Session(on_frame=lambda s: shown.append(bytes(s.buf))))
+        self.hello(session, 2, 1)
+
+        limit = proto.frame_wait_tile_limit(None)  # у HELLO тесту швидкості немає
+
+        t = 100.0
+        for _ in range(40):  # 40 × 10 мс = 400 мс
+            self.whole_tile(session)
+            session.handle(
+                proto.PKT_FRAME_END,
+                struct.pack("<H", limit + 1),  # рівно на одну плитку понад поріг
+                now=t,
+            )
+            session.flush_stale(t)
+            t += 0.010
+
+        # Показ на кожному кадрі — саме поведінка «як було», і це навмисно.
+        self.assertEqual(len(shown), 40)
+        self.assertEqual(session.frames_too_many, 40)
+        self.assertEqual(session.frames_timeout, 0)
+        self.assertEqual(session.frames_whole, 0)
+
+    def test_threshold_follows_the_baudrate_end_to_end(self):
+        # ⚠️ Тест не про формулу — формулу вже перевірено окремо. Він про
+        # **під'єднання**: чи справді клієнт бере швидкість із HELLO. Без нього
+        # одруківка в назві поля (`baudCurrent` замість `baud_current`) дала б
+        # None → запасні 45 → усі тести зелені, а на 921600 клієнт чекав би
+        # того, що за побудовою не встигне.
+        shown = []
+        session = self.watch(Session(on_frame=lambda s: shown.append(bytes(s.buf))))
+        self.hello(session, 2, 1, baud_current=921_600)
+        self.assertEqual(session.hello["baud_current"], 921_600)
+
+        self.whole_tile(session)
+        # 20 плиток: у межах запасних 45, але понад поріг 16 для 921600.
+        session.handle(proto.PKT_FRAME_END, b"\x14\x00", now=100.0)
+
+        self.assertEqual(len(shown), 1)
+        self.assertEqual(session.frames_too_many, 1)
+        self.assertEqual(session.frames_timeout, 0)
+
+    def test_ceiling_stops_endless_scrolling_from_freezing_the_screen(self):
+        # Безперервне гортання із залишком **у межах** порога: чекати сенс є,
+        # але dirtyTiles не спадає до нуля ніколи. Якби строк зводився від
+        # кожного FRAME_END наново, екран замерз би назавжди — стеля
+        # рахується від початку низки очікування й це обриває.
+        shown = []
+        session = self.watch(Session(on_frame=lambda s: shown.append(bytes(s.buf))))
         self.hello(session, 2, 1)
         self.whole_tile(session)
 
         t = 100.0
         for _ in range(40):  # 40 × 10 мс = 400 мс > стелі 250 мс
-            session.handle(proto.PKT_FRAME_END, b"\x64\x00", now=t)  # 100 плиток
+            session.handle(proto.PKT_FRAME_END, b"\x14\x00", now=t)  # 20 плиток
             session.flush_stale(t)
             t += 0.010
 
         self.assertGreaterEqual(len(shown), 1)
         self.assertEqual(session.frames_whole, 0)
+        self.assertEqual(session.frames_too_many, 0)  # 20 плиток — у межах порога
         # Не частіше ніж раз на стелю: 400 мс дають щонайбільше два покази.
         self.assertLessEqual(len(shown), 2)
 
@@ -377,7 +476,7 @@ class SessionBehaviour(unittest.TestCase):
         # поводимось рівно як досі: показуємо. Помилка в бік «чекаю» дала б
         # мертву картинку на кожному кадрі.
         shown = []
-        session = Session(on_frame=lambda s: shown.append(bytes(s.buf)))
+        session = self.watch(Session(on_frame=lambda s: shown.append(bytes(s.buf))))
         self.hello(session, 2, 1)
         self.whole_tile(session)
         session.handle(proto.PKT_FRAME_END, b"", now=100.0)
@@ -391,7 +490,7 @@ class SessionBehaviour(unittest.TestCase):
         import test_client
 
         shown = []
-        session = Session(on_frame=lambda s: shown.append(bytes(s.buf)))
+        session = self.watch(Session(on_frame=lambda s: shown.append(bytes(s.buf))))
         self.hello(session, 4, 1)
         session.handle(
             proto.PKT_TILE,

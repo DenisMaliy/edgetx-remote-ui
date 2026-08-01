@@ -51,11 +51,22 @@ const counters = {
   frames: 0,
   autoRefresh: 0,   // скільки разів просили REFRESH через втрати на мості
 
-  // Звідки взявся кожен показаний кадр — три взаємовиключні причини.
+  // Звідки взявся кожен показаний кадр — взаємовиключні причини, сума
+  // дорівнює `frames` рівно.
   framesWhole: 0,     // FRAME_END сказав dirtyTiles = 0: кадр цілісний
   framesTimeout: 0,   // решта не доїхала за строк — показали як є
+  framesTooMany: 0,   // чекати не було сенсу: залишок більший за поріг
+  framesNoWait: 0,    // очікування вимкнене кнопкою — режим «як було»
   framesLegacy: 0,    // прошивка без ознаки повноти (до задачі 0019)
 };
+
+/* ⚠️ Очікування вимикається кнопкою — це **прилад**, а не налаштування.
+ *
+ * Розлам і ривки неможливо порівняти по пам'яті: обидва режими треба
+ * побачити поспіль, на тому самому меню. Вимкнене очікування = поведінка до
+ * задачі 0019, тобто показ на кожному FRAME_END. Клієнт живе в бінарнику
+ * моста, тож без цієї кнопки кожне порівняння коштувало б перепрошивання. */
+let waitEnabled = true;
 
 /* --- скільки головний потік зайнятий нами ---------------------------------
  *
@@ -188,6 +199,27 @@ function onFrameEnd(payload) {
   if (dirty === 0) {
     cancelPendingFrame();
     counters.framesWhole++;
+    showFrame();
+    return;
+  }
+
+  // Запобіжник: залишок такий великий, що не встигне доїхати раніше, ніж пульт
+  // перемалює кадр наново. Чекати нема сенсу — те, чого ми чекаємо, застаріє
+  // швидше, ніж прийде. Показуємо як є, і саме це рятує безперервне гортання
+  // від падіння до ~4 кадр/с зшитими кадрами.
+  //
+  // Поріг береться зі швидкості каналу (див. proto.js), бо швидкість тут
+  // міняється на ходу. `waitEnabled` — кнопка порівняння оком, не налаштування.
+  if (!waitEnabled) {
+    cancelPendingFrame();
+    counters.framesNoWait++;
+    showFrame();
+    return;
+  }
+
+  if (dirty > P.frameWaitTileLimit(hello && hello.baudCurrent)) {
+    cancelPendingFrame();
+    counters.framesTooMany++;
     showFrame();
     return;
   }
@@ -462,6 +494,9 @@ function onPacket(type, payload) {
       }
       hello = h;
       baudRefresh(h);
+      // Поріг залежить від швидкості каналу, а вона міняється на ходу —
+      // напис на кнопці має їхати за нею.
+      waitLabel();
 
       // Успіхом перемикання вважається саме це: пульт назвав нову поточну
       // швидкість у HELLO. Обіцянка в підтвердженні успіхом не була.
@@ -588,6 +623,37 @@ document.getElementById('btn-refresh').addEventListener('click', () => {
   send(P.encodeFrame(P.PKT_REFRESH));
 });
 
+/* Перемикач очікування. Напис показує **поточний стан**, а не дію: людина зі
+ * стенда має бачити, у якому режимі вона зараз, не тиснучи нічого. */
+const btnWait = document.getElementById('btn-wait');
+
+function waitLabel() {
+  // ⚠️ До HELLO швидкості немає, і поріг був би запасним 45 — на 921600
+  // правильне число 16. Показувати завідомо чуже число в перші секунди, коли
+  // людина зі стенда саме й читає кнопку, гірше, ніж не показувати нічого.
+  if (!hello) { btnWait.textContent = 'чек: —'; return; }
+
+  const limit = P.frameWaitTileLimit(hello.baudCurrent);
+  btnWait.textContent = waitEnabled ? `чек: до ${limit}` : 'чек: вимк';
+  btnWait.title = waitEnabled
+    ? `чекаю цілого кадру, поки в дорозі не більше ${limit} плиток`
+    : 'очікування вимкнене — показ на кожному FRAME_END, як до задачі 0019';
+}
+
+btnWait.addEventListener('click', () => {
+  waitEnabled = !waitEnabled;
+  // Вимкнули посеред очікування — відкладений кадр показуємо негайно, інакше
+  // він висів би до строку вже в режимі, який очікування не робить.
+  // ⚠️ Саме `pendingFrameTimer !== null`, а не просто showFrame(): показ без
+  // причини збив би рівність «сума причин = кадрів».
+  if (!waitEnabled && pendingFrameTimer !== null) {
+    cancelPendingFrame();
+    counters.framesNoWait++;
+    showFrame();
+  }
+  waitLabel();
+});
+
 const info = document.getElementById('info');
 document.getElementById('btn-info').addEventListener('click', () => {
   info.hidden = !info.hidden;
@@ -648,7 +714,14 @@ async function updateInfo() {
     `  кадрів         ${counters.frames}`,
     `    цілих (dirtyTiles = 0)       ${counters.framesWhole}`,
     `    показано за строком          ${counters.framesTimeout}`,
+    `    залишок понад поріг          ${counters.framesTooMany}`,
+    `    очікування вимкнене          ${counters.framesNoWait}`,
     `    без ознаки повноти           ${counters.framesLegacy}`,
+    // ⚠️ Режим — у панелі, а не лише на кнопці: панель і є артефактом доказу
+    // за критеріями 3.2 і 4.1, а на знімку кнопки не видно.
+    `  очікування                     ` +
+      `${waitEnabled ? `увімкнене, поріг ${P.frameWaitTileLimit(hello && hello.baudCurrent)} плиток`
+                     : 'ВИМКНЕНЕ (режим «як було»)'}`,
     `  REFRESH через втрати на мості  ${counters.autoRefresh}`,
     '',
     'головний потік, мс за секунду',
