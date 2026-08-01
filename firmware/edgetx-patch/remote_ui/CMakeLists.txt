@@ -16,6 +16,7 @@
 # Шляхи відносні до `radio/src`, бо саме там створюються цілі.
 
 set(SRC ${SRC}
+  remote_ui/baudrate.cpp
   remote_ui/capture.cpp
   remote_ui/crc16.cpp
   remote_ui/hello.cpp

@@ -60,6 +60,7 @@ enum PacketType : uint8_t {
   PKT_FRAME_END = 0x03,
   PKT_STATE = 0x04,
   PKT_LOG = 0x05,
+  PKT_BAUD = 0x06,
 
   // Клієнт -> пульт
   PKT_KEY = 0x81,
@@ -69,6 +70,7 @@ enum PacketType : uint8_t {
   PKT_TRIM = 0x85,
   PKT_PING = 0x86,
   PKT_INPUT_STATE = 0x87,
+  PKT_BAUD_SET = 0x88,
 
   // Зарезервовано під файлові операції (наступні етапи)
   PKT_FILE_LIST = 0x90,

@@ -25,6 +25,7 @@ CRC — CRC-16/CCITT-FALSE по `TYPE + LEN + PAYLOAD` (маркер і сам C
 | `input.h` / `input.cpp` | емульований ввід: клавіші, тримери, енкодер, сенсор, **тайм-аут відпускання**, повний стан (`0x87`) і розбір пакетів вводу |
 | `input_edgetx.cpp` | прив'язка вводу до EdgeTX: годинник, `keysGetSupported()`, кількість тримерів |
 | `hello.h` / `hello.cpp` | пакет `HELLO`: опис заліза, взятий з API EdgeTX |
+| `baudrate.h` / `baudrate.cpp` | перемикання швидкості каналу на ходу: перелік дозволених, пакети `0x06`/`0x88`, числа вікна повернення (ADR-0005) |
 | `transport_simu.cpp` | TCP замість UART — тільки для симулятора (`#if defined(SIMU)`) |
 | `transport_uart.cpp` | транспорт на залізі: AUX1 через драйвер EdgeTX, DMA на передачу, **власна задача** (`#if !defined(SIMU)`) |
 | `CMakeLists.txt` | дописує наші `.cpp` у список `SRC` EdgeTX |
@@ -150,9 +151,10 @@ EdgeTX тут немає, а `geometry.h` без нього не знає роз
 cd firmware/edgetx-patch/remote_ui && mkdir -p ../../../build && \
 g++ -std=c++17 -Wall -Wextra -fsanitize=address,undefined \
     -DREMOTE_UI -DREMOTE_UI_STANDALONE -DREMOTE_UI_LCD_W=480 -DREMOTE_UI_LCD_H=272 -I. \
-    crc16.cpp protocol.cpp rle16.cpp tile.cpp capture.cpp input.cpp \
+    baudrate.cpp crc16.cpp protocol.cpp rle16.cpp tile.cpp capture.cpp input.cpp \
     test/alloc_guard.cpp test/test_crc16.cpp test/test_protocol.cpp \
-    test/test_rle16.cpp test/test_capture.cpp test/test_input.cpp test/test_main.cpp \
+    test/test_rle16.cpp test/test_capture.cpp test/test_input.cpp \
+    test/test_baudrate.cpp test/test_main.cpp \
     -o ../../../build/remote_ui-tests \
 && ../../../build/remote_ui-tests
 ```
@@ -164,20 +166,21 @@ g++ -std=c++17 -Wall -Wextra -fsanitize=address,undefined \
 cd firmware/edgetx-patch/remote_ui && mkdir -p ../../../build && \
 g++ -std=c++17 -Wall -Wextra \
     -DREMOTE_UI -DREMOTE_UI_STANDALONE -DREMOTE_UI_LCD_W=480 -DREMOTE_UI_LCD_H=272 -I. \
-    crc16.cpp protocol.cpp rle16.cpp tile.cpp capture.cpp input.cpp \
+    baudrate.cpp crc16.cpp protocol.cpp rle16.cpp tile.cpp capture.cpp input.cpp \
     test/alloc_guard.cpp test/test_crc16.cpp test/test_protocol.cpp \
-    test/test_rle16.cpp test/test_capture.cpp test/test_input.cpp test/test_main.cpp \
+    test/test_rle16.cpp test/test_capture.cpp test/test_input.cpp \
+    test/test_baudrate.cpp test/test_main.cpp \
     -o ../../../build/remote_ui-tests-nosan
 ```
 
-Стан на 2026-07-26 (g++ 16.1.1, `-fsanitize=address,undefined`):
+Стан на 2026-08-01 (g++ 16.1.1, `-fsanitize=address,undefined`):
 
-- тестів — **96**, пройдено 96;
-- ті самі 96 проходять на 480×272, 320×240, 800×480 і **212×64** — координати
+- тестів — **109**, пройдено 109;
+- ті самі 109 проходять на 480×272, 320×240, 800×480 і **212×64** — координати
   в тестах сенсора виводяться з `SCREEN_W`/`SCREEN_H`, а не пишуться числами,
   інакше на низькому екрані вони обрізались би по межі й тест падав би не
   через код;
-- час прогону — **≈0.04 с**;
+- час прогону — **≈0.07 с**;
 - код повернення — **0** (успіх), **1** — якщо провалилась хоч одна перевірка;
 - виділень динамічної пам'яті в захищених зонах — **1**, і це навмисне
   виділення в тесті `AllocGuardDetectsAllocation`, який доводить, що сторож

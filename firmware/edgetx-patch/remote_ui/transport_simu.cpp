@@ -32,6 +32,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "baudrate.h"
 #include "capture.h"
 #include "geometry.h"
 #include "hal/key_driver.h"  // MAX_KEYS — розмір буфера HELLO
@@ -181,6 +182,36 @@ void onPacket(uint8_t type, const uint8_t* payload, size_t length, void* context
       const int fd = s_clientFd.load(std::memory_order_relaxed);
       if (helloLen > 0 && fd >= 0) {
         sendPacket(fd, PKT_HELLO, s_helloPayload, helloLen);
+      }
+      break;
+    }
+
+    case PKT_BAUD_SET: {
+      // ⚠️ У TCP поняття «швидкість каналу» беззмістовне, і відповісти на це
+      // треба **вголос**, а не мовчазним ігноруванням.
+      //
+      // Мовчання формально дозволене правилом сумісності, але тут воно
+      // неправильне по суті: інструмент, що попросив перемикання, не відрізнив
+      // би «транспорт цього не вміє» від «пульт помер». Перше — нормальна
+      // відповідь, друге — привід бігти до стенда.
+      //
+      // Поточна швидкість передається нулем: це і є «не застосовне», і
+      // сплутати його з дійсною швидкістю неможливо — нуля в переліку немає й
+      // бути не може.
+      uint32_t want = 0;
+      uint8_t nonce = 0;
+      if (!parseBaudSet(payload, length, want, nonce)) {
+        break;
+      }
+
+      uint8_t report[BAUD_REPORT_SIZE];
+      const size_t len = buildBaudReport(report, sizeof(report),
+                                         BAUD_NOT_APPLICABLE, nonce, 0, 0,
+                                         BAUD_SWITCH_DELAY_MS,
+                                         BAUD_REVERT_WINDOW_MS, 0);
+      const int fd = s_clientFd.load(std::memory_order_relaxed);
+      if (len > 0 && fd >= 0) {
+        sendPacket(fd, PKT_BAUD, report, len);
       }
       break;
     }
