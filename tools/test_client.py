@@ -84,6 +84,30 @@ CLIENT_SILENCE_REPORT_MS = 750.0
 # Як часто друкувати розкид пауз під час прогону.
 GAP_REPORT_PERIOD_S = 30.0
 
+# Режими очікування цілого кадру — ті самі три, що дає кнопка «чек» у браузері
+# (`webui/app.js`). Тримати назви однаковими важливіше за стислість: розбіжність
+# двох клієнтів у політиці показу неможливо помітити інакше, ніж оком.
+WAIT_OFF = "off"        # показ на кожному FRAME_END — поведінка до задачі 0019
+WAIT_LIMIT = "limit"    # очікування, поки залишок не більший за поріг
+WAIT_ALWAYS = "always"  # очікування завжди; порога немає, тримає лише стеля
+WAIT_MODES = (WAIT_OFF, WAIT_LIMIT, WAIT_ALWAYS)
+
+
+def wait_label(session) -> str:
+    """Режим очікування словами, які побачить людина у вікні.
+
+    ⚠️ Для `limit` підставляється **справжній** поріг, а не назва режиму: він
+    їде за швидкістю каналу (задача 0017), тож знімок вікна без числа не
+    фіксує, при якому порозі знято замір. Те саме число показує кнопка «чек»
+    у браузері.
+    """
+    if session.wait_mode == WAIT_OFF:
+        return "вимк"
+    if session.wait_mode == WAIT_ALWAYS:
+        return "завжди"
+    baud = session.hello.get("baud_current") if session.hello else None
+    return f"до {frame_wait_tile_limit(baud)}" if session.hello else "до ?"
+
 # --- Пікселі --------------------------------------------------------------
 
 # RGB565 → три байти RGB888. Таблиця на 64 Кі записів будується один раз і
@@ -177,14 +201,30 @@ class Session:
     росте, розбір триває далі.
     """
 
-    def __init__(self, on_frame=None, mask_input_state_bit=False, wait_enabled=True):
+    def __init__(self, on_frame=None, mask_input_state_bit=False,
+                 wait_mode=WAIT_ALWAYS):
         self.on_frame = on_frame
-        # ⚠️ Прилад для порівняння оком, не налаштування (прапорець --no-wait).
-        # Вимкнене очікування = поведінка до задачі 0019: показ на кожному
-        # FRAME_END, розлам і всі кадри. У браузері те саме дає кнопка «чек»;
-        # без цього прапорця режим «до» був би доступний лише з телефона, і
-        # порівняти на стенді вікном ПК не вийшло б.
-        self.wait_enabled = wait_enabled
+        # ⚠️ Прилад для порівняння оком, не налаштування (прапорець --wait).
+        # Три режими, ті самі, що дає кнопка «чек» у браузері: два клієнти не
+        # мають права показувати різне.
+        #
+        #   off     показ на кожному FRAME_END — поведінка до задачі 0019
+        #   limit   очікування, поки залишок не більший за поріг
+        #   always  очікування завжди; порога немає, тримає лише стеля
+        #
+        # Третій режим з'явився із заміру на живому пульті (2026-08-01): поріг
+        # вимикає очікування саме на великих перемальовках, тобто там, де шов
+        # видно оком, а `за строком` не трапляється жодного разу ні при якому
+        # порозі. Без цього прапорця режим «завжди» був би доступний лише з
+        # телефона, і порівняти на стенді вікном ПК не вийшло б.
+        #
+        # ⚠️ Типове — `always`, і це рішення людини за критерієм 4.1 після
+        # порівняння оком. Поріг як важіль закритий числами: `dirtyTiles` не
+        # наближається до розміру сітки в жодному режимі керування (максимуми
+        # 83 / 94 / 89 при сітці 135), тож режими не розділяються порогом —
+        # будь-який поріг від 100 тотожний `always`, менший ріже гортання.
+        # Виведення повністю — у `webui/app.js` над `waitMode`.
+        self.wait_mode = wait_mode
         # Тестова підміна: викинути біт3 з прийнятого HELLO і тим самим вдати
         # стару прошивку. Підмінюється саме байт на дроті, а не рішення клієнта,
         # тому запасний шлях вибирає той самий код, що й у житті.
@@ -214,6 +254,7 @@ class Session:
         self.frames_whole = 0  # dirtyTiles = 0 — кадр цілісний
         self.frames_timeout = 0  # решта не доїхала за строк
         self.frames_too_many = 0  # чекати не було сенсу: залишок понад поріг
+        self.frames_no_wait = 0  # очікування вимкнене прапорцем — режим «як було»
         self.frames_legacy = 0  # прошивка без ознаки повноти
         self.pending_since = None  # початок поточної низки очікування
         self.pending_until = None  # коли показати неповний кадр як є
@@ -247,6 +288,9 @@ class Session:
                 hello["height"],
             ):
                 self.screen = Screen(hello["width"], hello["height"])
+                # Разом із кадром помирає й очікування: таймер чекав кадру
+                # старого розміру, а показав би буфер нового — порожній.
+                self.forget_pending()
                 # ЧБ-пульти — етап 5.3. Плитки такого пульта клієнт відкине як
                 # биті, і без цього рядка це виглядало б як поломка захоплення.
                 if hello["pixfmt"] != HELLO_PIXFMT_RGB565:
@@ -312,12 +356,21 @@ class Session:
             self._show()
             return
 
+        # Очікування вимкнене прапорцем — прилад для порівняння оком, до порога
+        # стосунку не має.
+        if self.wait_mode == WAIT_OFF:
+            self.frames += 1
+            self.frames_no_wait += 1
+            self.pending_since = None
+            self._show()
+            return
+
         # Запобіжник: залишок не встигне доїхати раніше, ніж пульт перемалює
         # кадр наново, тож чекати нема сенсу — те, чого ми чекаємо, застаріє
         # швидше, ніж прийде. Правило дослівно те саме, що в `webui/app.js`:
         # два клієнти не мають права показувати різне.
         baud = self.hello.get("baud_current") if self.hello else None
-        if not self.wait_enabled or dirty > frame_wait_tile_limit(baud):
+        if self.wait_mode == WAIT_LIMIT and dirty > frame_wait_tile_limit(baud):
             self.frames += 1
             self.frames_too_many += 1
             self.pending_since = None
@@ -345,6 +398,17 @@ class Session:
             return
 
         self.pending_until = now + wait_s
+
+    def forget_pending(self):
+        """Забути відкладений кадр **без показу** — дзеркало `cancelPendingFrame()`.
+
+        ⚠️ Не те саме, що `_show()`: там кадр показується й рахується причиною.
+        Тут його не буде взагалі, бо чекати вже нема на що — з'єднання померло
+        або кадр змінив розмір. Показ у такій миті збрехав би людині старими
+        пікселями й накрутив би лічильник причини, якої не сталося.
+        """
+        self.pending_until = None
+        self.pending_since = None
 
     def _show(self):
         self.last_frame_tiles = self.tiles_in_frame
@@ -613,12 +677,12 @@ class Link(threading.Thread):
     daemon = True
 
     def __init__(self, connect, on_frame, mask_input_state_bit=False,
-                 wait_enabled=True):
+                 wait_mode=WAIT_ALWAYS):
         super().__init__(name="remote-ui-link")
         self.connect = connect
         self.session = Session(on_frame=on_frame,
                                mask_input_state_bit=mask_input_state_bit,
-                               wait_enabled=wait_enabled)
+                               wait_mode=wait_mode)
         self.stop = threading.Event()
         # Декодувальник один на всі з'єднання: `reset()` чистить лише
         # недочитаний кадр, тому лічильники помилок не обнуляються при
@@ -748,6 +812,14 @@ class Link(threading.Thread):
         # і наше дзеркало має погодитись із ним, а не переконувати його, що
         # клавіша досі натиснута.
         self.mirror.clear()
+
+        # ⚠️ Відкладений неповний кадр помирає разом зі з'єднанням — дзеркало
+        # `cancelPendingFrame()` у `webui/app.js`. Решта його плиток уже не
+        # доїде ніколи, тож показ був би не «кадром за строком», а старими
+        # пікселями під виглядом свіжих. Гірше того, він накрутив би саме
+        # `frames_timeout` — лічильник, на якому стоїть рішення про поріг
+        # (критерій 4.1), і замір отримав би домішку від кожного розриву.
+        session.forget_pending()
 
         # Порядок вітання важливий: спершу PING, і лише отримавши у відповідь
         # HELLO — REFRESH. До HELLO клієнт не знає розміру екрана, і плитки
@@ -1064,6 +1136,9 @@ class Window:
                 f"биті плитки {session.bad_tiles}  "
                 f"цілих {session.frames_whole}  за строком {session.frames_timeout}  "
                 f"понад поріг {session.frames_too_many}  "
+                f"без очікування {session.frames_no_wait}  "
+                f"без ознаки {session.frames_legacy}  "
+                f"чек: {wait_label(session)}  "
                 f"без FRAME_END {session.forced}  "
                 f"застарілі {self.skipped}  розриви {link.drops}",
                 f"надіслано: клавіш {sent['key']:4d}  енкодер {sent['enc']:4d}  "
@@ -1079,7 +1154,14 @@ class Window:
         self.stats.configure(text="\n".join(self.line))
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """Розбір прапорців окремо від `main()` — щоб його могли перевірити тести.
+
+    ⚠️ `main()` піднімає вікно tkinter, тобто з тесту недосяжний. Поки розбір
+    сидів усередині, під'єднання прапорця до поведінки не перевіряв ніхто — а
+    саме цей клас пастки («функція є, під'єднання немає») уже коштував цій
+    задачі одного кола рецензії на швидкості в `HELLO`.
+    """
     ap = argparse.ArgumentParser(description="Тестовий клієнт Remote UI: вікно з екраном пульта")
     add_transport_args(ap)
     ap.add_argument("--scale", type=int, default=1, help="ціле збільшення картинки")
@@ -1091,14 +1173,41 @@ def main() -> int:
         "утримується",
     )
     ap.add_argument(
+        "--wait",
+        choices=WAIT_MODES,
+        default=WAIT_ALWAYS,
+        help="політика показу неповного кадру. off — не чекати зовсім "
+        "(поведінка до задачі 0019); limit — чекати, поки залишок не більший "
+        "за поріг (типово); always — чекати завжди, порога немає. Це прилад "
+        "для порівняння оком: розлам і ривки неможливо порівняти по пам'яті, "
+        "режими треба побачити поспіль. У браузері те саме робить кнопка «чек»",
+    )
+    # ⚠️ Взаємовиключні навмисно. `--no-wait --wait always` мовчки давало б
+    # `off`, і на стенді, де команди збираються з історії shell, це рівно той
+    # спосіб зняти замір не в тому режимі й не помітити.
+    ap.add_argument(
         "--no-wait",
         action="store_true",
-        help="не чекати доїзду решти плиток — поведінка до задачі 0019. "
-        "Це прилад для порівняння оком: розлам і ривки неможливо порівняти "
-        "по пам'яті, обидва режими треба побачити поспіль. У браузері те саме "
-        "робить кнопка «чек»",
+        help="те саме, що --wait off (лишено, щоб не ламати записані команди)",
     )
-    args = ap.parse_args()
+    return ap
+
+
+def parse_args(argv=None):
+    """Розібрати прапорці й звести їх у те, що справді керує клієнтом."""
+    ap = build_parser()
+    argv = list(sys.argv[1:] if argv is None else argv)
+    args = ap.parse_args(argv)
+    if args.no_wait and "--wait" in argv:
+        ap.error("--no-wait і --wait разом не можна: перший — старий синонім "
+                 "другого, і мовчки перебивав би його")
+    # Один прапорець керує режимом, скільки б їх не було в командному рядку.
+    args.wait_mode = WAIT_OFF if args.no_wait else args.wait
+    return args
+
+
+def main() -> int:
+    args = parse_args()
 
     # 5 мс, а не типові 50: цим вікном ще й керують, і кожна мілісекунда тут
     # додається до затримки «натиснув -> побачив».
@@ -1107,7 +1216,7 @@ def main() -> int:
     window = Window(f"Remote UI — {where}", max(1, args.scale))
     link = Link(connect, window.submit,
                 mask_input_state_bit=args.mask_input_state_bit,
-                wait_enabled=not args.no_wait)
+                wait_mode=args.wait_mode)
     link.start()
     try:
         window.run(link)

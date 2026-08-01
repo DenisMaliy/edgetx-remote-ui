@@ -20,6 +20,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import remote_ui_proto as proto  # noqa: E402
+import test_client  # noqa: E402
 from test_client import Input, Link, Session, tile_rgb  # noqa: E402
 
 
@@ -273,7 +274,8 @@ class SessionBehaviour(unittest.TestCase):
             return
         self.assertEqual(
             s.frames,
-            s.frames_whole + s.frames_timeout + s.frames_too_many + s.frames_legacy,
+            s.frames_whole + s.frames_timeout + s.frames_too_many
+            + s.frames_no_wait + s.frames_legacy,
             "сума причин показу розійшлася з кількістю показаних кадрів",
         )
 
@@ -407,8 +409,13 @@ class SessionBehaviour(unittest.TestCase):
         #
         # Без цього безперервне гортання давало б ~4 кадр/с, і кадри однаково
         # лишалися б зшитими: строго гірше, ніж було до задачі.
+        #
+        # ⚠️ Режим названо **явно**: типовим він бути перестав (замір показав,
+        # що поріг не розділяє режимів керування), і тест про поріг мусить
+        # просити поріг, а не покладатись на типове значення.
         shown = []
-        session = self.watch(Session(on_frame=lambda s: shown.append(bytes(s.buf))))
+        session = self.watch(Session(on_frame=lambda s: shown.append(bytes(s.buf)),
+                                     wait_mode=test_client.WAIT_LIMIT))
         self.hello(session, 2, 1)
 
         limit = proto.frame_wait_tile_limit(None)  # у HELLO тесту швидкості немає
@@ -437,7 +444,8 @@ class SessionBehaviour(unittest.TestCase):
         # None → запасні 45 → усі тести зелені, а на 921600 клієнт чекав би
         # того, що за побудовою не встигне.
         shown = []
-        session = self.watch(Session(on_frame=lambda s: shown.append(bytes(s.buf))))
+        session = self.watch(Session(on_frame=lambda s: shown.append(bytes(s.buf)),
+                                     wait_mode=test_client.WAIT_LIMIT))
         self.hello(session, 2, 1, baud_current=921_600)
         self.assertEqual(session.hello["baud_current"], 921_600)
 
@@ -470,6 +478,158 @@ class SessionBehaviour(unittest.TestCase):
         self.assertEqual(session.frames_too_many, 0)  # 20 плиток — у межах порога
         # Не частіше ніж раз на стелю: 400 мс дають щонайбільше два покази.
         self.assertLessEqual(len(shown), 2)
+
+    def test_wait_always_ignores_the_threshold(self):
+        # Режим «завжди»: порога немає, тож залишок понад поріг більше не веде
+        # до негайного показу. Це третє положення кнопки «чек», додане після
+        # заміру на живому пульті — там саме кадри понад порогом і несли шов,
+        # видний оком.
+        shown = []
+        session = self.watch(Session(
+            on_frame=lambda s: shown.append(bytes(s.buf)),
+            wait_mode=test_client.WAIT_ALWAYS))
+        self.hello(session, 2, 1)
+        self.whole_tile(session)
+
+        limit = proto.frame_wait_tile_limit(None)
+        session.handle(proto.PKT_FRAME_END, struct.pack("<H", limit + 1), now=100.0)
+
+        # Не показано: у режимі «завжди» клієнт чекає навіть такий залишок.
+        self.assertEqual(shown, [])
+        self.assertEqual(session.frames_too_many, 0)
+
+        # Але не назавжди: стеля обриває очікування й показує як є.
+        session.flush_stale(100.0 + (proto.FRAME_WAIT_MAX_MS + 10) / 1000.0)
+        self.assertEqual(len(shown), 1)
+        self.assertEqual(session.frames_timeout, 1)
+
+    def test_wait_always_shows_whole_after_waiting_out_a_big_remainder(self):
+        # ⚠️ Головний шлях режиму «завжди», і саме він дав на живому пульті
+        # «100 % цілих при порозі 100+»: залишок понад поріг → клієнт чекає →
+        # приходить FRAME_END(0) → показ **цілого** кадру, а не «за строком».
+        #
+        # Без цього тесту зелено лишалось би й тоді, якби очікування обривалось
+        # достроково: попередні тести перевіряють стелю й негайний показ, але
+        # жоден не проходить шлях «дочекався й отримав ціле».
+        shown = []
+        session = self.watch(Session(
+            on_frame=lambda s: shown.append(bytes(s.buf)),
+            wait_mode=test_client.WAIT_ALWAYS))
+        self.hello(session, 2, 1)
+        self.whole_tile(session)
+
+        limit = proto.frame_wait_tile_limit(None)
+        session.handle(proto.PKT_FRAME_END, struct.pack("<H", limit + 50), now=100.0)
+        session.flush_stale(100.020)
+        self.assertEqual(shown, [], "показав, не дочекавшись")
+
+        # Решта доїхала — кадр закрився цілим ще в межах стелі.
+        self.whole_tile(session)
+        session.handle(proto.PKT_FRAME_END, b"\x00\x00", now=100.100)
+
+        self.assertEqual(len(shown), 1)
+        self.assertEqual(session.frames_whole, 1)
+        self.assertEqual(session.frames_timeout, 0)
+        self.assertEqual(session.frames_too_many, 0)
+        # Таймер знято: подальший плин часу зайвого показу не дає.
+        session.flush_stale(100.0 + (proto.FRAME_WAIT_MAX_MS + 50) / 1000.0)
+        self.assertEqual(len(shown), 1)
+
+    def test_wait_off_still_shows_whole_frame_as_whole(self):
+        # Порядок гілок: `dirty == 0` стоїть **до** перевірки режиму, тож навіть
+        # із вимкненим очікуванням цілий кадр рахується цілим. Інакше режим
+        # «як було» занижував би `цілих` і псував саме те порівняння, заради
+        # якого існує.
+        shown = []
+        session = self.watch(Session(
+            on_frame=lambda s: shown.append(bytes(s.buf)),
+            wait_mode=test_client.WAIT_OFF))
+        self.hello(session, 2, 1)
+        self.whole_tile(session)
+
+        session.handle(proto.PKT_FRAME_END, b"\x00\x00", now=100.0)
+        self.assertEqual(session.frames_whole, 1)
+        self.assertEqual(session.frames_no_wait, 0)
+
+    def test_wait_flag_reaches_the_client(self):
+        # Під'єднання прапорця до поведінки, а не сам розбір: одруківка тут
+        # лишила б усі решту тестів зеленими, а замір на стенді знявся б у
+        # режимі, якого людина не просила.
+        # Типове — `always` (рішення людини за критерієм 4.1 після заміру).
+        # ⚠️ Тест стереже саме типове значення: мовчазна зміна тут перевела б
+        # усі заміри стенда в інший режим показу, і числа розійшлися б із тими,
+        # за якими рішення ухвалювали.
+        self.assertEqual(test_client.parse_args([]).wait_mode,
+                         test_client.WAIT_ALWAYS)
+        self.assertEqual(test_client.parse_args(["--wait", "limit"]).wait_mode,
+                         test_client.WAIT_LIMIT)
+        self.assertEqual(test_client.parse_args(["--wait", "always"]).wait_mode,
+                         test_client.WAIT_ALWAYS)
+        self.assertEqual(test_client.parse_args(["--wait", "off"]).wait_mode,
+                         test_client.WAIT_OFF)
+        # Старий синонім лишається робочим — записані команди не ламаємо.
+        self.assertEqual(test_client.parse_args(["--no-wait"]).wait_mode,
+                         test_client.WAIT_OFF)
+
+    def test_wait_and_no_wait_together_are_refused(self):
+        # Мовчазне перебивання одного прапорця іншим — саме той спосіб зняти
+        # замір не в тому режимі й не помітити.
+        with self.assertRaises(SystemExit):
+            test_client.parse_args(["--no-wait", "--wait", "always"])
+
+    def test_broken_link_forgets_the_pending_frame(self):
+        # ⚠️ Відкладений кадр не має пережити розрив: решта плиток уже не доїде,
+        # а показ був би старими пікселями під виглядом свіжих. Гірше того, він
+        # накрутив би `frames_timeout` — лічильник, на якому стоїть рішення про
+        # поріг (критерій 4.1), і кожен розрив на стенді додавав би домішку.
+        shown = []
+        session = self.watch(Session(
+            on_frame=lambda s: shown.append(bytes(s.buf))))
+        self.hello(session, 2, 1)
+        self.whole_tile(session)
+
+        session.handle(proto.PKT_FRAME_END, b"\x05\x00", now=100.0)
+        self.assertIsNotNone(session.pending_until)
+
+        session.forget_pending()   # це робить `_serve()` при перепідключенні
+
+        session.flush_stale(100.0 + (proto.FRAME_WAIT_MAX_MS + 50) / 1000.0)
+        self.assertEqual(shown, [])
+        self.assertEqual(session.frames_timeout, 0)
+
+    def test_wait_always_still_shows_whole_frame_at_once(self):
+        # Режим «завжди» міняє лише поріг. Цілий кадр показується негайно, як і
+        # в решті режимів: інакше він додав би затримки там, де чекати нема чого.
+        shown = []
+        session = self.watch(Session(
+            on_frame=lambda s: shown.append(bytes(s.buf)),
+            wait_mode=test_client.WAIT_ALWAYS))
+        self.hello(session, 2, 1)
+        self.whole_tile(session)
+
+        session.handle(proto.PKT_FRAME_END, b"\x00\x00", now=100.0)
+        self.assertEqual(len(shown), 1)
+        self.assertEqual(session.frames_whole, 1)
+
+    def test_wait_off_counts_separately_from_over_threshold(self):
+        # ⚠️ Дві різні причини показу, які легко злити в одну: «очікування
+        # вимкнене людиною» і «залишок понад поріг». Зливши їх, ми не змогли б
+        # прочитати з панелі, у якому режимі знято замір, — а панель і є
+        # артефактом доказу за критеріями 3.2 і 4.1.
+        shown = []
+        session = self.watch(Session(
+            on_frame=lambda s: shown.append(bytes(s.buf)),
+            wait_mode=test_client.WAIT_OFF))
+        self.hello(session, 2, 1)
+        self.whole_tile(session)
+
+        # Залишок у межах порога: у режимі «до N» клієнт чекав би.
+        session.handle(proto.PKT_FRAME_END, b"\x05\x00", now=100.0)
+
+        self.assertEqual(len(shown), 1)
+        self.assertEqual(session.frames_no_wait, 1)
+        self.assertEqual(session.frames_too_many, 0)
+        self.assertEqual(session.frames_timeout, 0)
 
     def test_old_firmware_frame_end_shows_at_once(self):
         # Порожній FRAME_END — прошивка до задачі 0019. Ознаки повноти немає,
