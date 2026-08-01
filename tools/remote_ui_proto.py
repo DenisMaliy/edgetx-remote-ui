@@ -30,6 +30,7 @@ PKT_TILE = 0x02
 PKT_FRAME_END = 0x03
 PKT_STATE = 0x04
 PKT_LOG = 0x05
+PKT_BAUD = 0x06
 
 # Клієнт → пульт
 PKT_KEY = 0x81
@@ -39,6 +40,7 @@ PKT_REFRESH = 0x84
 PKT_TRIM = 0x85
 PKT_PING = 0x86
 PKT_INPUT_STATE = 0x87
+PKT_BAUD_SET = 0x88
 
 TILE_METHOD_RAW = 0
 TILE_METHOD_RLE16 = 1
@@ -161,6 +163,64 @@ def encode_input_state(keys: int, trims: int, touch_down: bool, x: int, y: int) 
             y & 0xFFFF,
         ),
     )
+
+
+def encode_baud_set(baud: int, nonce: int) -> bytes:
+    """BAUD_SET: попросити пульт перемкнути швидкість каналу (ADR-0005).
+
+    5 байтів: швидкість (4, LE) і nonce (1).
+
+    ⚠️ nonce потрібен не для краси. Людина тисне «2 000 000», відповіді немає,
+    тисне «1 000 000» — а підтвердження на **першу** команду доїжджає із
+    запізненням. Без nonce його прийняли б за відповідь на другу, і сторони
+    розійшлися б **без жодної відмови в каналі**: обидві вважали б, що
+    домовились, але про різне. Пульт nonce не перевіряє, а повертає як є, —
+    сплутати має бути неможливо саме на боці того, хто питав.
+    """
+    return encode_frame(PKT_BAUD_SET, struct.pack("<IB", baud & 0xFFFFFFFF, nonce & 0xFF))
+
+
+# Вердикти пакета BAUD. Дзеркало BaudVerdict із firmware/.../baudrate.h.
+BAUD_ACCEPTED = 0
+BAUD_UNSUPPORTED = 1
+BAUD_BUSY = 2
+BAUD_NOT_APPLICABLE = 3
+BAUD_REVERTED = 4
+
+BAUD_VERDICT_NAMES = {
+    BAUD_ACCEPTED: "перемкнеться",
+    BAUD_UNSUPPORTED: "швидкості немає в переліку",
+    BAUD_BUSY: "уже триває перемикання",
+    BAUD_NOT_APPLICABLE: "транспорт не має поняття швидкості",
+    BAUD_REVERTED: "пульт повернувся сам",
+}
+
+
+def parse_baud(payload: bytes) -> dict | None:
+    """BAUD: відповідь пульта про швидкість. 16 байтів.
+
+    Повертає None, якщо вантаж коротший за відому частину: частково прочитане
+    число швидкості гірше за нечитане. Довший хвіст ігнорується — це правило
+    сумісності протоколу.
+    """
+    if len(payload) < 16:
+        return None
+
+    verdict, nonce, target, current, switch_delay, revert_window, reverts = struct.unpack(
+        "<BBIIHHH", payload[:16]
+    )
+    return {
+        "verdict": verdict,
+        "verdict_name": BAUD_VERDICT_NAMES.get(verdict, f"невідомий ({verdict})"),
+        "nonce": nonce,
+        "target": target,
+        # Нуль означає «поняття не застосовне» (USB CDC, TCP симулятора), а не
+        # швидкість нуль: нуля в переліку немає й бути не може.
+        "current": current if current else None,
+        "switch_delay_ms": switch_delay,
+        "revert_window_ms": revert_window,
+        "reverts": reverts,
+    }
 
 
 class InputMirror:
@@ -454,6 +514,24 @@ class SerialTransport(Transport):
 
     def send(self, data: bytes):
         self.ser.write(data)
+
+    def set_baudrate(self, baud: int) -> None:
+        """Перемкнути швидкість цього боку — дзеркало того, що робить міст.
+
+        ⚠️ Порядок такий самий, як у прошивки й у моста, і він не випадковий:
+
+        1. дочекатись, поки все відправлене зійде з дроту (`flush`) — інакше
+           недописаний кадр доїде вже на новій швидкості й стане сміттям;
+        2. записати нову швидкість;
+        3. викинути все, що встигло накопичитись у приймачі, — байти, які
+           ловилися в мить перемикання, спотворені за побудовою.
+
+        Пункт 3 робиться **після** пункту 2, а не до нього.
+        """
+        self.ser.flush()
+        self.ser.baudrate = baud
+        self.ser.reset_input_buffer()
+        self.name = f"serial {self.ser.port} @ {baud}"
 
     def close(self):
         try:
