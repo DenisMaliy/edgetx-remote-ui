@@ -58,6 +58,12 @@ extern const uint8_t app_js_start[] asm("_binary_app_js_gz_start");
 extern const uint8_t app_js_end[] asm("_binary_app_js_gz_end");
 extern const uint8_t style_css_start[] asm("_binary_style_css_gz_start");
 extern const uint8_t style_css_end[] asm("_binary_style_css_gz_end");
+/* Опис застосунку й значок: із ними сторінку кладуть на робочий стіл телефона
+ * і запускають без браузерної обгортки — задача 0023, критерій 1.4. */
+extern const uint8_t manifest_start[] asm("_binary_manifest_webmanifest_gz_start");
+extern const uint8_t manifest_end[] asm("_binary_manifest_webmanifest_gz_end");
+extern const uint8_t icon_png_start[] asm("_binary_icon_png_gz_start");
+extern const uint8_t icon_png_end[] asm("_binary_icon_png_gz_end");
 
 static httpd_handle_t s_server;
 static SemaphoreHandle_t s_lock;
@@ -718,6 +724,22 @@ static esp_err_t css_get(httpd_req_t *req)
     return send_blob(req, "text/css; charset=utf-8", style_css_start, style_css_end);
 }
 
+/* ⚠️ Тип обов'язковий: із чужим типом браузер опис застосунку мовчки
+ * ігнорує, і сторінка з робочого столу відкривається знову в обгортці. */
+static esp_err_t manifest_get(httpd_req_t *req)
+{
+    return send_blob(req, "application/manifest+json; charset=utf-8",
+                     manifest_start, manifest_end);
+}
+
+/* ⚠️ Значок теж їде стисненим — `send_blob` ставить `Content-Encoding: gzip`
+ * безумовно. Для PNG це не виграш (512 Б проти 513), але й не втрата, а
+ * винятку в спільній дорозі не з'явилось. */
+static esp_err_t icon_get(httpd_req_t *req)
+{
+    return send_blob(req, "image/png", icon_png_start, icon_png_end);
+}
+
 /**
  * @brief Почати нове вікно заміру купи.
  *
@@ -816,14 +838,30 @@ esp_err_t ws_bridge_start(void)
     esp_log_level_set("httpd_ws", ESP_LOG_ERROR);
     esp_log_level_set("httpd_txrx", ESP_LOG_ERROR);
 
+    /* ⚠️ Перелік стоїть **до** налаштувань навмисно: стеля кількості шляхів
+     * рахується з нього самого (`cfg.max_uri_handlers` нижче). Доти число
+     * стояло окремо з приміткою «додаєш шлях — звір із цим числом», і
+     * перебір упав би не при збірці, а на старті моста, у полі. */
+    static const httpd_uri_t uris[] = {
+        {.uri = "/", .method = HTTP_GET, .handler = index_get},
+        {.uri = "/index.html", .method = HTTP_GET, .handler = index_get},
+        {.uri = "/proto.js", .method = HTTP_GET, .handler = protojs_get},
+        {.uri = "/wait.js", .method = HTTP_GET, .handler = waitjs_get},
+        {.uri = "/panels.js", .method = HTTP_GET, .handler = panelsjs_get},
+        {.uri = "/app.js", .method = HTTP_GET, .handler = appjs_get},
+        {.uri = "/style.css", .method = HTTP_GET, .handler = css_get},
+        {.uri = "/manifest.webmanifest", .method = HTTP_GET, .handler = manifest_get},
+        {.uri = "/icon.png", .method = HTTP_GET, .handler = icon_get},
+        {.uri = "/api/stats", .method = HTTP_GET, .handler = stats_get},
+        {.uri = "/api/heap/reset", .method = HTTP_POST, .handler = heap_reset_post},
+        {.uri = "/api/wifi/off", .method = HTTP_POST, .handler = wifi_off_post},
+        {.uri = "/ws", .method = HTTP_GET, .handler = ws_handler, .is_websocket = true},
+    };
+
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.stack_size = 8192; /* у обробнику лежить буфер на BRIDGE_WS_RX_MAX */
     cfg.max_open_sockets = 4;
-    /* Типова стеля — 8, а шляхів уже одинадцять (останнім додався
-     * `/panels.js`, задача 0022). Число
-     * тримається з запасом навмисно: перебір упав би не при збірці, а на
-     * старті моста, у полі. ⚠️ Додаєш шлях — звір із цим числом. */
-    cfg.max_uri_handlers = 12;
+    cfg.max_uri_handlers = sizeof(uris) / sizeof(uris[0]);
     cfg.lru_purge_enable = true;
     cfg.close_fn = on_sock_close;
     cfg.send_wait_timeout = 2;
@@ -841,20 +879,6 @@ esp_err_t ws_bridge_start(void)
              BRIDGE_PRIO_RX, cfg.task_priority, BRIDGE_PRIO_WATCHDOG, BRIDGE_PRIO_WS_TX);
 
     ESP_ERROR_CHECK(httpd_start(&s_server, &cfg));
-
-    static const httpd_uri_t uris[] = {
-        {.uri = "/", .method = HTTP_GET, .handler = index_get},
-        {.uri = "/index.html", .method = HTTP_GET, .handler = index_get},
-        {.uri = "/proto.js", .method = HTTP_GET, .handler = protojs_get},
-        {.uri = "/wait.js", .method = HTTP_GET, .handler = waitjs_get},
-        {.uri = "/panels.js", .method = HTTP_GET, .handler = panelsjs_get},
-        {.uri = "/app.js", .method = HTTP_GET, .handler = appjs_get},
-        {.uri = "/style.css", .method = HTTP_GET, .handler = css_get},
-        {.uri = "/api/stats", .method = HTTP_GET, .handler = stats_get},
-        {.uri = "/api/heap/reset", .method = HTTP_POST, .handler = heap_reset_post},
-        {.uri = "/api/wifi/off", .method = HTTP_POST, .handler = wifi_off_post},
-        {.uri = "/ws", .method = HTTP_GET, .handler = ws_handler, .is_websocket = true},
-    };
 
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); ++i) {
         ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &uris[i]));

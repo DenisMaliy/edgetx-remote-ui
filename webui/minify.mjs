@@ -40,7 +40,7 @@
 // модуль загорнутий в IIFE, тож перейменування нікуди не витікає». Для
 // `proto.js`, `wait.js` і `panels.js` це правда, **а для `app.js` — ні**: у
 // нього обгортки немає, увесь його верхній рівень лежить у глобальній
-// області. І це найбільший файл із шести. Хибне пояснення небезпечніше за
+// області. І це найбільший файл із восьми. Хибне пояснення небезпечніше за
 // відсутнє: воно виглядає як дозвіл чіпати `bundle`.
 //
 // Решта перевірена окремо: у `index.html` немає вбудованих обробників
@@ -62,9 +62,11 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 //   2. `WEBUI_FILES` у `firmware/esp32/main/CMakeLists.txt`;
 //   3. оголошення `extern` і шлях у `firmware/esp32/main/ws_bridge.c`;
 //   4. `ASSETS` у `tools/webui_built_check.py` — інакше сторож звірятиме
-//      п'ять файлів із шести й пропустить саме новий.
+//      сім файлів із восьми й пропустить саме новий.
 const MINIFY = ['proto.js', 'wait.js', 'panels.js', 'app.js', 'style.css'];
-const COPY = ['index.html'];
+// ⚠️ `manifest.webmanifest` і `icon.png` теж лише копіюються: перший — JSON
+// на десяток рядків, різати там нема чого, другий — двійковий.
+const COPY = ['index.html', 'manifest.webmanifest', 'icon.png'];
 
 const outDir = process.argv[2];
 if (!outDir) {

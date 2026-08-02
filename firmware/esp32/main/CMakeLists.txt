@@ -46,7 +46,8 @@ idf_component_register(
 set(WEBUI_DIR "${CMAKE_CURRENT_LIST_DIR}/../../../webui")
 set(WEBUI_MIN_DIR "${CMAKE_CURRENT_BINARY_DIR}/webui-min")
 set(WEBUI_GZ_DIR "${CMAKE_CURRENT_BINARY_DIR}/webui-gz")
-set(WEBUI_FILES index.html proto.js wait.js panels.js app.js style.css)
+set(WEBUI_FILES index.html proto.js wait.js panels.js app.js style.css
+                manifest.webmanifest icon.png)
 
 # --- перед стисненням клієнт мініфікується ----------------------------------
 #
@@ -133,7 +134,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
              "${WEBUI_DIR}/pnpm-lock.yaml")
 
 # Один виклик на всі файли, а не по одному на кожен: запуск node коштує
-# ~50 мс, і шість запусків були б помітні в кожній збірці.
+# ~50 мс, і вісім запусків були б помітні в кожній збірці.
 set(WEBUI_MIN_FILES)
 set(WEBUI_SRC_FILES)
 foreach(asset IN LISTS WEBUI_FILES)
@@ -177,10 +178,10 @@ foreach(asset IN LISTS WEBUI_FILES)
         # зайва.
         #
         # ⚠️ Дрібності це не дає, і обіцяти її не треба: мініфікація групова
-        # (один виклик на всі шість, залежить від усіх шести джерел), а esbuild
+        # (один виклик на всі вісім, залежить від усіх восьми джерел), а esbuild
         # і `copyFile` пишуть безумовно. Тобто правка одного `style.css` однак
-        # оновлює час усіх шести `webui-min/*` і перестискає всі шість. Ціна —
-        # п'ять крихітних зайвих кроків, і вона свідомо прийнята.
+        # оновлює час усіх восьми `webui-min/*` і перестискає всі вісім. Ціна —
+        # сім крихітних зайвих кроків, і вона свідомо прийнята.
         DEPENDS "${src}"
         COMMENT "стискаю ${asset} для вбудовування"
         VERBATIM)

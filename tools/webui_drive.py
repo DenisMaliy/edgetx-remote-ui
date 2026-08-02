@@ -143,6 +143,15 @@ def main():
             відкриваємо, потім чекаємо оновлення, і лише тоді читаємо: інакше
             вертався б текст, зібраний хтозна-коли.
             """
+            # ⚠️ Смужка стану тепер згортається, і кнопка «Стан» лежить у ній
+            # (задача 0023, критерій 1.1). Клацати по схованій кнопці не можна:
+            # Playwright чекав би її появи, доки не спрацює тайм-аут.
+            bar_collapsed = page.evaluate(
+                "() => document.getElementById('bar').classList.contains('collapsed')")
+            if bar_collapsed:
+                page.click("#bar-toggle-left")
+                time.sleep(0.3)
+
             was_hidden = page.evaluate(
                 "() => document.getElementById('info').hidden")
             if was_hidden:
@@ -156,6 +165,8 @@ def main():
             # виглядав би проведеним, а міряв би тишу.
             if was_hidden:
                 page.click("#btn-info")
+            if bar_collapsed:
+                page.click("#bar-toggle-left")
             return text
 
         def swipe(seconds, name, hold_ms=360, steps=12, gap_ms=250):

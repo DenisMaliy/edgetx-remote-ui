@@ -301,12 +301,82 @@ function resizeTo(w, h) {
   fitCanvas();
 }
 
-/** Полотно вписуємо в екран телефона, зберігаючи співвідношення сторін. */
+/**
+ * Полотно вписуємо в екран телефона, зберігаючи співвідношення сторін, і
+ * ставимо панелі впритул до нього.
+ *
+ * ⚠️ Зсув рахується тут, а не в CSS, і це не лінощі. Правило боса складається
+ * з двох половин, які CSS разом не виражає:
+ *
+ *   1. **панель стоїть упритул до зображення** (критерій 2.4) — тобто колонка
+ *      сітки має дорівнювати самій картинці, а не вільному місцю;
+ *   2. **зображення стоїть по центру вікна, доки місця вистачає** (критерій
+ *      2.5), а коли не вистачає — панель його тіснить.
+ *
+ * Вирівнювання групи «панель — екран — панель» дало б другу половину лише
+ * поки панелі однакові; варто згорнути одну, і центрувалася б група, а
+ * зображення поїхало б убік на пів різниці — при цілком вільному місці.
+ * Симетричні розпірки дають те саме. Тому зсув рахується числом і кладеться
+ * в `margin-left` лівої панелі.
+ */
+/* ⚠️ Присвоєння лише коли число справді змінилось.
+ *
+ * `fitCanvas` кличе й спостерігач розміру (`ResizeObserver` на `#screen-wrap`),
+ * а сама вона тому ж елементу ширину й ставить. Безумовне присвоєння тієї
+ * самої ширини — це запрошення до зайвого кола «змінив → мене покликали →
+ * змінив», за яке Chrome ще й лається в журнал сторінки. */
+function setStyle(el, prop, value) {
+  if (el.style[prop] !== value) el.style[prop] = value;
+}
+
 function fitCanvas() {
   if (!W || !H) return;
-  const k = Math.max(0.1, Math.min(wrap.clientWidth / W, wrap.clientHeight / H));
-  canvas.style.width = Math.floor(W * k) + 'px';
-  canvas.style.height = Math.floor(H * k) + 'px';
+
+  const stage = document.getElementById('stage');
+  const padL = document.getElementById('pad-left');
+  const padR = document.getElementById('pad-right');
+  const bar = document.getElementById('bar');
+  if (!stage || !padL || !padR) return;
+
+  if (portrait()) {
+    // Книжкова: зображення на всю ширину ряду, панелі під ним. Зсувати нічого
+    // не треба — упритул тут дає сам ряд сітки, а CSS притискає картинку вниз.
+    setStyle(padL, 'marginLeft', '');
+    setStyle(wrap, 'width', '');
+    const k = Math.max(0.1, Math.min(wrap.clientWidth / W, wrap.clientHeight / H));
+    setStyle(canvas, 'width', Math.floor(W * k) + 'px');
+    setStyle(canvas, 'height', Math.floor(H * k) + 'px');
+    return;
+  }
+
+  // ⚠️ Ширини панелей читаються **до** того, як ми чіпаємо колонку екрана, і
+  // тримається це не на самому лише `--key-w`, а на `min-width: max-content`
+  // у `.pad` (див. `style.css`). Без нього сітка стискає панель під ще не
+  // виправлену ширину зображення, ми читаємо стиснуте число, вважаємо, що
+  // місця вдосталь, — і зображення лишається завеликим. Заміряно: клавіші по
+  // 14 пікселів після звуження вікна 900 → 760.
+  const stageW = stage.clientWidth;
+  const stageH = stage.clientHeight;
+  const leftW = padL.offsetWidth;
+  const rightW = padR.offsetWidth;
+  const barH = bar ? bar.offsetHeight : 0;
+
+  const availW = Math.max(1, stageW - leftW - rightW);
+  const availH = Math.max(1, stageH - barH);
+
+  const k = Math.max(0.1, Math.min(availW / W, availH / H));
+  const iw = Math.floor(W * k);
+  const ih = Math.floor(H * k);
+  setStyle(canvas, 'width', iw + 'px');
+  setStyle(canvas, 'height', ih + 'px');
+  // Колонка сітки = рівно картинка, тож між нею й панеллю не лишається нічого.
+  setStyle(wrap, 'width', iw + 'px');
+
+  // Бажане: картинка по центру вікна. Дозволене: не вилізти за краї — саме це
+  // й означає «панель тіснить зображення».
+  const want = Math.round((stageW - iw) / 2) - leftW;
+  const room = stageW - leftW - iw - rightW;
+  setStyle(padL, 'marginLeft', Math.max(0, Math.min(want, room)) + 'px');
 }
 
 function onTile(payload) {
@@ -1264,6 +1334,96 @@ function setupPad(id) {
 setupPad('pad-left');
 setupPad('pad-right');
 
+/* --- смужка стану: згорнута, доки її не покликали --------------------------
+ *
+ * ⚠️ Смужка згорнута **за замовчуванням** (задача 0023, критерій 1.1), і це
+ * не смак: на телефоні найдорожчий ресурс — висота, а смужку зверху бос
+ * назвав першою серед незручностей. У згорнутому стані вона не займає нічого
+ * — ні власного ряду в альбомній, ні висоти в книжковій.
+ *
+ * ⚠️ Те, заради чого смужка існує (пам'ять моста, швидкість каналу, частота
+ * кадрів, фокус клавіатури), лишається досяжним **за одне торкання** — ручкою
+ * `≡`, яка є з обох боків, під кожним великим пальцем. Вимога 6.2 задачі 0022
+ * не скасована, а переформульована: не «видно завжди», а «видно за дотик».
+ */
+const BAR_KEY = 'collapsed.bar';
+const barEl = document.getElementById('bar');
+const barToggles = ['bar-toggle-left', 'bar-toggle-right']
+  .map((id) => document.getElementById(id))
+  .filter(Boolean);
+
+function barIsCollapsed() {
+  return storeGet(BAR_KEY, '1') === '1';
+}
+
+function applyBar() {
+  if (!barEl) return;
+  const collapsed = barIsCollapsed();
+  barEl.classList.toggle('collapsed', collapsed);
+  for (const b of barToggles) b.textContent = collapsed ? '≡' : '×';
+  // Місце під картинку щойно змінилось — перерахувати.
+  fitCanvas();
+}
+
+function setBar(collapsed) {
+  storeSet(BAR_KEY, collapsed ? '1' : '0');
+  applyBar();
+}
+
+for (const b of barToggles) {
+  b.addEventListener('click', () => {
+    setBar(!barIsCollapsed());
+    focusScreen();
+  });
+}
+
+applyBar();
+
+/* --- на весь екран ---------------------------------------------------------
+ *
+ * ⚠️ Кнопки немає в розмітці навмисно: вона з'являється лише там, де браузер
+ * повноекранний режим справді вміє (критерій 1.5). На пристроях Apple цього
+ * способу немає взагалі, і кнопка, яка нічого не робить, гірша за відсутню —
+ * бос натиснув би її й вирішив, що клієнт зламався.
+ *
+ * Другий, і головний, шлях віддати ту саму висоту — опис застосунку
+ * (`manifest.webmanifest`): сторінку кладуть на робочий стіл і запускають
+ * без браузерної обгортки взагалі. Він працює і там, де кнопки немає.
+ */
+const fullscreenSupported = !!(document.fullscreenEnabled ||
+                               document.webkitFullscreenEnabled);
+
+function fullscreenOn() {
+  return !!(document.fullscreenElement || document.webkitFullscreenElement);
+}
+
+function toggleFullscreen() {
+  const el = document.documentElement;
+  try {
+    const p = fullscreenOn()
+      ? (document.exitFullscreen || document.webkitExitFullscreen).call(document)
+      : (el.requestFullscreen || el.webkitRequestFullscreen).call(el);
+    // Браузер має право відмовити (немає жесту, заборонено налаштуванням).
+    // Відмова — не помилка клієнта, і в журнал сторінки їй нема чого потрапляти.
+    if (p && typeof p.catch === 'function') p.catch(() => {});
+  } catch (e) { /* не вміє — лишаємось як були */ }
+  focusScreen();
+}
+
+if (fullscreenSupported) {
+  const btnFull = document.createElement('button');
+  btnFull.id = 'btn-full';
+  btnFull.type = 'button';
+  // ⚠️ Словом, а не значком. Типовий значок повноекранного режиму (U+26F6) є
+  // далеко не в кожному шрифті, а свого ми не возимо: на стенді він виходить
+  // порожнім прямокутником, і на чужому телефоні вийшов би так само.
+  btnFull.textContent = 'Весь екран';
+  btnFull.title = 'розгорнути сторінку на весь екран (де браузер це вміє)';
+  btnFull.addEventListener('click', toggleFullscreen);
+  const row = document.getElementById('bar-row');
+  row.insertBefore(btnFull, document.getElementById('btn-refresh'));
+}
+
 document.getElementById('baud').addEventListener('change', onBaudPick);
 
 document.getElementById('btn-refresh').addEventListener('click', () => {
@@ -1333,9 +1493,10 @@ window.remoteUiDragRule = function (on) {
   return policy.dragRule;
 };
 
-/* Панель стану — угорі й **згорнута за замовчуванням**: місце внизу віддане
- * клавішам, а те, що потрібне під час роботи (пам'ять моста, швидкість,
- * частота кадрів, фокус клавіатури), і так лишається видимим у смужці. */
+/* Панель стану — усередині смужки й **згорнута за замовчуванням**: розклад
+ * «хто з'їв пам'ять» і решта подробиць потрібні на стенді, а не щодня. Те, що
+ * потрібне під час роботи, лежить чипами в самій смужці — за одне торкання
+ * ручки `≡`. */
 const info = document.getElementById('info');
 const btnInfo = document.getElementById('btn-info');
 btnInfo.addEventListener('click', () => {
@@ -1391,6 +1552,28 @@ setInterval(pollBridge, BRIDGE_POLL_MS);
 
 const kb = (n) => (n / 1024).toFixed(n < 10240 ? 1 : 0);
 
+/** Чи була пам'ять моста нижче межі минулого разу — щоб смужка відчинялась
+ *  один раз на подію, а не щосекунди. */
+let heapWasLow = false;
+
+/** Скільки опитувань поспіль міст мовчить. Див. `HEAP_ALARM_REARM_POLLS`. */
+let heapQuietPolls = 0;
+
+/*
+ * ⚠️ Скільки мовчання вважати новим сеансом, а не блиманням зв'язку.
+ *
+ * Спокуса «міст замовк — знімаємо засувку, бо ми більше не знаємо, скільки в
+ * нього купи» коштувала б рівно тієї гарантії, заради якої засувка є: низька
+ * купа моста береться від тиску трафіку, і **той самий тиск зриває
+ * опитування**. Тобто одна пропущена відповідь — це не новина, а частина тієї
+ * ж події, і смужка ставала б незакривною саме під навантаженням. Заміряно
+ * рецензією: після блимання зв'язку закрита смужка відчинялась знову.
+ *
+ * П'ять періодів (≈5 с) — це вже не блимання, а перезапуск моста або відхід
+ * телефона з мережі; після такого тривогу справді треба подати наново.
+ */
+const HEAP_ALARM_REARM_POLLS = 5;
+
 /**
  * Вільна пам'ять моста — у смужці поруч із кадрами, а не в панелі «Стан».
  *
@@ -1407,13 +1590,32 @@ const kb = (n) => (n / 1024).toFixed(n < 10240 ? 1 : 0);
 function showHeapChip(s) {
   const el = document.getElementById('heap');
   const h = s && s.heap;
-  if (!h) { el.hidden = true; return; }   // міст старіший за прилад
+  if (!h) {
+    el.hidden = true;
+    // ⚠️ Засувка знімається не за першою пропущеною відповіддю, а за
+    // **тривалим** мовчанням — пояснення при `HEAP_ALARM_REARM_POLLS`.
+    if (++heapQuietPolls >= HEAP_ALARM_REARM_POLLS) heapWasLow = false;
+    return;
+  }
 
+  heapQuietPolls = 0;
   el.hidden = false;
-  chip('heap', `пам'ять ${kb(h.min_window)} КБ`,
-       h.min_window < h.warn_at ? 'warn' : '');
+  const low = h.min_window < h.warn_at;
+  chip('heap', `пам'ять ${kb(h.min_window)} КБ`, low ? 'warn' : '');
   el.title = `мінімум вільної купи моста у вікні заміру; межа ${kb(h.warn_at)} КБ, ` +
              `стеля ${kb(h.ceiling)} КБ`;
+
+  /* ⚠️ Смужка тепер згортається, і сторож із задачі 0021 міг би сховатись
+   * разом із нею. Тому при падінні нижче межі смужка розгортається сама.
+   *
+   * Рівно один раз на подію: `heapWasLow` гаситься, коли пам'ять повернулась
+   * вище межі — або коли міст мовчить довше за `HEAP_ALARM_REARM_POLLS`
+   * періодів, тобто сеанс уже інший. Інакше опитування раз на секунду
+   * відчиняло б смужку знову й знову, і закрити її стало б неможливо саме
+   * тоді, коли людина дивиться на пульт.
+   */
+  if (low && !heapWasLow && barIsCollapsed()) setBar(false);
+  heapWasLow = low;
 }
 
 const SOURCE_NAME = {

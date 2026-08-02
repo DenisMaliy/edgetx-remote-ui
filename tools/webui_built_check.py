@@ -22,7 +22,13 @@ Playwright робити проти зібраної сторінки, а не п
 
 ## Що саме перевіряється
 
-Не вигляд, а те, що ламає **саме мініфікатор**:
+⚠️ **Двома шарами, і другий з'явився в задачі 0023.** Спершу інструмент
+перевіряв лише те, що ламає мініфікатор; тепер він ще й **міряє розкладку й
+кольори живої сторінки**. Причина — спільне правило доказу 0023: числа
+знімаються обчисленими розмірами й кольорами, а не оком по знімку. Знімок
+каже «схоже на правду» — а критерій каже «дорівнює нулю» і «втричі більше».
+
+**Шар перший — те, що ламає саме мініфікатор:**
 
 * глобальні `RemoteUI`, `RemoteUIWait`, `RemoteUIPanels` не перейменовані;
 * публічна поверхня (ключі об'єктів) ціла — `RemoteUIPanels.INTENT_UP`;
@@ -31,6 +37,16 @@ Playwright робити проти зібраної сторінки, а не п
 * клавіатура: стрілка вниз → `enc`, `Esc` → `RTN`;
 * вліво-вправо **не роблять нічого** (рішення людини від 03.08);
 * жодної помилки JS за весь прогін.
+
+**Шар другий — вигляд і розкладка (задача 0023), у двох орієнтаціях:**
+
+* смужка стану згорнута **за замовчуванням** і не займає нічого;
+* панелі однакові, стоять упритул до зображення, зображення по центру;
+* подвійні відступи, ширина кнопок джойстика, чверть ручки під смужку;
+* книжкова: одна колонка, три панелі в сумі дорівнюють ширині вікна;
+* кольори тла, написів і двох порід кнопок;
+* опис застосунку (`display: standalone`) і кнопка «на весь екран» — разом із
+  тим, що там, де браузер повноекранного режиму не вміє, кнопки **немає**.
 
 ## Запуск
 
@@ -68,7 +84,8 @@ WEBUI = os.path.join(ROOT, "webui")
 # ⚠️ Має збігатися з `WEBUI_FILES` у firmware/esp32/main/CMakeLists.txt і з
 # `MINIFY` + `COPY` у webui/minify.mjs. Новий файл клієнта додається в усіх
 # трьох місцях плюс оголошення в `ws_bridge.c`.
-ASSETS = ["index.html", "proto.js", "wait.js", "panels.js", "app.js", "style.css"]
+ASSETS = ["index.html", "proto.js", "wait.js", "panels.js", "app.js", "style.css",
+          "manifest.webmanifest", "icon.png"]
 
 
 def die(msg, code=2):
@@ -194,6 +211,588 @@ def assert_serving_built(url, built_dir):
               "     cd firmware/esp32 && idf.py -p /dev/ttyUSB0 flash")
 
 
+# --------------------------------------------------------- вигляд і розкладка
+#
+# ⚠️ Спільне правило доказу задачі 0023: числа знімаються з **живої сторінки**
+# обчисленими розмірами й кольорами, а не оком по знімку. Знімок каже «схоже на
+# правду», а тут потрібне «дорівнює нулю» і «втричі більше».
+#
+# Обидві орієнтації міряються тим самим кодом: вікно 900×420 і 420×860.
+
+LANDSCAPE = {"width": 900, "height": 420}
+PORTRAIT = {"width": 420, "height": 860}
+
+# Кольори з `webui/style.css`, записані так, як їх вертає `getComputedStyle`.
+NEON = "rgb(255, 125, 26)"
+WIDE_BG = "rgb(194, 98, 15)"
+BLACK = "rgb(0, 0, 0)"
+
+MEASURE_JS = r"""
+() => {
+  const g = (s) => document.querySelector(s);
+  const box = (el) => {
+    if (!el) return null;
+    const b = el.getBoundingClientRect();
+    return {w: b.width, h: b.height, l: b.left, r: b.right, t: b.top, b: b.bottom};
+  };
+  const css = (el, prop) => el ? getComputedStyle(el)[prop] : null;
+  const list = (sel) => [...document.querySelectorAll(sel)].map((el) => Object.assign(
+      {label: el.textContent.trim(), wide: el.classList.contains('key-wide')}, box(el)));
+  const bar = g('#bar');
+  const seen = (id) => {
+    const el = document.getElementById(id);
+    return !!(el && el.getClientRects().length);
+  };
+  return {
+    win: {w: window.innerWidth, h: window.innerHeight},
+    stage: box(g('#stage')),
+    bar: box(bar),
+    barCollapsed: bar.classList.contains('collapsed'),
+    padL: box(g('#pad-left')),
+    padR: box(g('#pad-right')),
+    rail: box(g('#pad-left .pad-rail')),
+    padToggle: box(g('#pad-left-toggle')),
+    barToggle: box(g('#bar-toggle-left')),
+    canvas: box(g('#screen')),
+    keysL: list('#pad-left-body button.key'),
+    keysR: list('#pad-right-body button.key'),
+    stick: [...document.querySelectorAll('.stick-btn')].map(
+        (el) => Object.assign({cls: el.className}, box(el))),
+    color: {
+      padL: css(g('#pad-left'), 'backgroundColor'),
+      padR: css(g('#pad-right'), 'backgroundColor'),
+      bar: css(bar, 'backgroundColor'),
+      narrowText: css(g('button.key:not(.key-wide)'), 'color'),
+      narrowBg: css(g('button.key:not(.key-wide)'), 'backgroundColor'),
+      wideText: css(g('.key-wide'), 'color'),
+      wideBg: css(g('.key-wide'), 'backgroundColor'),
+      stickText: css(g('.stick-btn'), 'color'),
+    },
+    hasFullscreenButton: !!g('#btn-full'),
+    chipsSeen: {
+      heap: seen('heap'), fps: seen('fps'), focus: seen('focus'),
+      baud: seen('baud-wrap'),
+    },
+  };
+}
+"""
+
+
+def measure(page):
+    return page.evaluate(MEASURE_JS)
+
+
+def near(a, b, eps=1.5):
+    return abs(a - b) <= eps
+
+
+def set_bar(page, collapsed):
+    """Згорнути або розгорнути смужку стану — рівно одним торканням ручки."""
+    if measure(page)["barCollapsed"] != collapsed:
+        page.click("#bar-toggle-left")
+        time.sleep(0.35)
+
+
+def gaps(keys):
+    """Проміжки між сусідніми кнопками стовпчика, згори вниз."""
+    return [round(keys[i + 1]["t"] - keys[i]["b"], 1) for i in range(len(keys) - 1)]
+
+
+# ⚠️ Перевірки нижче припускають, що перша кнопка лівої панелі — `SYS`, а
+# остання правої — `MDL`. Це припущення **інструмента**, не клієнта: сам
+# клієнт так само будує панелі з `HELLO` (`panels_test.js` про чужий пульт
+# лишається зеленим). На пульті з іншим набором клавіш падати має саме ця
+# перевірка, а не панелі, — і шукати треба тут, а не в `panels.js`.
+
+
+def open_page(browser, url, viewport):
+    """Свіже вікно з ловцем помилок сторінки.
+
+    ⚠️ Ловець тут не для повноти. Рецензія 0023 знайшла, що додаткові вікна
+    (типовий стан смужки, браузер без повноекранного режиму) створювались без
+    нього — тобто виняток саме на тих шляхах не побачив би ніхто.
+    """
+    ctx = browser.new_context(viewport=dict(viewport))
+    page = ctx.new_page()
+    errors = []
+    page.on("pageerror", lambda e: errors.append(str(e)))
+    page.on("console", lambda m: errors.append(f"console.error: {m.text}")
+            if m.type == "error" else None)
+    page.goto(url, wait_until="load", timeout=25000)
+    page.wait_for_function(
+        "() => document.getElementById('screen').width > 100", timeout=25000)
+    time.sleep(1.0)
+    return ctx, page, errors
+
+
+def check_resize_sweep(browser, url, chk):
+    """⚠️ Звуження вікна — заміряна вада, а не гіпотеза.
+
+    Рецензія 0023: при звуженні сітка стискала панелі під **ще не виправлену**
+    ширину зображення, `fitCanvas` читав стиснуте число й лишав зображення
+    завеликим. Заміряно на 900 → 760: клавіші по 14 пікселів замість 84, на
+    640 — панелі по нулю й горизонтальна прокрутка.
+
+    ⚠️ Прогін іде у **свіжому** вікні зі згорнутою смужкою, тобто в типовому
+    стані. Перевірка 2.5 звужувала вікно й казала `[OK]` рівно тому, що йшла
+    після інших: смужка вже була розгорнута, картинку обмежувала висота, і до
+    стискання по ширині справа не доходила.
+    """
+    ctx, page, errors = open_page(browser, url, LANDSCAPE)
+    try:
+        base = measure(page)
+        want_pad = round(base["padL"]["w"], 1)
+        want_key = round(base["keysL"][0]["w"], 1) if base["keysL"] else 0
+        bad = []
+        for w in (900, 760, 640, 520, 700, 900):
+            page.set_viewport_size({"width": w, "height": 420})
+            time.sleep(0.35)
+            m = measure(page)
+            key = round(m["keysL"][0]["w"], 1) if m["keysL"] else 0
+            over = page.evaluate("() => document.documentElement.scrollWidth >"
+                                 " window.innerWidth")
+            if (not near(m["padL"]["w"], want_pad) or not near(m["padR"]["w"], want_pad)
+                    or not near(key, want_key) or over):
+                bad.append(f"{w}: панелі {round(m['padL']['w'])}/{round(m['padR']['w'])}, "
+                           f"клавіша {key}" + (", переповнення" if over else ""))
+        chk("2.4 звуження вікна не стискає панелі й не дає прокрутки", not bad,
+            "; ".join(bad) if bad else f"панель {want_pad}, клавіша {want_key} на всіх "
+                                       "ширинах 900…520")
+        # ⚠️ Одне абсолютне число на весь розділ розкладки. Решта перевірок
+        # звіряє частини сторінки між собою (панель із панеллю, клавішу з
+        # клавішею), тож `--key-w: 8px` лишив би їх усі зеленими — знайдено
+        # рецензією. 44 px — та сама ціль для пальця, що вже стоїть у
+        # `.key { min-height: 44px }`.
+        chk("2.1 клавіша не вужча за ціль для пальця", want_key >= 44,
+            f"{want_key} px при межі 44")
+        # ⚠️ Межа, нижче якої панелі однак не поміщаються: 2 × 110 + мінімум
+        # під картинку ≈ 268 px ширини вікна. Жоден телефон в альбомній не
+        # буває вужчим за 480, тому прогін нижче 520 не спускається.
+        chk("сторінка без помилок JS (звуження вікна)", not errors, "; ".join(errors[:3]))
+    finally:
+        ctx.close()
+
+
+def check_heap_watchdog(browser, url, chk):
+    """Сторож пам'яті моста з 0021 не сховався разом зі смужкою.
+
+    ⚠️ Низька купа підставляється **підміною відповіді моста**, а не полем у
+    двійнику: у двійника справжньої купи немає, і постійне «мало пам'яті»
+    зробило б решту перевірок несхожими на роботу. Тут перевіряється рівно те,
+    що робить клієнт, коли міст каже, що пам'ять скінчилась.
+    """
+    ctx, page, errors = open_page(browser, url, LANDSCAPE)
+    try:
+        chk("сторож: смужка починає згорнутою", measure(page)["barCollapsed"])
+
+        def low(route):
+            route.fulfill(status=200, content_type="application/json",
+                          body=json.dumps({"heap": {"ceiling": 262144, "warn_at": 32768,
+                                                    "min_window": 12000}}))
+
+        page.route("**/api/stats", low)
+
+        # ⚠️ Чекати треба **викликом Playwright**, а не `time.sleep`. У
+        # синхронному Playwright перехоплювач запиту виконується лише тоді,
+        # коли головна нитка всередині його виклику; на звичайному сні запит
+        # просто висить неперехоплений, клієнт низької купи не бачить — і
+        # перевірка падає на справному коді. Спіймано на собі.
+        opened = True
+        try:
+            page.wait_for_function(
+                "() => !document.getElementById('bar').classList.contains('collapsed')",
+                timeout=8000)
+        except Exception:
+            opened = False
+        chk("сторож: пам'ять упала нижче межі — смужка відчинилась сама", opened)
+
+        # ⚠️ Друга половина правила, і без неї перша шкідлива: смужку, яку
+        # відчиняють щосекунди, закрити неможливо саме тоді, коли людина
+        # дивиться на пульт.
+        page.click("#bar-toggle-left")
+        for _ in range(6):
+            page.wait_for_timeout(500)
+        chk("сторож: відчиняється раз на подію, а не щосекунди",
+            measure(page)["barCollapsed"])
+
+        # ⚠️ Блимання зв'язку — не нова тривога. Низька купа моста береться від
+        # тиску трафіку, і **той самий тиск зриває опитування**: якби засувка
+        # знімалась першою пропущеною відповіддю, смужка ставала б незакривною
+        # саме під навантаженням. Заміряно рецензією на першому виправленні.
+        page.unroute("**/api/stats")
+        page.route("**/api/stats", lambda r: r.abort())
+        page.wait_for_timeout(2000)
+        page.unroute("**/api/stats")
+        page.route("**/api/stats", low)
+        for _ in range(6):
+            page.wait_for_timeout(500)
+        chk("сторож: блимання зв'язку не подає тривогу наново",
+            measure(page)["barCollapsed"])
+
+        # ⚠️ А довге мовчання — подає: це вже не блимання, а перезапуск моста
+        # або відхід телефона з мережі. Без цієї другої половини перша
+        # перетворилась би на «тривога подається один раз за життя вкладки».
+        page.unroute("**/api/stats")
+        page.route("**/api/stats", lambda r: r.abort())
+        page.wait_for_timeout(7000)
+        page.unroute("**/api/stats")
+        page.route("**/api/stats", low)
+        rearmed = True
+        try:
+            page.wait_for_function(
+                "() => !document.getElementById('bar').classList.contains('collapsed')",
+                timeout=8000)
+        except Exception:
+            rearmed = False
+        chk("сторож: після довгого мовчання тривога подається наново", rearmed)
+
+        # ⚠️ Те саме блимання ще раз, уже **після** довгого мовчання. Без цього
+        # кроку не перевіреним лишається скидання лічильника при живому мості:
+        # мутаційний прогін показав, що прибрати його можна, і всі перевірки
+        # лишаються зеленими. У житті нескинутий лічильник повз би вгору за
+        # години роботи на хиткому Wi-Fi і тихо повернув би ваду з блиманням.
+        page.click("#bar-toggle-left")
+        page.wait_for_timeout(500)
+        page.unroute("**/api/stats")
+        page.route("**/api/stats", lambda r: r.abort())
+        page.wait_for_timeout(2000)
+        page.unroute("**/api/stats")
+        page.route("**/api/stats", low)
+        for _ in range(6):
+            page.wait_for_timeout(500)
+        chk("сторож: лічильник мовчання скидається живим мостом",
+            measure(page)["barCollapsed"])
+        page.unroute("**/api/stats")
+
+        # ⚠️ Обірвані запити ми влаштували самі, і браузер про кожен пише в
+        # журнал. Це не помилка сторінки: `pollBridge` їх ловить і саме на них
+        # і розрахований. Відсіюємо рівно цей рядок, решту — ні.
+        ours = [e for e in errors if "Failed to load resource" not in e]
+        chk("сторінка без помилок JS (сторож пам'яті)", not ours, "; ".join(ours[:3]))
+    finally:
+        ctx.close()
+
+
+def check_icon_reproducible(chk, built_dir):
+    """Значок у git має збігатися з тим, що дає його генератор.
+
+    ⚠️ Це другий примірник даних у репозиторії — рівно те, від чого застерігає
+    найперший коментар `firmware/esp32/main/CMakeLists.txt`. Двійник без
+    сторожа розходиться з джерелом мовчки.
+    """
+    out = os.path.join(built_dir, "icon-check.png")
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "make_icon.py"), out],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    if r.returncode:
+        chk("1.4 значок відтворюється генератором", False,
+            r.stderr.decode("utf-8", "replace")[:200])
+        return
+    with open(out, "rb") as f:
+        made = f.read()
+    with open(os.path.join(WEBUI, "icon.png"), "rb") as f:
+        stored = f.read()
+    chk("1.4 значок у git збігається з тим, що дає tools/make_icon.py",
+        made == stored, f"{len(made)} Б проти {len(stored)} Б")
+
+
+def check_default_bar(browser, url, chk, viewport, where):
+    """Критерій 1.1 — смужка згорнута **за замовчуванням**.
+
+    ⚠️ Вікно береться свіже, а не те, у якому йдуть решта перевірок, і це не
+    зайва обережність: стан панелей клієнт пам'ятає між завантаженнями
+    (`localStorage`, задача 0022). У вікні, де смужку вже хтось відчиняв,
+    «згорнута за замовчуванням» довелося б спершу згорнути руками — тобто
+    перевірка міряла б власний клац, а не типовий стан.
+    """
+    ctx, page, errors = open_page(browser, url, viewport)
+    try:
+        m = measure(page)
+        chk(f"1.1 смужка згорнута за замовчуванням ({where})", m["barCollapsed"])
+        chk(f"1.1 згорнута смужка не має висоти ({where})", near(m["bar"]["h"], 0),
+            f"висота {m['bar']['h']} px")
+
+        # ⚠️ «Не займає окремого ряду» доводиться в двох орієнтаціях **різними
+        # числами**, бо ряду в них два різні.
+        if where == "альбомна":
+            # Тут смужка — справді власний ряд під панелями. Отже: у типовому
+            # стані панель дістає до самого низу сцени, а варто смужку
+            # відчинити — зображення на її висоту меншає. Друге число й робить
+            # перевірку такою, що може провалитись: якби смужка займала ряд
+            # завжди, різниці не було б.
+            chk("1.1 згорнута смужка не займає окремого ряду (альбомна)",
+                near(m["padL"]["b"], m["stage"]["b"]),
+                f"низ панелі {round(m['padL']['b'], 1)}, "
+                f"низ сцени {round(m['stage']['b'], 1)}")
+            page.click("#bar-toggle-left")
+            time.sleep(0.4)
+            opened = measure(page)
+            gain = m["canvas"]["h"] - opened["canvas"]["h"]
+            chk("1.1 згорнута смужка віддає ту висоту зображенню (альбомна)",
+                gain > 1 and opened["bar"]["h"] > 1,
+                f"картинка {round(m['canvas']['h'])} проти "
+                f"{round(opened['canvas']['h'])}, смужка {round(opened['bar']['h'])} px")
+        else:
+            # ⚠️ У книжковій різниці немає **за задумом**: смужка стоїть між
+            # панелями (критерій 3.5), а не під ними, тобто бере місце, яке
+            # інакше просто порожнє. Тому доказ інший: смужка нульова, і між
+            # зображенням та панелями теж нічого.
+            #
+            # ⚠️ Межі цієї перевірки названі чесно, бо мутаційний прогін їх
+            # показав: сам по собі **окремий ряд** під смужку вона не ловить
+            # (ловлять 3.1 і 3.5) — вона падає, коли згорнута смужка лишає за
+            # собою коробку. Разом із «смужка не має висоти» вище цього досить,
+            # а обіцяти більше — те саме, що брехати в коментарі.
+            chk("1.1 між зображенням і панелями нічого немає (книжкова)",
+                near(m["canvas"]["b"], m["padL"]["t"]),
+                f"проміжок {round(m['padL']['t'] - m['canvas']['b'], 1)} px")
+        chk(f"сторінка без помилок JS (типовий стан, {where})", not errors,
+            "; ".join(errors[:3]))
+    finally:
+        ctx.close()
+
+
+def check_height_back(page, chk, where):
+    """Критерій 1.3 — за одне торкання видно все, що показало свою вартість."""
+    set_bar(page, False)
+    m = measure(page)
+    missing = [k for k, v in m["chipsSeen"].items() if not v]
+    chk(f"1.3 за одне торкання видно пам'ять, швидкість, кадри, фокус ({where})",
+        not missing, f"не видно: {missing}" if missing else "усі чотири")
+    return m
+
+
+def check_landscape(page, chk):
+    """Розділ 2 (альбомна) плюс критерій 1.2."""
+    m = check_height_back(page, chk, "альбомна")
+
+    # 1.2 — смужка внизу, на всю ширину сцени.
+    chk("1.2 смужка стану переїхала вниз",
+        m["bar"]["t"] >= m["canvas"]["b"] - 1 and near(m["bar"]["b"], m["stage"]["b"]),
+        f"верх смужки {m['bar']['t']}, низ картинки {m['canvas']['b']}")
+    chk("1.2 смужка на всю ширину", near(m["bar"]["w"], m["stage"]["w"]),
+        f"{m['bar']['w']} проти {m['stage']['w']}")
+
+    # 2.1 — панелі однакової ширини.
+    chk("2.1 ліва й права панелі однакової ширини",
+        near(m["padL"]["w"], m["padR"]["w"]),
+        f"{m['padL']['w']} проти {m['padR']['w']}")
+
+    # 2.2 — подвійний відступ після SYS і після MDL.
+    gl = gaps(m["keysL"])
+    ok_l = len(gl) >= 2 and near(gl[0], 2 * gl[1], 1.0)
+    chk("2.2 подвійний відступ після SYS", ok_l, f"проміжки лівої: {gl}")
+    stick_top = min((s["t"] for s in m["stick"]), default=None)
+    mdl = m["keysR"][-1] if m["keysR"] else None
+    if mdl and stick_top is not None and gl:
+        chk("2.2 подвійний відступ між MDL і джойстиком",
+            near(stick_top - mdl["b"], 2 * gl[1], 1.5),
+            f"{round(stick_top - mdl['b'], 1)} проти звичайного {gl[1]}")
+    else:
+        chk("2.2 подвійний відступ між MDL і джойстиком", False, "джойстика немає")
+
+    # 2.3 — кнопка джойстика завширшки як MDL.
+    if mdl and m["stick"]:
+        widths = sorted({round(s["w"], 1) for s in m["stick"]})
+        chk("2.3 кнопки джойстика завширшки як MDL",
+            len(widths) == 1 and near(widths[0], mdl["w"]),
+            f"джойстик {widths}, MDL {mdl['w']}")
+        square = [s for s in m["stick"] if "st-mid" not in s["cls"]]
+        chk("2.3 пропорції збережені: напрямки квадратні",
+            all(near(s["w"], s["h"], 2) for s in square),
+            f"{[(round(s['w']), round(s['h'])) for s in square]}")
+
+    # 2.4 — панель упритул до зображення, без проміжку.
+    chk("2.4 ліва панель упритул до зображення", near(m["padL"]["r"], m["canvas"]["l"]),
+        f"проміжок {round(m['canvas']['l'] - m['padL']['r'], 1)} px")
+    chk("2.4 права панель упритул до зображення", near(m["padR"]["l"], m["canvas"]["r"]),
+        f"проміжок {round(m['padR']['l'] - m['canvas']['r'], 1)} px")
+
+    # 2.6 — чверть ручки віддана смужці.
+    ratio = m["padToggle"]["h"] / m["barToggle"]["h"] if m["barToggle"]["h"] else 0
+    chk("2.6 ручка смужки — чверть висоти ручки панелі", near(ratio, 3, 0.15),
+        f"панель {round(m['padToggle']['h'], 1)}, смужка {round(m['barToggle']['h'], 1)}")
+    chk("2.6 обидві частини заповнюють ручку",
+        near(m["padToggle"]["h"] + m["barToggle"]["h"], m["rail"]["h"], 2),
+        f"сума {round(m['padToggle']['h'] + m['barToggle']['h'], 1)}, "
+        f"ручка {round(m['rail']['h'], 1)}")
+
+
+def check_centering(page, chk):
+    """Критерій 2.5 — обидва випадки, на різних розмірах вікна."""
+    # Місця вистачає: зображення стоїть по центру вікна.
+    page.set_viewport_size({"width": 1200, "height": 420})
+    time.sleep(0.4)
+    m = measure(page)
+    mid = (m["canvas"]["l"] + m["canvas"]["r"]) / 2
+    chk("2.5 місця вистачає — зображення по центру", near(mid, m["win"]["w"] / 2, 2),
+        f"центр картинки {round(mid, 1)}, центр вікна {m['win']['w'] / 2}")
+    chk("2.5 і панелі при цьому впритул",
+        near(m["padL"]["r"], m["canvas"]["l"]) and near(m["padR"]["l"], m["canvas"]["r"]))
+
+    # Місця не вистачає, друга панель згорнута: панель тіснить зображення.
+    #
+    # ⚠️ Вікно тут вужче за звичайне (700, не 900) навмисно. При 900 місця
+    # вистачає навіть зі згорнутою панеллю — картинку обмежує висота, а не
+    # ширина, — і перевірка мовчки міряла б перший випадок удруге.
+    page.set_viewport_size({"width": 700, "height": 420})
+    page.click("#pad-right-toggle")
+    time.sleep(0.4)
+    m = measure(page)
+    mid = (m["canvas"]["l"] + m["canvas"]["r"]) / 2
+    chk("2.5 місця не вистачає — панель тіснить зображення",
+        near(m["padL"]["l"], 0) and not near(mid, m["win"]["w"] / 2, 2),
+        f"ліва панель від краю {round(m['padL']['l'], 1)}, "
+        f"центр картинки {round(mid, 1)} проти {m['win']['w'] / 2}")
+    chk("2.5 зображення не вилізло за краї",
+        m["canvas"]["l"] >= m["padL"]["r"] - 1.5 and m["canvas"]["r"] <= m["padR"]["l"] + 1.5)
+    page.click("#pad-right-toggle")
+    page.set_viewport_size(dict(LANDSCAPE))
+    time.sleep(0.4)
+
+
+def check_portrait(page, chk):
+    """Розділ 3 — книжкова орієнтація."""
+    m = check_height_back(page, chk, "книжкова")
+
+    # 3.1 — упритул до зображення, вільне місце над ним.
+    chk("3.1 панель упритул до зображення знизу", near(m["padL"]["t"], m["canvas"]["b"]),
+        f"проміжок {round(m['padL']['t'] - m['canvas']['b'], 1)} px")
+    chk("3.1 над зображенням лишається вільне місце",
+        m["canvas"]["t"] > m["stage"]["t"] + 1,
+        f"{round(m['canvas']['t'] - m['stage']['t'], 1)} px")
+
+    # 3.2 — усі кнопки в одну колонку.
+    for side, keys in (("ліва", m["keysL"]), ("права", m["keysR"])):
+        one_col = all(near(k["l"], keys[0]["l"]) for k in keys) and \
+            all(keys[i + 1]["t"] >= keys[i]["b"] - 1 for i in range(len(keys) - 1))
+        chk(f"3.2 {side} панель — одна колонка", bool(keys) and one_col,
+            f"{[(k['label'], round(k['l']), round(k['t'])) for k in keys]}")
+
+    # 3.3 — усі кнопки однакової ширини.
+    widths = sorted({round(k["w"], 1) for k in m["keysL"] + m["keysR"]})
+    chk("3.3 усі кнопки однакової ширини", len(widths) == 1, f"{widths}")
+
+    # 3.4 — подвійні відступи від SYS і MDL.
+    gl = gaps(m["keysL"])
+    chk("3.4 подвійний відступ після SYS (книжкова)",
+        len(gl) >= 2 and near(gl[0], 2 * gl[1], 1.0), f"{gl}")
+
+    # 3.5 — три панелі в сумі дорівнюють ширині вікна.
+    total = m["padL"]["w"] + m["bar"]["w"] + m["padR"]["w"]
+    chk("3.5 ліва + смужка + права = ширина вікна", near(total, m["win"]["w"], 2),
+        f"{round(m['padL']['w'], 1)} + {round(m['bar']['w'], 1)} + "
+        f"{round(m['padR']['w'], 1)} = {round(total, 1)} при {m['win']['w']}")
+    chk("3.5 смужка стоїть між панелями",
+        near(m["bar"]["l"], m["padL"]["r"]) and near(m["bar"]["r"], m["padR"]["l"]))
+
+
+def check_colors(page, chk, where):
+    """Розділ 4 — кольори."""
+    c = measure(page)["color"]
+    chk(f"4.1 фон панелей цілком чорний ({where})",
+        c["padL"] == BLACK and c["padR"] == BLACK and c["bar"] == BLACK,
+        f"{c['padL']} / {c['padR']} / смужка {c['bar']}")
+    chk(f"4.2 написи на кнопках — неоновий помаранчевий ({where})",
+        c["narrowText"] == NEON and c["stickText"] == NEON,
+        f"клавіші {c['narrowText']}, джойстик {c['stickText']}")
+    chk(f"4.3 SYS і MDL — помаранчеві з чорним написом ({where})",
+        c["wideBg"] == WIDE_BG and c["wideText"] == BLACK,
+        f"тло {c['wideBg']}, напис {c['wideText']}")
+    chk(f"4.4 різниця між групами лишилась помітною ({where})",
+        c["wideBg"] != c["narrowBg"] and c["wideText"] != c["narrowText"],
+        f"вузькі: {c['narrowBg']} / {c['narrowText']}; "
+        f"широкі: {c['wideBg']} / {c['wideText']}")
+
+
+def check_manifest(page, url, chk):
+    """Критерій 1.4 — сторінка вміє запускатися без браузерної обгортки."""
+    import urllib.parse
+    import urllib.request
+
+    href = page.evaluate("() => { const l = document.querySelector('link[rel=manifest]');"
+                         " return l ? l.href : null; }")
+    chk("1.4 сторінка оголошує опис застосунку", bool(href), f"{href}")
+    if not href:
+        return
+    try:
+        with urllib.request.urlopen(href, timeout=5) as r:
+            man = json.loads(r.read().decode("utf-8"))
+            ctype = (r.headers.get("Content-Type") or "").split(";")[0]
+    except Exception as e:
+        chk("1.4 опис застосунку віддається й розбирається", False, str(e))
+        return
+
+    chk("1.4 опис застосунку віддається й розбирається", True, f"тип {ctype}")
+    chk("1.4 display = standalone", man.get("display") == "standalone",
+        f"{man.get('display')}")
+    chk("1.4 тип опису — application/manifest+json",
+        ctype == "application/manifest+json", ctype)
+
+    icons = man.get("icons") or []
+    ok = False
+    if icons:
+        icon_url = urllib.parse.urljoin(href, icons[0].get("src", ""))
+        try:
+            with urllib.request.urlopen(icon_url, timeout=5) as r:
+                ok = r.read(8).startswith(b"\x89PNG")
+        except Exception:
+            ok = False
+    # ⚠️ Значок не оздоблення: без нього Chrome на Android робить не застосунок,
+    # а звичайну закладку — вона відкриється в тій самій обгортці з адресним
+    # рядком, тобто рівно в тому, від чого критерій 1.4 і рятує.
+    chk("1.4 значок віддається (без нього Android робить закладку, а не застосунок)", ok)
+
+
+def check_fullscreen(page, chk):
+    """Критерій 1.5, перша половина: кнопка є і працює там, де браузер уміє."""
+    set_bar(page, False)   # кнопка живе у смужці, а та згорнута за замовчуванням
+    supported = page.evaluate("() => !!(document.fullscreenEnabled ||"
+                              " document.webkitFullscreenEnabled)")
+    has = measure(page)["hasFullscreenButton"]
+    chk("1.5 кнопка «на весь екран» є там, де браузер уміє", supported and has,
+        f"браузер уміє: {supported}, кнопка: {has}")
+    if not (supported and has):
+        return
+    page.click("#btn-full")
+    time.sleep(0.6)
+    on = page.evaluate("() => !!(document.fullscreenElement ||"
+                       " document.webkitFullscreenElement)")
+    chk("1.5 кнопка справді розгортає на весь екран", on)
+    if on:
+        page.evaluate("() => document.exitFullscreen && document.exitFullscreen()")
+        time.sleep(0.4)
+
+
+def check_no_fullscreen(browser, url, chk):
+    """Критерій 1.5, друга половина: де браузер не вміє, кнопки немає.
+
+    ⚠️ Перевіряється в **окремому вікні**, якому підміняється оголошення
+    підтримки. Інакше цю половину не перевірити взагалі: Chromium уміє
+    повноекранний режим завжди, а пристроїв Apple у нас на столі немає.
+    """
+    ctx = browser.new_context(viewport=dict(LANDSCAPE))
+    ctx.add_init_script("""
+      Object.defineProperty(document, 'fullscreenEnabled', {get: () => false});
+      Object.defineProperty(document, 'webkitFullscreenEnabled', {get: () => false});
+    """)
+    page = ctx.new_page()
+    errors = []
+    page.on("pageerror", lambda e: errors.append(str(e)))
+    page.on("console", lambda m: errors.append(f"console.error: {m.text}")
+            if m.type == "error" else None)
+    try:
+        page.goto(url, wait_until="load", timeout=25000)
+        page.wait_for_function(
+            "() => document.getElementById('screen').width > 100", timeout=25000)
+        time.sleep(1.0)
+        chk("1.5 браузер не вміє — кнопки немає, а не мертва",
+            page.evaluate("() => !document.getElementById('btn-full')"))
+        chk("сторінка без помилок JS (браузер без повноекранного режиму)",
+            not errors, "; ".join(errors[:3]))
+    finally:
+        ctx.close()
+
+
 def events(log_path, kind=None):
     out = []
     try:
@@ -221,7 +820,7 @@ def run_checks(url, log_path, chk):
     with sync_playwright() as p:
         br = p.chromium.launch()
         try:
-            page = br.new_context(viewport={"width": 900, "height": 420}).new_page()
+            page = br.new_context(viewport=dict(LANDSCAPE)).new_page()
             errors = []
             page.on("pageerror", lambda e: errors.append(str(e)))
             page.on("console", lambda m: errors.append(f"console.error: {m.text}")
@@ -302,7 +901,31 @@ def run_checks(url, log_path, chk):
                 chk("вліво/вправо не роблять нічого", len(acts()) == n,
                     f"дій додалось: {len(acts()) - n}")
 
+            # --- вигляд і розкладка (задача 0023) --------------------------
+            #
+            # ⚠️ Ідуть після перевірок поведінки навмисно: ті клацають по
+            # кнопках і покладаються на типовий стан панелей, а ці його
+            # міняють — згортають смужку, складають праву панель, крутять
+            # вікно. Зворотний порядок зробив би перевірки поведінки
+            # залежними від того, чим скінчилась розкладка.
+            check_manifest(page, url, chk)
+            check_default_bar(br, url, chk, LANDSCAPE, "альбомна")
+            check_default_bar(br, url, chk, PORTRAIT, "книжкова")
+            check_resize_sweep(br, url, chk)
+            check_heap_watchdog(br, url, chk)
+            check_fullscreen(page, chk)
+            check_landscape(page, chk)
+            check_colors(page, chk, "альбомна")
+            check_centering(page, chk)
+
+            page.set_viewport_size(dict(PORTRAIT))
+            time.sleep(0.5)
+            check_portrait(page, chk)
+            check_colors(page, chk, "книжкова")
+
             chk("сторінка без помилок JS (у кінці)", not errors, "; ".join(errors[:3]))
+
+            check_no_fullscreen(br, url, chk)
         finally:
             br.close()
 
@@ -332,6 +955,7 @@ def main():
             built = os.path.join(tmp, "built")
             print("збираю клієнта для звірки…")
             build(built)
+            check_icon_reproducible(chk, built)
             print(f"перевіряю живу ціль: {args.url}")
             assert_serving_built(args.url, built)
             print("на тому кінці справді наш зібраний клієнт\n")
@@ -342,6 +966,7 @@ def main():
             built = os.path.join(tmp, "built")
             print("збираю клієнта…")
             build(built)
+            check_icon_reproducible(chk, built)
             log_path = os.path.join(tmp, "input.jsonl")
             print("піднімаю стенд без заліза (двійник пульта + віддача зібраного)…")
 

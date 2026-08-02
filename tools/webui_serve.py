@@ -73,6 +73,10 @@ CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".js": "application/javascript; charset=utf-8",
     ".css": "text/css; charset=utf-8",
+    # Опис застосунку й значок — щоб стенд без заліза вмів те саме, що міст:
+    # без правильного типу браузер опис просто не візьме (задача 0023, 1.4).
+    ".webmanifest": "application/manifest+json; charset=utf-8",
+    ".png": "image/png",
 }
 
 # Те саме число, що BRIDGE_CLIENT_SILENCE_MS у мості: три пропущені періоди
@@ -134,6 +138,22 @@ class Stats:
             "session": {
                 "seen": d["clients_seen"], "lost": d["clients_lost"],
                 "releases": d["input_releases"], "silence_timeouts": d["silence_timeouts"],
+            },
+            # ⚠️ Прилад купи двійник має віддавати **об'єктом**, а не рискою:
+            # плашка пам'яті в клієнті з'являється рівно тоді, коли в `/api/stats`
+            # є поле `heap` (задача 0021). Без нього перевірити «за одне
+            # торкання видно пам'ять моста» на стенді без заліза неможливо —
+            # плашка просто лишалась би схованою.
+            #
+            # ⚠️ Числа тут **вигадані й нічого не доводять**: у ПК купа не
+            # закінчується. Замір пам'яті робиться на живому мості, а тут
+            # перевіряється тільки те, що клієнт це поле вміє показати.
+            "heap": {
+                "ceiling": 262144, "warn_at": 32768, "warned": False,
+                "min_window": 131072, "min_idle": 131072, "min_stream": None,
+                "min_page": None, "min_first_min": None, "min_last_min": None,
+                "recover_first_min": None, "recover_last_min": None,
+                "note": "двійник: справжньої купи тут немає",
             },
             "note": "програмний двійник моста (tools/webui_serve.py), не ESP32",
         }
