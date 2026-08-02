@@ -20,6 +20,7 @@
       "Bash(g++:*)",
       "Bash(python3:*)",
       "Bash(node:*)",
+      "Bash(pnpm:*)",
       "Bash(dfu-util:*)",
       "Read(//etc/udev/rules.d/**)",
       "Bash(gcc:*)",
