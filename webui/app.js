@@ -730,10 +730,12 @@ function onPacket(type, payload) {
 
     case P.PKT_TILE:
       onTile(payload);
+      console.log('[пульт] плитка', payload.byteLength, 'байт');
       break;
 
     case P.PKT_FRAME_END:
       onFrameEnd(payload);
+      console.log('[пульт] кінець кадру', payload.byteLength, 'байт');
       break;
 
     case P.PKT_LOG:
