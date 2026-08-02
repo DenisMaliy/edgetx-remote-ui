@@ -40,8 +40,11 @@ function makeApp() {
     if (!els[id]) {
       els[id] = {
         id, hidden: false, textContent: '', innerHTML: '', title: '',
-        className: '', dataset: {}, style: {}, value: '',
+        className: '', dataset: {}, style: {}, value: '', type: '',
         width: 16, height: 9, clientWidth: 800, clientHeight: 500,
+        classList: { add() {}, remove() {}, toggle() {} },
+        contains: () => false,
+        focus() {},
         addEventListener() {}, appendChild() {}, setPointerCapture() {},
         getBoundingClientRect: () => ({ left: 0, top: 0, width: 480, height: 272 }),
         getContext: () => ({
@@ -54,13 +57,19 @@ function makeApp() {
     return els[id];
   };
 
+  const store = new Map();
+
   const g = {
     document: { getElementById: el, createElement: () => el('_tmp'),
-                addEventListener() {}, hidden: false },
+                addEventListener() {}, hidden: false, activeElement: null },
     window: { addEventListener() {} },
     performance: { now: () => g.__now },
     WebSocket: function () { this.readyState = 0; this.close = () => {}; },
     location: { host: 'x' },
+    localStorage: {
+      getItem: (k) => (store.has(k) ? store.get(k) : null),
+      setItem: (k, v) => store.set(k, String(v)),
+    },
     fetch: async () => { throw new Error('моста немає'); },
     setInterval: () => 0, clearInterval: () => {},
     setTimeout: () => 1, clearTimeout: () => {},
@@ -68,12 +77,13 @@ function makeApp() {
     console,
     __now: 1000,
     __el: el,
+    __store: store,
   };
   g.WebSocket.OPEN = 1;
   Object.assign(global, g);
 
   const mod = { exports: {} };
-  for (const f of ['proto.js', 'wait.js', 'app.js']) {
+  for (const f of ['proto.js', 'wait.js', 'panels.js', 'app.js']) {
     const src = fs.readFileSync(path.join(__dirname, f), 'utf8');
     // Три скрипти браузера ділять один глобальний простір — так їх і виконуємо.
     // `module` бачить лише останній: саме він і має ниточку для тестів.
@@ -205,6 +215,87 @@ console.log('вимикач правила протягу доступний с�
   check(fn(false) === false, 'вимикається');
   check(ctx.app.policy.dragRule === false, 'автомат про це знає');
   check(fn(true) === true, 'вмикається назад');
+}
+
+// ------------------------------- 6. утримання тримається до останнього ----
+//
+// ⚠️ Вада, від якої цей розділ стереже: клавішу можуть тримати двома руками —
+// пальцем на панелі й стрілкою на клавіатурі. Прапорець замість множини
+// тримачів зняв би її першим же відпусканням, і пульт лишився б із клавішею,
+// яку ніхто вже не тримає, — або навпаки, назавжди натиснутою.
+
+console.log('утримання знімається лише останнім тримачем (критерій 4.1)');
+{
+  const ctx = makeApp();
+  const { held, holdBegin, holdEnd, releaseAllHeld } = ctx.app;
+
+  const key = { kind: 'key', code: 7 };
+  holdBegin(key, 'pad');
+  check(held.size === 1, 'перший тримач почав утримання');
+  holdBegin(key, 'kbd');
+  check(held.size === 1, 'другий тримач не завів другого утримання');
+
+  holdEnd(key, 'pad');
+  check(held.size === 1, 'перший відпустив — клавіша ще тримається');
+  holdEnd(key, 'kbd');
+  check(held.size === 0, 'відпустив останній — і тільки тепер знято');
+
+  holdBegin(key, 'pad');
+  releaseAllHeld();
+  check(held.size === 0, 'releaseAllHeld знімає все — розрив, blur, ховання');
+}
+
+// -------------------- 7. намір виконується тим, що пульт справді має -------
+
+console.log('намір бере клавішу або енкодер — за тим, що назвав HELLO');
+{
+  const ctx = makeApp();
+  const { held, counters, intentHold, buildPanels, getIntents } = ctx.app;
+
+  // Такий набір клавіш віддає TX16S: стрілок немає, є енкодер.
+  const hello = {
+    width: 480, height: 272, flags: 0x0b,
+    hasTouch: true, hasEncoder: true, hasInputState: true,
+    keys: [
+      { code: 0, name: 'RTN' }, { code: 1, name: 'Enter' },
+      { code: 2, name: 'PAGE<' }, { code: 3, name: 'PAGE>' },
+      { code: 4, name: 'MDL' }, { code: 5, name: 'TELE' },
+      { code: 6, name: 'SYS' },
+    ],
+  };
+  buildPanels(hello);
+  const intents = getIntents();
+
+  check(intents.up && intents.up.kind === 'enc' && intents.up.steps === -1,
+        'стрілок немає — «вгору» виконує клацання енкодера');
+  check(intents.select && intents.select.code === 1, '«вибрати» — це Enter');
+  check(intents.back && intents.back.code === 0, '«назад» — це RTN');
+  check(intents.left === null && intents.right === null,
+        '⚠️ вліво-вправо не виконує ніхто: сторінки під них вішати заборонено');
+
+  const encBefore = counters.encClicks;
+  intentHold('up', true, 'kbd:ArrowUp');
+  check(counters.encClicks === encBefore + 1,
+        'перше клацання йде негайно, решту доставить розгін');
+  intentHold('up', false, 'kbd:ArrowUp');
+  check(held.size === 0, 'відпустили — розгін спинився');
+
+  const keysBefore = counters.keyPresses;
+  intentHold('page-prev', true, 'kbd:PageUp');
+  check(counters.keyPresses === keysBefore + 1, 'сторінка — це справжня клавіша');
+  check(held.size === 1, 'і вона тримається, доки тримають');
+  intentHold('page-prev', false, 'kbd:PageUp');
+
+  // Намір, якого пульт виконати не може, не має тихо робити щось інше.
+  intentHold('left', true, 'kbd:ArrowLeft');
+  check(held.size === 0, 'намір без виконавця не робить нічого');
+
+  // Перебудова панелі не має лишати натиснутого: кнопки зникнуть разом зі
+  // своїми обробниками, і відпускати буде нікому.
+  intentHold('page-next', true, 'pad:page-next');
+  check(held.size === 1, 'клавішу тримають');
+  buildPanels(Object.assign({}, hello, { keys: hello.keys.slice(0, 3) }));
+  check(held.size === 0, 'перебудова панелі відпустила все');
 }
 
 // ----------------------------------------------------------------------------

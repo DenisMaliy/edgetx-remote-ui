@@ -1,6 +1,10 @@
 /*
   Оформлення клієнта. Телефон тримають у руках поруч із пультом, тому:
   темне тло, великі цілі для пальця, нуль прокрутки й нуль масштабування.
+
+  ⚠️ Розкладку задає **орієнтація**, а не ширина в пікселях: у руках телефон
+  повертають, і панелі мають переїжджати разом із ним. Розмітка при цьому одна
+  на обидва випадки — два набори розійшлися б.
 */
 
 * { box-sizing: border-box; }
@@ -22,17 +26,53 @@ body {
            env(safe-area-inset-bottom) env(safe-area-inset-left);
 }
 
+/* --- сцена: панель — екран — панель --------------------------------------- */
+
+#stage {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  gap: 4px;
+  padding: 4px;
+
+  /* Альбомна: кнопки з боків, порядок як на самому пульті. */
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-rows: minmax(0, 1fr);
+  grid-template-areas: "left screen right";
+}
+
+#pad-left { grid-area: left; }
+#pad-right { grid-area: right; }
+#screen-wrap { grid-area: screen; }
+
+/* Портретна: один ряд знизу, поділений на дві частини — ліва й права, з тим
+   самим наповненням і тим самим порядком. */
+@media (orientation: portrait) {
+  #stage {
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "screen screen"
+      "left   right";
+  }
+}
+
 /* --- екран пульта -------------------------------------------------------- */
 
 #screen-wrap {
   position: relative;
-  flex: 1 1 auto;
+  min-width: 0;
   min-height: 0;
   display: flex;
   align-items: center;
   justify-content: center;
   background: #000;
+  outline: none;
 }
+
+/* ⚠️ Фокус видимий, і це критерій, а не оздоблення: без нього «клавіатура не
+   працює» неможливо відрізнити від «фокус в іншому місці». */
+#screen-wrap:focus { box-shadow: inset 0 0 0 2px #3d7fd6; }
 
 #screen {
   display: block;
@@ -63,16 +103,174 @@ body {
 
 #veil[hidden] { display: none; }
 
-/* --- нижня смуга --------------------------------------------------------- */
+/* --- бокові панелі ------------------------------------------------------- */
+
+.pad {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  gap: 4px;
+
+  /* Панелі — це органи керування, а не сторінка: палець на них нічого не
+     гортає й нічого не масштабує. */
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* ⚠️ Прокрутка самої панелі лишається можливою. Панель вища за вікно — не
+   вигадка: невідомі клавіші чужого пульта лягають у кінець лівої, і без цього
+   рядка `touch-action: none` з `.pad` зробив би той хвіст недосяжним пальцем.
+   Дозволена рівно та вісь, уздовж якої панель складена. */
+.pad-body {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  touch-action: pan-y;
+}
+
+/* Альбомна: кнопки стовпчиком, ручка згортання — з боку екрана. */
+#pad-left { flex-direction: row-reverse; }
+#pad-right { flex-direction: row; }
+.pad-body { flex-direction: column; align-items: stretch; }
+
+@media (orientation: portrait) {
+  /* Портретна: ручка зверху, кнопки в ряд із переносом.
+     ⚠️ Селектор навмисно за ідентифікаторами: правило `.pad` тут програло б
+     за вагою тим самим `#pad-left`/`#pad-right` вище — і панелі лишились би
+     складеними вбік у портреті, з ручками посеред ряду. */
+  #pad-left, #pad-right { flex-direction: column; }
+  /* `touch-action` лишається `pan-y` з правила вище: кнопки тут переносяться
+     рядками, тобто зайве знову йде вниз, а не вбік. */
+  .pad-body { flex-direction: row; flex-wrap: wrap; align-items: center; }
+  #pad-right .pad-body { justify-content: flex-end; }
+}
+
+.pad.collapsed .pad-body { display: none; }
+
+.pad-toggle {
+  flex: 0 0 auto;
+  min-width: 22px;
+  min-height: 34px;
+  padding: 2px;
+  border: 0;
+  border-radius: 6px;
+  background: #1b2129;
+  color: #6f7a86;
+  font: inherit;
+  cursor: pointer;
+}
+
+.pad-toggle:active { background: #2b3542; }
+
+/* --- клавіші пульта ------------------------------------------------------ */
+
+/*
+  ⚠️ Дві породи кнопок, і різниця не косметична. На самому TX16S `SYS` і `MDL`
+  — широкі світлі кнопки над екраном, а `RTN`, `PAGE>`, `PAGE<`, `TELE` —
+  вузькі чорні ребристі на лівому ребрі. Рука шукає їх окремо, і панель, де
+  всі кнопки однакові, ламає саме ту звичку, заради якої ми відтворюємо
+  розкладку.
+*/
+.key {
+  flex: 0 0 auto;
+  min-width: 56px;
+  min-height: 44px;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 7px;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+
+  /* Вузька чорна ребриста — типова клавіша на ребрі пульта. */
+  color: #cfd6de;
+  background:
+    repeating-linear-gradient(180deg,
+      rgba(255, 255, 255, .05) 0 2px, rgba(0, 0, 0, .18) 2px 4px),
+    #262f3a;
+  box-shadow: inset 0 -2px 0 rgba(0, 0, 0, .35);
+}
+
+.key.down, .key:active {
+  background: #3c4a5c;
+  box-shadow: inset 0 2px 3px rgba(0, 0, 0, .5);
+}
+
+/* Широка світла — та, що над екраном. */
+.key-wide {
+  min-width: 76px;
+  color: #1b2129;
+  background: #c8d0d9;
+  box-shadow: inset 0 -2px 0 rgba(0, 0, 0, .25);
+}
+
+.key-wide.down, .key-wide:active { background: #9fa9b4; }
+
+/* Клавіша, якої немає в таблиці бажаного розташування: вона працює, але
+   видно, що місце їй дане, а не вибране. */
+.key-extra { opacity: .82; }
+
+/* --- джойстик ------------------------------------------------------------ */
+
+.stick {
+  flex: 0 0 auto;
+  display: grid;
+  gap: 4px;
+  width: 132px;
+  height: 132px;
+  grid-template-columns: repeat(3, 1fr);
+  grid-template-rows: repeat(3, 1fr);
+  grid-template-areas:
+    ".    up   ."
+    "left mid  right"
+    ".    down .";
+}
+
+.st-up { grid-area: up; }
+.st-down { grid-area: down; }
+.st-left { grid-area: left; }
+.st-right { grid-area: right; }
+.st-mid { grid-area: mid; }
+
+.stick-btn {
+  border: 0;
+  border-radius: 8px;
+  padding: 0;
+  font: inherit;
+  font-size: 18px;
+  line-height: 1;
+  color: #dfe4ea;
+  background: #2b3542;
+  cursor: pointer;
+}
+
+.stick-btn.st-mid {
+  border-radius: 50%;
+  background: #3a4757;
+  font-size: 15px;
+}
+
+.stick-btn.down, .stick-btn:active { background: #4d5f75; }
+
+/* Напрямок, якого пульт виконати не може, лишає порожнє місце: хрестовина не
+   поїде, і палець не промахнеться повз сусідню кнопку. */
+.stick-gap { display: block; }
+
+/* --- смужка стану -------------------------------------------------------- */
 
 #bar {
   flex: 0 0 auto;
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
   align-items: center;
   padding: 6px 8px;
   background: #171c22;
-  border-top: 1px solid #232a32;
+  border-bottom: 1px solid #232a32;
   font-size: 12px;
 }
 
@@ -119,7 +317,7 @@ button:active { background: #3a4757; }
   overflow: auto;
   padding: 8px 10px;
   background: #0c1014;
-  border-top: 1px solid #232a32;
+  border-bottom: 1px solid #232a32;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px;
   white-space: pre-wrap;

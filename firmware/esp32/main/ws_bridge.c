@@ -52,6 +52,8 @@ extern const uint8_t proto_js_start[] asm("_binary_proto_js_gz_start");
 extern const uint8_t proto_js_end[] asm("_binary_proto_js_gz_end");
 extern const uint8_t wait_js_start[] asm("_binary_wait_js_gz_start");
 extern const uint8_t wait_js_end[] asm("_binary_wait_js_gz_end");
+extern const uint8_t panels_js_start[] asm("_binary_panels_js_gz_start");
+extern const uint8_t panels_js_end[] asm("_binary_panels_js_gz_end");
 extern const uint8_t app_js_start[] asm("_binary_app_js_gz_start");
 extern const uint8_t app_js_end[] asm("_binary_app_js_gz_end");
 extern const uint8_t style_css_start[] asm("_binary_style_css_gz_start");
@@ -700,6 +702,12 @@ static esp_err_t waitjs_get(httpd_req_t *req)
     return send_blob(req, "application/javascript; charset=utf-8", wait_js_start, wait_js_end);
 }
 
+/* Намір, розкладка панелей і розгін енкодера — теж без DOM (задача 0022). */
+static esp_err_t panelsjs_get(httpd_req_t *req)
+{
+    return send_blob(req, "application/javascript; charset=utf-8", panels_js_start, panels_js_end);
+}
+
 static esp_err_t appjs_get(httpd_req_t *req)
 {
     return send_blob(req, "application/javascript; charset=utf-8", app_js_start, app_js_end);
@@ -811,7 +819,8 @@ esp_err_t ws_bridge_start(void)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.stack_size = 8192; /* у обробнику лежить буфер на BRIDGE_WS_RX_MAX */
     cfg.max_open_sockets = 4;
-    /* Типова стеля — 8, а шляхів уже десять (додався `/api/heap/reset`). Число
+    /* Типова стеля — 8, а шляхів уже одинадцять (останнім додався
+     * `/panels.js`, задача 0022). Число
      * тримається з запасом навмисно: перебір упав би не при збірці, а на
      * старті моста, у полі. ⚠️ Додаєш шлях — звір із цим числом. */
     cfg.max_uri_handlers = 12;
@@ -838,6 +847,7 @@ esp_err_t ws_bridge_start(void)
         {.uri = "/index.html", .method = HTTP_GET, .handler = index_get},
         {.uri = "/proto.js", .method = HTTP_GET, .handler = protojs_get},
         {.uri = "/wait.js", .method = HTTP_GET, .handler = waitjs_get},
+        {.uri = "/panels.js", .method = HTTP_GET, .handler = panelsjs_get},
         {.uri = "/app.js", .method = HTTP_GET, .handler = appjs_get},
         {.uri = "/style.css", .method = HTTP_GET, .handler = css_get},
         {.uri = "/api/stats", .method = HTTP_GET, .handler = stats_get},

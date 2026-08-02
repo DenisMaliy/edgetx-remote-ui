@@ -12,6 +12,7 @@
 
 const P = RemoteUI;
 const Wait = RemoteUIWait;
+const Panels = RemoteUIPanels;
 
 const RECONNECT_MS = 1000;
 
@@ -51,6 +52,12 @@ const counters = {
   beforeHello: 0,
   frames: 0,
   autoRefresh: 0,   // скільки разів просили REFRESH через втрати на мості
+
+  // Панелі керування. ⚠️ Клацання енкодера рахуються окремо від натискань
+  // клавіш: у них різні правила показу кадру (задача 0020) і різна ціна —
+  // клацання їде щоразу, клавіша тримається рівнем.
+  encClicks: 0,
+  keyPresses: 0,
 
   // Звідки взявся кожен показаний кадр — взаємовиключні причини, сума
   // дорівнює `frames` рівно.
@@ -234,8 +241,18 @@ function latencyReset() {
   latency.samples = { touch: [], enc: [], key: [] };
 }
 
-function latencyNoteInput(source, now) {
-  if (latency.pendingSource !== null) return;   // вже чекаємо на старіший
+/**
+ * @param renew  переписати заявку, навіть якщо стара ще чекає відповіді.
+ *
+ * ⚠️ Потрібне рівно для **відпускання клавіші**, і без нього прилад бреше.
+ * EdgeTX багато меню виконує на відпусканні (`EVT_KEY_BREAK`), тобто на
+ * натискання екран часто не міняється зовсім. Заявка від натискання тоді
+ * доживає до відпускання, і зразком стає **тривалість утримання**: потримав
+ * три секунди — «затримка клавіші 3000 мс». Число описувало б палець, а не
+ * клієнта.
+ */
+function latencyNoteInput(source, now, renew) {
+  if (latency.pendingSource !== null && !renew) return;   // чекаємо на старіший
   latency.pendingSource = source;
   latency.pendingAt = now;
 }
@@ -618,7 +635,10 @@ function connect() {
     veil('зв’язок обірвано, перепідключаюсь…');
     stopTimers();
     // Ввід відпускаємо в себе; пульту про це вже сказав міст обнуленим
-    // INPUT_STATE — негайно, не чекаючи тайм-ауту.
+    // INPUT_STATE — негайно, не чекаючи тайм-ауту. Спершу знімаємо утримання
+    // (щоб не лишилось таймера, який клацає енкодером у мертвий сокет), потім
+    // дзеркало.
+    releaseAllHeld();
     mirror.clear();
     pointerId = null;
     scheduleReconnect();
@@ -690,6 +710,9 @@ function onPacket(type, payload) {
         resizeTo(h.width, h.height);
       }
       hello = h;
+      // Панелі — з того самого вітання: перелік клавіш, підписи й наявність
+      // енкодера. Перебудова відбувається лише коли набір справді змінився.
+      buildPanels(h);
       // Поріг автомата рахується зі швидкості, а вона міняється на ходу.
       policy.setBaud(h.baudCurrent);
       baudRefresh(h);
@@ -728,14 +751,17 @@ function onPacket(type, payload) {
       break;
     }
 
+    // ⚠️ Жодного запису в консоль на плитці й на кінці кадру. Це гарячий шлях:
+    // близько 150 записів за секунду під гортанням, кожен — синхронна робота в
+    // тому самому потоці, який приймає й малює. Замір затримки з ними виходить
+    // про консоль, а не про клієнта; а `busy` — прилад, заради якого 0018
+    // знімала підозру з телефона, — показував би нашу ж налагодку.
     case P.PKT_TILE:
       onTile(payload);
-      console.log('[пульт] плитка', payload.byteLength, 'байт');
       break;
 
     case P.PKT_FRAME_END:
       onFrameEnd(payload);
-      console.log('[пульт] кінець кадру', payload.byteLength, 'байт');
       break;
 
     case P.PKT_LOG:
@@ -792,10 +818,10 @@ function toRadio(ev) {
  * рівень, а не є новою дією людини. Інакше палець, покладений на екран і
  * забутий там, нескінченно подовжував би вікно «не чекати» — уже після того,
  * як усе зупинилось. Те саме про `PING` і `REFRESH`. */
-function noteInput(source, opts) {
+function noteInput(source, opts, renew) {
   const now = performance.now();
   policy.noteInput(source, now, opts);
-  latencyNoteInput(source, now);
+  latencyNoteInput(source, now, renew);
 }
 
 function sendTouch(event, pt) {
@@ -844,30 +870,161 @@ function endTouch(ev) {
 canvas.addEventListener('pointerup', endTouch);
 canvas.addEventListener('pointercancel', endTouch);
 
+/* --- Утримання: натиснуто означає натиснуто --------------------------------
+ *
+ * ⚠️ Клієнт не «клацає», а **тримає рівень**. Довге натискання, автоповтор і
+ * прискорення дає сам EdgeTX — від нас потрібно лише чесно сказати, коли
+ * натиснули й коли відпустили. Клієнт, який шле пару «натиснув-відпустив»
+ * одним пакетом, робить довге натискання недосяжним у принципі.
+ *
+ * Один намір можуть тримати одночасно кілька рук: палець на джойстику й
+ * стрілка на клавіатурі. Тому не прапорець, а **множина тримачів**: пульт
+ * дізнається про відпускання лише коли відпустив останній. Без цього клавіша,
+ * натиснута двома способами, знімалась би першим же відпусканням — і навпаки,
+ * лишалась би натиснутою після другого.
+ */
+const held = new Map();   // id цілі -> {target, holders, timer, clicks}
+
+const targetId = (t) => (t.kind === 'key' ? 'key:' + t.code : 'enc:' + t.steps);
+
+function holdBegin(target, holder) {
+  if (!target) return;
+  const id = targetId(target);
+  let h = held.get(id);
+  if (!h) {
+    h = { target, holders: new Set(), timer: null, clicks: 0 };
+    held.set(id, h);
+    holdStart(h);
+  }
+  h.holders.add(holder);
+}
+
+function holdEnd(target, holder) {
+  if (!target) return;
+  const id = targetId(target);
+  const h = held.get(id);
+  if (!h) return;
+  h.holders.delete(holder);
+  if (h.holders.size) return;   // хтось іще тримає
+  holdStop(h);
+  held.delete(id);
+}
+
+function holdStart(h) {
+  if (h.target.kind === 'key') {
+    // ⚠️ Спершу дзеркало, потім пакет: інакше рівень, який піде наступним
+    // INPUT_STATE, суперечив би щойно надісланому переходу.
+    mirror.key(h.target.code, true);
+    send(P.encodeKey(h.target.code, true));
+    counters.keyPresses++;
+    noteInput(Wait.SRC_KEY);
+    return;
+  }
+  encTick(h);
+}
+
+/* Клацання енкодера, поки тримають напрямок. Проміжок скорочується з кожним
+ * клацанням (`Panels.encDelay`) — саме він, а не наш власний множник, і дає
+ * прискорення: EdgeTX рахує крок із `dt` між клацаннями. */
+function encTick(h) {
+  send(P.encodeEnc(h.target.steps));
+  counters.encClicks++;
+  noteInput(Wait.SRC_ENC);
+  h.timer = setTimeout(() => encTick(h), Panels.encDelay(h.clicks++));
+}
+
+function holdStop(h) {
+  if (h.target.kind === 'key') {
+    mirror.key(h.target.code, false);
+    send(P.encodeKey(h.target.code, false));
+    // ⚠️ Відпускання — теж ввід, і часто саме воно змінює екран: EdgeTX
+    // виконує пункт меню на `EVT_KEY_BREAK`. Без цього рядка кадр-відповідь не
+    // приписався б жодній дії, а правило показу вважало б, що керування
+    // скінчилось на натисканні. `renew` — щоб зразком не стала тривалість
+    // утримання; чому саме так, написано біля `latencyNoteInput`.
+    noteInput(Wait.SRC_KEY, undefined, true);
+    return;
+  }
+  clearTimeout(h.timer);
+  h.timer = null;
+}
+
+/** Відпустити все. Вкладку сховали, вікно втратило фокус, зв'язок обірвався,
+ *  панель перебудовується — усе це залишило б клавішу натиснутою. */
+function releaseAllHeld() {
+  for (const h of held.values()) holdStop(h);
+  held.clear();
+}
+
+// ------------------------------------------------------------- наміри -----
+//
+// ⚠️ Джойстик і клавіатура виражають **намір**, а не клавішу. Чим його
+// виконати, вирішує перелік клавіш із HELLO: на пульті зі стрілками намір
+// «вгору» — це клавіша UP, на TX16S стрілок немає і той самий намір виконує
+// клацання енкодера. Правило й таблиці — у `panels.js`.
+
+let intents = {};
+
+function intentTarget(name) {
+  const i = intents[name];
+  if (!i) return null;
+  return i.kind === 'key' ? { kind: 'key', code: i.code }
+                          : { kind: 'enc', steps: i.steps };
+}
+
+function intentHold(name, pressed, holder) {
+  const t = intentTarget(name);
+  if (!t) return;   // цей пульт такого не вміє — і кнопки під це немає
+  if (pressed) holdBegin(t, holder); else holdEnd(t, holder);
+}
+
+/* --- панелі будуються з HELLO ---------------------------------------------
+ *
+ * ⚠️ Перебудова спершу **відпускає все**: кнопки зараз зникнуть разом зі
+ * своїми обробниками, і клавіша, яку тримали в цю мить, лишилась би натиснутою
+ * назавжди — відпускати її стало б нікому.
+ */
+const panelCallbacks = {
+  key: (code, pressed) => {
+    const holder = 'pad:key:' + code;
+    if (pressed) holdBegin({ kind: 'key', code }, holder);
+    else holdEnd({ kind: 'key', code }, holder);
+    focusScreen();
+  },
+  intent: (name, pressed) => {
+    intentHold(name, pressed, 'pad:' + name);
+    focusScreen();
+  },
+};
+
+let panelSignature = null;
+
+function buildPanels(h) {
+  // Сигнатура з переліку клавіш і прапорців: HELLO приходить постійно, а
+  // перебудовувати панель на кожен — це вбивати натискання, що триває.
+  const sig = h.flags + '|' + h.keys.map((k) => k.code + ':' + k.name).join(',');
+  if (sig === panelSignature) return;
+  panelSignature = sig;
+
+  releaseAllHeld();
+  intents = Panels.resolveIntents(h);
+  Panels.render(document, Panels.planPanels(h, intents), intents, panelCallbacks);
+  fitCanvas();
+  showFocusChip();
+}
+
 /* --- Права кнопка миші як «назад» ------------------------------------------
  *
  * ⚠️ Код клавіші **не вписаний числом**: правило проєкту — специфіки
  * конкретного пульта в коді нуль рядків. Клавіша шукається за міткою, яку
- * пульт сам назвав у `HELLO` (`keysGetLabel`). На TX16S це `RTN`, на інших
- * цілях мітка може бути інша — тому перелік, а не одне слово.
+ * пульт сам назвав у `HELLO` (`keysGetLabel`), — тепер тим самим правилом
+ * наміру, що й `Esc` на клавіатурі.
  *
  * Не знайшлась — кнопка просто нічого не робить: вигадувати код навмання
  * означало б натиснути на чужому пульті випадкову клавішу.
  */
-const BACK_KEY_LABELS = ['RTN', 'EXIT'];
-
-function backKeyCode() {
-  if (!hello) return null;
-  const k = hello.keys.find((k) => BACK_KEY_LABELS.includes(k.name));
-  return k ? k.code : null;
-}
-
 function sendBack(pressed) {
-  const code = backKeyCode();
-  if (code === null) return;
-  mirror.key(code, pressed);       // рівень — інакше повтор стану її «відпустить»
-  send(P.encodeKey(code, pressed));
-  noteInput(Wait.SRC_KEY);
+  intentHold(Panels.INTENT_BACK, pressed, 'mouse:back');
 }
 
 canvas.addEventListener('pointerdown', (ev) => {
@@ -876,8 +1033,12 @@ canvas.addEventListener('pointerdown', (ev) => {
   ev.preventDefault();
 });
 
+/* ⚠️ `pointercancel` приходить із `button === -1`, а не 2 — це не та сама
+ * перевірка, що на натисканні. Поруч, у `endTouch`, цей випадок уже розібраний
+ * явно; тут він лишався вадою з 0019: перебита система лишала б «назад»
+ * натиснутим. */
 function releaseBack(ev) {
-  if (ev.button !== 2) return;
+  if (ev.type === 'pointerup' && ev.button !== 2) return;
   sendBack(false);
   ev.preventDefault();
 }
@@ -939,19 +1100,169 @@ canvas.addEventListener('wheel', (ev) => {
 }, { passive: false });
 
 /* Вкладку сховали або телефон заблокували — палець на екрані лишатись не має.
- * Те саме стосується правої кнопки: `pointerup` над схованою вкладкою може не
- * прийти зовсім, а утримана клавіша пульта — це вже не косметика. */
+ * Те саме стосується клавіш і джойстика: `pointerup` над схованою вкладкою
+ * може не прийти зовсім, а утримана клавіша пульта — це вже не косметика. */
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) return;
   if (mirror.down) {
     sendTouch(P.TOUCH_UP, { x: mirror.x, y: mirror.y });
     pointerId = null;
   }
-  const back = backKeyCode();
-  if (back !== null && (mirror.keys & (1 << back))) sendBack(false);
+  releaseAllHeld();
 });
 
+/* Вікно втратило фокус — клавіатурне `keyup` до нас уже не дійде. */
+window.addEventListener('blur', releaseAllHeld);
+
+// ------------------------------------------------------------ клавіатура ---
+//
+// ⚠️ Ті самі наміри, що й на джойстику, і те саме правило: вліво-вправо на
+// пульті без стрілок лишаються **без дії**. Вішати на них сторінки заборонено
+// рішенням людини — сторінки перемикаються лише `PageUp`/`PageDown` і своїми
+// кнопками на панелі.
+
+const KEYBOARD_INTENT = {
+  ArrowUp: Panels.INTENT_UP,
+  ArrowDown: Panels.INTENT_DOWN,
+  ArrowLeft: Panels.INTENT_LEFT,
+  ArrowRight: Panels.INTENT_RIGHT,
+  Enter: Panels.INTENT_SELECT,
+  Escape: Panels.INTENT_BACK,
+  PageUp: Panels.INTENT_PAGE_PREV,
+  PageDown: Panels.INTENT_PAGE_NEXT,
+};
+
+/** Чи слухає зараз клавіатура. Фокус на екрані пульта — і тільки він. */
+function keyboardOn() {
+  const a = document.activeElement;
+  if (!a) return false;
+  if (a === wrap) return true;
+  return !!(wrap.contains && wrap.contains(a));
+}
+
+function focusScreen() {
+  try { wrap.focus({ preventScroll: true }); } catch (e) {
+    try { wrap.focus(); } catch (e2) { /* заглушка без фокуса */ }
+  }
+  showFocusChip();
+}
+
+function showFocusChip() {
+  const on = keyboardOn();
+  chip('focus', on ? 'клавіатура ✓' : 'клавіатура —', on ? 'ok' : 'warn');
+  const el = document.getElementById('focus');
+  el.title = on
+    ? '↑↓ — вгору/вниз, Enter — вибрати, Esc — назад, PgUp/PgDn — сторінки'
+    : 'клацни по екрану пульта, щоб керувати з клавіатури';
+}
+
+window.addEventListener('keydown', (ev) => {
+  if (!keyboardOn()) return;
+  const name = KEYBOARD_INTENT[ev.key];
+  if (!name) return;
+  // Сторінка не має гортатись під картинкою, а `Enter` — тиснути кнопку в
+  // смужці, якої людина не бачить.
+  ev.preventDefault();
+  // ⚠️ Автоповтор браузера ігноруємо: повторює або EdgeTX (клавіша), або наш
+  // розгін енкодера. Інакше повтори наклались би один на одного.
+  if (ev.repeat) return;
+  intentHold(name, true, 'kbd:' + ev.key);
+});
+
+/* ⚠️ Відпускання приймається **завжди**, без перевірки фокуса: фокус може
+ * поїхати між натисканням і відпусканням (клацнули мишею в іншому місці), і
+ * тоді клавіша лишилась би натиснутою. */
+window.addEventListener('keyup', (ev) => {
+  const name = KEYBOARD_INTENT[ev.key];
+  if (!name) return;
+  intentHold(name, false, 'kbd:' + ev.key);
+});
+
+wrap.addEventListener('focus', showFocusChip);
+wrap.addEventListener('blur', showFocusChip);
+canvas.addEventListener('pointerdown', focusScreen);
+
 // ------------------------------------------------------------- керування ---
+
+/* --- що людина склала, те й лишається складеним -----------------------------
+ *
+ * ⚠️ Стан панелей переживає перезавантаження сторінки, і це не зручність.
+ * Перепідключень у нас багато — після кожного прошивання моста, кожного
+ * перезапуску стенда, кожного разу, коли телефон приспав вкладку. Розкладка,
+ * що вертається до типової на кожному з них, коштує людині одного й того
+ * самого дотику десятки разів на день.
+ *
+ * `localStorage` буває недоступний (приватне вікно, заборонені сайтові дані),
+ * і це не привід валити клієнт: тоді просто нічого не пам'ятаємо.
+ */
+function storeGet(key, dflt) {
+  try {
+    const v = localStorage.getItem('remoteui.' + key);
+    return v === null ? dflt : v;
+  } catch (e) { return dflt; }
+}
+
+function storeSet(key, value) {
+  try { localStorage.setItem('remoteui.' + key, value); } catch (e) { /* нехай */ }
+}
+
+/**
+ * У портреті панелі складаються вниз, в альбомі — вбік.
+ *
+ * ⚠️ Питаємо ту саму умову, за якою переїжджає розкладка, — `@media
+ * (orientation: portrait)`. Порівняння сторін здається тим самим, але на
+ * точно квадратному вікні CSS вважає портретом, а порівняння — ні, і глиф на
+ * ручці розходився б із напрямком складання.
+ */
+function portrait() {
+  if (typeof window.matchMedia === 'function') {
+    return window.matchMedia('(orientation: portrait)').matches;
+  }
+  return (window.innerHeight || 0) >= (window.innerWidth || 0);
+}
+
+function padGlyph(id, collapsed) {
+  if (portrait()) return collapsed ? '▲' : '▼';
+  if (id === 'pad-left') return collapsed ? '▶' : '◀';
+  return collapsed ? '◀' : '▶';
+}
+
+const padApply = [];
+
+function setupPad(id) {
+  const pad = document.getElementById(id);
+  const btn = document.getElementById(id + '-toggle');
+  if (!pad || !btn) return;
+
+  const key = 'collapsed.' + id;
+  const apply = () => {
+    // ⚠️ Спершу відпустити все, і з тієї самої причини, що й при перебудові
+    // панелі: кнопка, яку зараз тримають пальцем, за мить зникне разом зі
+    // своїми обробниками. Двома руками — палець на клавіші, друга рука на
+    // ручці згортання — це не рідкість на телефоні, а перевірка меж у
+    // `bindHold` спрацьовує лише коли палець **рухається**.
+    releaseAllHeld();
+
+    const collapsed = storeGet(key, '0') === '1';
+    if (pad.classList) pad.classList.toggle('collapsed', collapsed);
+    btn.textContent = padGlyph(id, collapsed);
+    // Місце під картинку щойно змінилось — перерахувати, інакше вона лишиться
+    // маленькою в широкому вікні або вилізе за край.
+    fitCanvas();
+  };
+
+  btn.addEventListener('click', () => {
+    storeSet(key, storeGet(key, '0') === '1' ? '0' : '1');
+    apply();
+    focusScreen();
+  });
+
+  padApply.push(apply);
+  apply();
+}
+
+setupPad('pad-left');
+setupPad('pad-right');
 
 document.getElementById('baud').addEventListener('change', onBaudPick);
 
@@ -1022,9 +1333,14 @@ window.remoteUiDragRule = function (on) {
   return policy.dragRule;
 };
 
+/* Панель стану — угорі й **згорнута за замовчуванням**: місце внизу віддане
+ * клавішам, а те, що потрібне під час роботи (пам'ять моста, швидкість,
+ * частота кадрів, фокус клавіатури), і так лишається видимим у смужці. */
 const info = document.getElementById('info');
-document.getElementById('btn-info').addEventListener('click', () => {
+const btnInfo = document.getElementById('btn-info');
+btnInfo.addEventListener('click', () => {
   info.hidden = !info.hidden;
+  btnInfo.textContent = info.hidden ? 'Стан ▾' : 'Стан ▴';
   updateInfo();
 });
 
@@ -1230,6 +1546,15 @@ async function updateInfo() {
                          : 'ВИМКНЕНЕ (поведінка до задачі 0020)'}`,
     `  REFRESH через втрати на мості  ${counters.autoRefresh}`,
     '',
+    // ⚠️ Скільки клацань за секунду віддає джойстик — критерій 3.4, і взяти це
+    // число більше нізвідки: міст рахує пакети, але не розрізняє, звідки вони.
+    'панелі керування',
+    `  наміри             ${Panels.intentsText(intents)}`,
+    `  клацань енкодера   ${counters.encClicks}  (найбільше ${encRateMax}/с)`,
+    `  натискань клавіш   ${counters.keyPresses}`,
+    `  тримається зараз   ${held.size ? Array.from(held.keys()).join(', ') : '—'}`,
+    `  клавіатура         ${keyboardOn() ? 'слухає' : 'фокус в іншому місці'}`,
+    '',
     // ⚠️ Затримка міряється **тут**, а не в tools/input_check.py: той міряє до
     // дроту, а очікування лежить після дроту (борг 4.2 задачі 0019).
     'затримка ввід → показаний кадр, мс',
@@ -1278,7 +1603,19 @@ setInterval(updateInfo, 1000);
 let lastFrames = 0;
 let lastWhole = 0;
 let lastProfAt = performance.now();
+let lastEncClicks = 0;
+let encRateMax = 0;
 setInterval(() => {
+  // Найбільша частота клацань енкодера — відповідь на питання «чи вистачає
+  // джойстика, щоб пройти довгий список» (критерій 3.4).
+  const enc = counters.encClicks - lastEncClicks;
+  lastEncClicks = counters.encClicks;
+  if (enc > encRateMax) encRateMax = enc;
+
+  // Фокус міг поїхати без події (перемкнули вкладку, закрили випадайку) —
+  // плашка має казати правду, а не останній відомий стан.
+  showFocusChip();
+
   // ⚠️ Частка цілих кадрів стоїть поруч із частотою, а не в панелі під
   // кнопкою: обидва критерії задачі 0019 (скільки кадрів цілі, і чого коштувало
   // очікування) людина зі стенда звіряє очима, тримаючи телефон у руках.
@@ -1308,8 +1645,27 @@ setInterval(() => {
        pct >= 80 ? 'bad' : pct >= 50 ? 'warn' : 'ok');
 }, 1000);
 
-window.addEventListener('resize', fitCanvas);
-window.addEventListener('orientationchange', () => setTimeout(fitCanvas, 200));
+/* Розмір картинки й напрямок складання панелей перераховуються разом: у
+ * портреті панелі складаються вниз, в альбомі — вбік, і глиф на ручці має це
+ * казати. */
+function relayout() {
+  for (const apply of padApply) apply();
+  fitCanvas();
+}
+
+window.addEventListener('resize', relayout);
+window.addEventListener('orientationchange', () => setTimeout(relayout, 200));
+
+/* ⚠️ Зміну розміру самого місця під картинку подія `resize` не ловить:
+ * згортання панелі вікна не міняє. Спостерігач дає точний перерахунок і там,
+ * де ми його не передбачили — наприклад, коли смужка стану переноситься на
+ * два рядки. */
+if (typeof ResizeObserver !== 'undefined') {
+  try { new ResizeObserver(fitCanvas).observe(wrap); } catch (e) { /* нехай */ }
+}
+
+// Клавіатура має працювати одразу, без клацання по екрану.
+focusScreen();
 
 connect();
 
@@ -1332,5 +1688,9 @@ if (typeof module !== 'undefined' && module.exports) {
     noteInput, latencyStats, latencyReset, resetFrameCounters,
     sourceLabel, updateInfo, onFrameEnd,
     LATENCY_FLOOR_MS,
+    // Панелі й утримання: перевіряється, що рівень тримається до останнього
+    // тримача і що перебудова панелі нічого не лишає натиснутим.
+    held, holdBegin, holdEnd, releaseAllHeld, intentHold, buildPanels,
+    getIntents: () => intents,
   };
 }

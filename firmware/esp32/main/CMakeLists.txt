@@ -45,7 +45,7 @@ idf_component_register(
 # вище. Джерело лишається одне — `webui/`.
 set(WEBUI_DIR "${CMAKE_CURRENT_LIST_DIR}/../../../webui")
 set(WEBUI_GZ_DIR "${CMAKE_CURRENT_BINARY_DIR}/webui-gz")
-set(WEBUI_FILES index.html proto.js wait.js app.js style.css)
+set(WEBUI_FILES index.html proto.js wait.js panels.js app.js style.css)
 
 file(MAKE_DIRECTORY "${WEBUI_GZ_DIR}")
 

@@ -8,6 +8,7 @@
 
   ⚠️ Нуль жорстко зашитої специфіки пульта. Роздільність, перелік клавіш і
   наявність сенсора приходять у пакеті HELLO. Літерал 480 у коді = помилка.
+  Кнопки панелей теж не написані тут: їх будує panels.js із того ж HELLO.
 -->
 <html lang="uk">
 <head>
@@ -19,12 +20,9 @@
 </head>
 <body>
 
-<div id="screen-wrap">
-  <!-- Розмір полотна виставляється з HELLO, а не тут. -->
-  <canvas id="screen" width="16" height="9"></canvas>
-  <div id="veil"><span id="veil-text">під'єднуюсь…</span></div>
-</div>
-
+<!-- ⚠️ Смужка стану стоїть **угорі**, і панель «Стан» розгортається вниз
+     з-під неї (задача 0022, критерій 6.1). Унизу тепер живуть клавіші: місце
+     під великим пальцем дорожче за діагностику. -->
 <div id="bar">
   <span id="link" class="chip">—</span>
   <span id="fps" class="chip">—</span>
@@ -32,6 +30,9 @@
        стенда видно різницю між «міст не встигає віддати» і «телефон не
        встигає забрати» — приймання й малювання тут в одному потоці. -->
   <span id="busy" class="chip">—</span>
+  <!-- Чи слухає клавіатура. Без цього «клавіатура не працює» неможливо
+       відрізнити від «фокус в іншому місці» — критерій 5.4. -->
+  <span id="focus" class="chip">—</span>
   <span id="radio" class="chip">—</span>
   <!-- ⚠️ Вільна пам'ять моста стоїть у смужці, а не в панелі «Стан», і це
        вимога задачі 0021. Вона впала вдесятеро за добу, і помітили це
@@ -49,10 +50,41 @@
        кнопки кожне порівняння коштувало б перепрошивання моста. -->
   <button id="btn-wait" type="button" title="очікування цілого кадру">чек: —</button>
   <button id="btn-refresh" type="button">Оновити</button>
-  <button id="btn-info" type="button">Стан</button>
+  <button id="btn-info" type="button">Стан ▾</button>
 </div>
 
 <div id="info" hidden></div>
+
+<!--
+  Сцена: панель — екран — панель.
+
+  В альбомній орієнтації це три колонки, у портретній — екран угорі й один
+  ряд кнопок унизу, поділений навпіл. Різницю робить CSS, а не другий набір
+  розмітки: два набори розійшлися б.
+
+  Панелі порожні: кнопки в них кладе panels.js після HELLO.
+-->
+<div id="stage">
+  <div id="pad-left" class="pad">
+    <button class="pad-toggle" id="pad-left-toggle" type="button"
+            title="згорнути / розгорнути панель">◀</button>
+    <div class="pad-body" id="pad-left-body"></div>
+  </div>
+
+  <!-- ⚠️ tabindex: екран має вміти брати фокус, інакше клавіатурі нема на
+       чому працювати, а людині — нічого побачити (критерій 5.4). -->
+  <div id="screen-wrap" tabindex="0">
+    <!-- Розмір полотна виставляється з HELLO, а не тут. -->
+    <canvas id="screen" width="16" height="9"></canvas>
+    <div id="veil"><span id="veil-text">під'єднуюсь…</span></div>
+  </div>
+
+  <div id="pad-right" class="pad">
+    <button class="pad-toggle" id="pad-right-toggle" type="button"
+            title="згорнути / розгорнути панель">▶</button>
+    <div class="pad-body" id="pad-right-body"></div>
+  </div>
+</div>
 
 <!-- Протокол окремо від оформлення: proto.js прогоняється тестами під node
      (`node webui/proto_test.js`) тими самими еталонними векторами, що й
@@ -60,9 +92,13 @@
 
      wait.js — політика показу кадру, теж без DOM: `node webui/wait_test.js`
      перевіряє правила, `python3 tools/wait_crosscheck.py` — що вони збігаються
-     з клієнтом ПК. ⚠️ Порядок обов'язковий: wait.js читає сталі з proto.js. -->
+     з клієнтом ПК. ⚠️ Порядок обов'язковий: wait.js читає сталі з proto.js.
+
+     panels.js — намір, розкладка панелей і розгін енкодера
+     (`node webui/panels_test.js`). -->
 <script src="proto.js"></script>
 <script src="wait.js"></script>
+<script src="panels.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

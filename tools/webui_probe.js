@@ -213,6 +213,7 @@ async function checkHttp() {
   // того, що міст справді віддає клієнт.
   for (const [name, marker] of [['/', '<canvas'], ['/proto.js', 'RemoteUI'],
                                 ['/wait.js', 'RemoteUIWait'],
+                                ['/panels.js', 'RemoteUIPanels'],
                                 ['/app.js', 'RemoteUI'], ['/style.css', '#screen']]) {
     try {
       const r = await fetch(base + name);
