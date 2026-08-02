@@ -54,7 +54,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import remote_ui_proto as proto  # noqa: E402
 
-WEBUI_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "webui")
+# ⚠️ Не константа, а типове значення: `--dir` перемикає стенд на **зібрану**
+# сторінку (задача 0022). Клієнт їде у флеш мініфікованим, і зелені тести
+# проти джерела нічого не кажуть про те, що там опинилось: зламане
+# мініфікатором пройшло б повз них непоміченим.
+#
+#     node webui/minify.mjs /tmp/built
+#     python3 tools/webui_serve.py --dir /tmp/built
+WEBUI_DIR = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "webui"))
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -361,8 +369,18 @@ class Handler(BaseHTTPRequestHandler):
         # Ходити вище webui/ не даємо: інструмент інструментом, а віддавати
         # увесь диск тому, хто відкрив сторінку, не треба.
         full = os.path.normpath(os.path.join(WEBUI_DIR, name))
-        if not full.startswith(WEBUI_DIR) or not os.path.isfile(full):
-            self.send_error(404, "немає такого файлу")
+        # ⚠️ Через `commonpath`, а не `startswith`: для теки `/tmp/built` той
+        # пропустив би й `/tmp/built-evil`, бо порівнює рядки, а не шляхи.
+        try:
+            inside = os.path.commonpath([full, WEBUI_DIR]) == WEBUI_DIR
+        except ValueError:      # різні диски — спільного шляху немає взагалі
+            inside = False
+        if not inside or not os.path.isfile(full):
+            # ⚠️ Кирилиця йде **третім** аргументом (тіло, UTF-8), а не другим:
+            # другий потрапляє в рядок стану HTTP, а той кодується latin-1 і
+            # валить обробник `UnicodeEncodeError`. Замість чесного 404 клієнт
+            # бачив розрив з'єднання — тобто діагностика ламала діагностику.
+            self.send_error(404, "Not Found", "немає такого файлу")
             return
 
         with open(full, "rb") as f:
@@ -446,10 +464,19 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     proto.add_transport_args(ap)
+    ap.add_argument("--dir", help="тека клієнта (типово webui/); "
+                                  "для прогону проти зібраної сторінки")
     ap.add_argument("--port", type=int, default=8080, help="порт HTTP (типово 8080)")
     ap.add_argument("--bind", default="0.0.0.0", help="адреса для прослуховування")
     ap.add_argument("-v", "--verbose", action="store_true", help="журнал запитів HTTP")
     args = ap.parse_args()
+
+    if args.dir:
+        global WEBUI_DIR
+        WEBUI_DIR = os.path.normpath(os.path.abspath(args.dir))
+        if not os.path.isfile(os.path.join(WEBUI_DIR, "index.html")):
+            ap.error(f"у теці {WEBUI_DIR} немає index.html")
+        print(f"клієнт: {WEBUI_DIR}")
 
     desc, connect = proto.make_connector(args, poll=0.02)
     print(f"пульт: {desc}")

@@ -1,0 +1,12 @@
+{
+  "name": "tx16s-remote-ui-webui",
+  "private": true,
+  "description": "Мініфікація клієнта на збірці моста. Джерело лишається в webui/*.js — читабельним і з коментарями; у прошивку їде стиснений результат.",
+  "packageManager": "pnpm@11.3.0",
+  "devDependencies": {
+    "esbuild": "0.25.10"
+  },
+  "scripts": {
+    "min": "node minify.mjs"
+  }
+}
