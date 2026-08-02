@@ -14,6 +14,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "heap_watch.h"
 #include "ws_bridge.h"
 
 static const char *TAG = "stats";
@@ -73,6 +74,29 @@ size_t bridge_stats_json(char *out, size_t cap)
      * mark` монотонно спадає, тому просто перезаписуємо. */
     g_stats.httpd_stack_free = (uint32_t)uxTaskGetStackHighWaterMark(NULL);
 
+    /* Прилад купи складається окремо: він має власну довжину і власну
+     * перевірку на замалий буфер.
+     *
+     * ⚠️ 640, а не «десь 400». Довжину задають **підписи контрольних точок**,
+     * а вони кирилицею, тобто по два байти на літеру: шість наявних точок
+     * дають 409 Б із 420 у першій же збірці — одинадцять байтів запасу.
+     * Сьома точка мовчки перетворила б увесь прилад на `null`, і виглядало б
+     * це як «прилад не працює», а не як «буфер замалий». Додаєш точку —
+     * звіряйся з цим числом. */
+    char heap[640];
+    if (heap_watch_json(heap, sizeof(heap)) == 0) {
+        /* Не мовчимо і не віддаємо порожнє поле: обрізаний вкладений об'єкт
+         * зламав би розбір усього JSON, а причину шукали б у клієнті. */
+        static bool heap_moaned;
+        if (!heap_moaned) {
+            heap_moaned = true;
+            ESP_LOGE(TAG, "буфер приладу купи замалий (%u Б) — поле heap віддається "
+                          "порожнім; додай місця в stats.c",
+                     (unsigned)sizeof(heap));
+        }
+        snprintf(heap, sizeof(heap), "null");
+    }
+
     const int n = snprintf(
         out, cap,
         "{"
@@ -81,6 +105,11 @@ size_t bridge_stats_json(char *out, size_t cap)
         "\"heap_free\":%u,"
         "\"heap_min\":%u,"
         "\"heap_largest\":%u,"
+        /* ⚠️ `heap_min` вище — монотонний від старту й ніколи не скидається,
+         * тобто після одного глибокого просідання відповідає лише на питання
+         * «чи бувало колись погано». На «чи погано зараз» і «через що саме»
+         * відповідає цей об'єкт (heap_watch.h). */
+        "\"heap\":%s,"
         "\"httpd_stack_free\":%u,"
         "\"client\":%s,"
         "\"uart\":{\"bytes\":%u,\"packets\":%u,\"tiles\":%u,\"frames\":%u,"
@@ -104,7 +133,7 @@ size_t bridge_stats_json(char *out, size_t cap)
         "}",
         (unsigned long long)(esp_timer_get_time() / 1000000), U(s->baud_current),
         U(esp_get_free_heap_size()), U(esp_get_minimum_free_heap_size()),
-        U(largest_free_cached()), U(s->httpd_stack_free),
+        U(largest_free_cached()), heap, U(s->httpd_stack_free),
         ws_bridge_has_client() ? "true" : "false", U(s->uart_bytes), U(s->packets_ok),
         U(s->tiles_in), U(s->frames_in), U(s->crc_errors), U(s->oversized), U(s->uart_dropped),
         U(s->silence_resets), U(s->ws_bytes), U(s->ws_chunks), U(s->ws_errors),

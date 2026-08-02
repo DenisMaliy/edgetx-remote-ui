@@ -21,7 +21,12 @@
 #include "freertos/task.h"
 #include "ws_bridge.h"
 
-static const char *TAG = "wifi";
+/* ⚠️ Не «wifi»: цю мітку вже займає драйвер Wi-Fi самої ESP-IDF, і наші рядки
+ * досі були від його рядків невідрізнимі. Наслідок не косметичний — заглушити
+ * балакучий драйвер (`esp_log_level_set("wifi", …)` — той самий прийом, яким у
+ * `ws_bridge_start` глушиться `httpd_ws`) означало б заглушити разом із ним
+ * і «точка доступу піднята», і «телефон у мережі». */
+static const char *TAG = "rui_wifi";
 
 static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {

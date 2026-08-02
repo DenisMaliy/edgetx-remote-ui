@@ -26,6 +26,7 @@
 #include "framing.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "heap_watch.h"
 #include "lwip/sockets.h"
 #include "stats.h"
 #include "uart_link.h"
@@ -33,17 +34,28 @@
 
 static const char *TAG = "ws";
 
-/* Клієнт вбудований у прошивку з webui/ — див. main/CMakeLists.txt. */
-extern const uint8_t index_html_start[] asm("_binary_index_html_start");
-extern const uint8_t index_html_end[] asm("_binary_index_html_end");
-extern const uint8_t proto_js_start[] asm("_binary_proto_js_start");
-extern const uint8_t proto_js_end[] asm("_binary_proto_js_end");
-extern const uint8_t wait_js_start[] asm("_binary_wait_js_start");
-extern const uint8_t wait_js_end[] asm("_binary_wait_js_end");
-extern const uint8_t app_js_start[] asm("_binary_app_js_start");
-extern const uint8_t app_js_end[] asm("_binary_app_js_end");
-extern const uint8_t style_css_start[] asm("_binary_style_css_start");
-extern const uint8_t style_css_end[] asm("_binary_style_css_end");
+/**
+ * Клієнт вбудований у прошивку з webui/ — див. main/CMakeLists.txt.
+ *
+ * ⚠️ Вбудовується **стиснене**, і це не про місце у флеші. Заміри 0021:
+ * віддача одного файлу на 67 КБ забирає з купи моста 61 КБ, бо стільки його
+ * одночасно лежить у черзі TCP і в буферах Wi-Fi. Тобто ціна сторінки в
+ * пам'яті — це її розмір **на дроті**, і єдиний спосіб її зменшити, не
+ * ламаючи ні клієнта, ні протокол, — щоб на дроті було менше байтів.
+ *
+ * Розпаковує браузер, безкоштовно для нас: жодного рядка на розпакування в
+ * мості немає, є лише заголовок `Content-Encoding`.
+ */
+extern const uint8_t index_html_start[] asm("_binary_index_html_gz_start");
+extern const uint8_t index_html_end[] asm("_binary_index_html_gz_end");
+extern const uint8_t proto_js_start[] asm("_binary_proto_js_gz_start");
+extern const uint8_t proto_js_end[] asm("_binary_proto_js_gz_end");
+extern const uint8_t wait_js_start[] asm("_binary_wait_js_gz_start");
+extern const uint8_t wait_js_end[] asm("_binary_wait_js_gz_end");
+extern const uint8_t app_js_start[] asm("_binary_app_js_gz_start");
+extern const uint8_t app_js_end[] asm("_binary_app_js_gz_end");
+extern const uint8_t style_css_start[] asm("_binary_style_css_gz_start");
+extern const uint8_t style_css_end[] asm("_binary_style_css_gz_end");
 
 static httpd_handle_t s_server;
 static SemaphoreHandle_t s_lock;
@@ -648,13 +660,28 @@ static esp_err_t ws_handler(httpd_req_t *req)
 
 /* ------------------------------------------------------------ сторінка ----*/
 
+/**
+ * @brief Віддати вбудований файл сторінки.
+ *
+ * ⚠️ Позначка `heap_watch_page_enter/leave` тут не діагностична прикраса, а
+ * єдине місце, де взагалі можна приписати просідання купи віддачі сторінки.
+ * Задача 0020 записала «вільної пам'яті 1.9 КБ за сеанс із одним клієнтом» і
+ * шукала винного в потоці пікселів — тоді як просідання належало цим
+ * кільком рядкам і тривало десяті частки секунди.
+ */
 static esp_err_t send_blob(httpd_req_t *req, const char *ctype, const uint8_t *start,
                            const uint8_t *end)
 {
     httpd_resp_set_type(req, ctype);
+    /* Вміст стиснений при збірці — див. оголошення символів вище. */
+    httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
     /* Без кешу: сторінка живе в прошивці й міняється разом із нею. */
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    return httpd_resp_send(req, (const char *)start, (size_t)(end - start));
+
+    heap_watch_page_enter();
+    const esp_err_t err = httpd_resp_send(req, (const char *)start, (size_t)(end - start));
+    heap_watch_page_leave();
+    return err;
 }
 
 static esp_err_t index_get(httpd_req_t *req)
@@ -683,11 +710,39 @@ static esp_err_t css_get(httpd_req_t *req)
     return send_blob(req, "text/css; charset=utf-8", style_css_start, style_css_end);
 }
 
+/**
+ * @brief Почати нове вікно заміру купи.
+ *
+ * ⚠️ Існує рівно тому, що `heap_min` від ESP-IDF скинути неможливо: він
+ * монотонний від старту. Без цієї ручки кожен замір пам'яті починався б із
+ * перезавантаження моста — а перезавантаження рве Wi-Fi, змушує ПК
+ * перепід'єднуватись і саме собою породжує сплеск, який ми ж і міряємо.
+ */
+static esp_err_t heap_reset_post(httpd_req_t *req)
+{
+    heap_watch_window_reset();
+    httpd_resp_set_type(req, "application/json");
+    /* ⚠️ Вертаємо вільне **зараз**, а не `heap_watch_window_min()`: скид
+     * виконає найближчий знімок (до 10 мс), тож мінімум вікна в цю мить ще
+     * старий, і надрукований тут він виглядав би як «скид не спрацював». */
+    char json[80];
+    const int n = snprintf(json, sizeof(json), "{\"ok\":true,\"heap_free\":%u}",
+                           (unsigned)esp_get_free_heap_size());
+    return httpd_resp_send(req, json, n);
+}
+
 static esp_err_t stats_get(httpd_req_t *req)
 {
     /* Росте разом із набором лічильників. Замалий буфер більше не обрізає
-     * JSON мовчки — `bridge_stats_json()` скаржиться в журнал. */
-    char json[1792];
+     * JSON мовчки — `bridge_stats_json()` скаржиться в журнал.
+     *
+     * ⚠️ Лежить на стеку задачі httpd (`cfg.stack_size` нижче), і разом із
+     * буфером приладу купи (640 Б у `stats.c`) з'їдає 3.2 КБ із 8. Заміряний
+     * найменший запас після цього — **2564 Б** (`httpd_stack_free`). Запас є,
+     * але він уже не «купа»: наступний, хто захоче тут ще кілобайт, мусить
+     * підняти `cfg.stack_size`, а не сподіватись. Переповнення стека дало б
+     * паніку моста, схожу на просадку живлення. */
+    char json[2560];
     const size_t n = bridge_stats_json(json, sizeof(json));
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -756,7 +811,7 @@ esp_err_t ws_bridge_start(void)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.stack_size = 8192; /* у обробнику лежить буфер на BRIDGE_WS_RX_MAX */
     cfg.max_open_sockets = 4;
-    /* Типова стеля — 8, а шляхів уже дев'ять (додався `/wait.js`). Число
+    /* Типова стеля — 8, а шляхів уже десять (додався `/api/heap/reset`). Число
      * тримається з запасом навмисно: перебір упав би не при збірці, а на
      * старті моста, у полі. ⚠️ Додаєш шлях — звір із цим числом. */
     cfg.max_uri_handlers = 12;
@@ -786,6 +841,7 @@ esp_err_t ws_bridge_start(void)
         {.uri = "/app.js", .method = HTTP_GET, .handler = appjs_get},
         {.uri = "/style.css", .method = HTTP_GET, .handler = css_get},
         {.uri = "/api/stats", .method = HTTP_GET, .handler = stats_get},
+        {.uri = "/api/heap/reset", .method = HTTP_POST, .handler = heap_reset_post},
         {.uri = "/api/wifi/off", .method = HTTP_POST, .handler = wifi_off_post},
         {.uri = "/ws", .method = HTTP_GET, .handler = ws_handler, .is_websocket = true},
     };
