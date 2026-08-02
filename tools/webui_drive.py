@@ -34,6 +34,13 @@
 коштує `REFRESH` і повний кадр, а лічильники клієнта починаються з нуля — тобто
 замір, розрізаний на перезапуски, не додається.
 
+⚠️ Зате **наприкінці роботи воно закривається завжди** — хоч по `quit`, хоч
+по Ctrl-C, хоч через помилку. Раніше виходу, крім `quit`, тут не існувало
+взагалі, і в задачі 0020 драйвер від попередньої сесії прожив **1 год 14 хв**:
+два клієнти мовчки ділили дріт, і перший замір довелось викинути цілком.
+Ціна помилки несиметрична — зайве закриття коштує одного `REFRESH`, забуте
+з'єднання коштує заміру.
+
 Команди:
 
     tap X Y          дотик у точку **екрана пульта** (не сторінки)
@@ -53,6 +60,22 @@
 ⚠️ `scroll` і `swipe` — **різні органи керування**, і плутати їх не можна:
 перший крутить колесо миші, тобто емулює енкодер, другий веде пальцем по
 сенсору. Уся задача 0020 саме про різницю між ними.
+
+Дорога до `Model Settings` — сторінки, на якій знімають більшість замірів
+(координати в системі екрана пульта, 480×272):
+
+    tap 20 22       ліворуч угорі, логотип EdgeTX → головне меню
+    tap 239 104     «Model Settings», третій значок верхнього ряду
+
+⚠️ **Довгий прогін не можна навантажувати протягом пальця.** На `Model
+Settings` протяг за кілька хвилин звалюється в `Heli Settings`: LVGL читає
+повільний жест як натискання. Сторінка там коротка й не гортається, тож
+навантаження зникає **непомітно** — `swipe` і далі каже «25 жестів», а
+`uart.tiles` завмирає. Для тривалих прогонів беріть `scroll` (енкодер): він
+гортає надійно й вантажить дріт сильніше (87 КБ/с проти 23).
+
+⚠️ **`back` із підменю виходить далі, ніж очікується** — аж на головний
+екран, де гортати нічого. Після `back` завжди звіряйтесь `pageshot`.
 
 ⚠️ Для доказів беріть `pageshot`, а не `shot`: рецензія 0019 вимагає, щоб
 знімок сам казав, у якому режимі й на якій швидкості він знятий.
@@ -168,113 +191,127 @@ def main():
                 time.sleep(gap_ms / 1000.0)
             return n, shots
 
-        while True:
-            with FIFO.open() as f:
-                for raw in f:
-                    line = raw.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    cmd, *rest = line.split()
-                    try:
-                        if cmd == "quit":
-                            log("зачиняю вікно")
-                            browser.close()
-                            return
-                        elif cmd == "tap":
-                            px, py = to_page(int(rest[0]), int(rest[1]))
-                            page.mouse.move(px, py)
-                            time.sleep(0.05)
-                            page.mouse.down()
-                            time.sleep(0.15)   # LVGL опитує сенсор раз на 30 мс
-                            page.mouse.up()
-                            log(f"дотик {rest[0]},{rest[1]}")
-                        elif cmd == "click":
-                            # Кнопка самого клієнта (не пульта): «Стан», «чек».
-                            page.click(rest[0])
-                            log(f"натиснуто {rest[0]}")
-                        elif cmd == "baud":
-                            # Перемикач швидкості каналу (задача 0017): вибір у
-                            # списку + подія change, як від руки людини.
-                            page.select_option("#baud", rest[0])
-                            time.sleep(2.5)
-                            log(f"швидкість {rest[0]}: "
-                                + page.evaluate(
-                                    "() => document.getElementById('baud').value"))
-                        elif cmd == "back":
-                            # Права кнопка миші = клавіша «назад» (RTN).
-                            px, py = to_page(w // 2, h // 2)
-                            page.mouse.move(px, py)
-                            page.mouse.down(button="right")
-                            time.sleep(0.15)
-                            page.mouse.up(button="right")
-                            log("назад (RTN)")
-                        elif cmd == "wheel":
-                            n = int(rest[0])
-                            px, py = to_page(w // 2, h // 2)
-                            page.mouse.move(px, py)
-                            for _ in range(abs(n)):
-                                page.mouse.wheel(0, 100 if n > 0 else -100)
-                                time.sleep(0.12)
-                            log(f"енкодер {n}")
-                        elif cmd == "scroll":
-                            sec, hz, name = float(rest[0]), float(rest[1]), rest[2]
-                            px, py = to_page(w // 2, h // 2)
-                            page.mouse.move(px, py)
-                            t0, n, back, shots = time.time(), 0, False, 0
-                            while time.time() - t0 < sec:
-                                # Довгий пробіг в один бік: інакше виділення
-                                # тупцює між двома сусідніми пунктами, список
-                                # не гортається і дріт лишається майже вільним.
-                                if n % 45 == 44:
-                                    back = not back
-                                page.mouse.wheel(0, -100 if back else 100)
-                                n += 1
-                                time.sleep(1.0 / hz)
-                                # Знімок у самій гущі гортання — доказ 3.2.
-                                if name != "-" and n % 7 == 3 and shots < 12:
-                                    pageshot(f"{name}-{shots:02d}")
-                                    shots += 1
-                            log(f"гортання {sec} с: {n} клацань, {shots} знімків, {status()}")
-                        elif cmd == "shot":
-                            shot(rest[0])
-                            log(f"знімок {rest[0]}  |  {status()}")
-                        elif cmd == "pageshot":
-                            pageshot(rest[0])
-                            log(f"знімок сторінки {rest[0]}  |  {wait_mode()}  |  {status()}")
-                        elif cmd == "burst":
-                            n, ms, name = int(rest[0]), int(rest[1]), rest[2]
-                            for i in range(n):
-                                pageshot(f"{name}-{i:02d}")
-                                time.sleep(ms / 1000.0)
-                            log(f"черга {name}: {n} знімків")
-                        elif cmd == "swipe":
-                            sec, name = float(rest[0]), rest[1]
-                            n, shots = swipe(sec, name)
-                            log(f"протяг {sec} с: {n} жестів, {shots} знімків, "
-                                f"{status()}")
-                        elif cmd == "dragrule":
-                            # ⚠️ Вимикач правила протягу — прилад **сліпого**
-                            # порівняння (критерій 2.3). Кнопки в панелі він не
-                            # має навмисно: видима кнопка сказала б людині, який
-                            # режим увімкнено, а саме цього знання вона й не
-                            # повинна мати.
-                            on = rest[0] in ("on", "1", "true")
-                            got = page.evaluate(
-                                f"() => window.remoteUiDragRule({str(on).lower()})")
-                            log(f"правило протягу: {'увімкнене' if got else 'ВИМКНЕНЕ'}"
-                                " (лічильники обнулені)")
-                        elif cmd == "panel":
-                            log("панель:\n" + panel_text())
-                        elif cmd == "wait":
-                            time.sleep(int(rest[0]) / 1000.0)
-                        elif cmd == "info":
-                            log("стан: " + status())
-                        elif cmd == "say":
-                            log("— " + " ".join(rest))
-                        else:
-                            log(f"невідома команда: {line}")
-                    except Exception as e:  # вікно має пережити криву команду
-                        log(f"помилка на «{line}»: {e}")
+        def pump():
+            """Читати команди з ФІФО, доки не скажуть `quit`."""
+            while True:
+                with FIFO.open() as f:
+                    for raw in f:
+                        line = raw.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        cmd, *rest = line.split()
+                        try:
+                            if cmd == "quit":
+                                return
+                            elif cmd == "tap":
+                                px, py = to_page(int(rest[0]), int(rest[1]))
+                                page.mouse.move(px, py)
+                                time.sleep(0.05)
+                                page.mouse.down()
+                                time.sleep(0.15)   # LVGL опитує сенсор раз на 30 мс
+                                page.mouse.up()
+                                log(f"дотик {rest[0]},{rest[1]}")
+                            elif cmd == "click":
+                                # Кнопка самого клієнта (не пульта): «Стан», «чек».
+                                page.click(rest[0])
+                                log(f"натиснуто {rest[0]}")
+                            elif cmd == "baud":
+                                # Перемикач швидкості каналу (задача 0017): вибір у
+                                # списку + подія change, як від руки людини.
+                                page.select_option("#baud", rest[0])
+                                time.sleep(2.5)
+                                log(f"швидкість {rest[0]}: "
+                                    + page.evaluate(
+                                        "() => document.getElementById('baud').value"))
+                            elif cmd == "back":
+                                # Права кнопка миші = клавіша «назад» (RTN).
+                                px, py = to_page(w // 2, h // 2)
+                                page.mouse.move(px, py)
+                                page.mouse.down(button="right")
+                                time.sleep(0.15)
+                                page.mouse.up(button="right")
+                                log("назад (RTN)")
+                            elif cmd == "wheel":
+                                n = int(rest[0])
+                                px, py = to_page(w // 2, h // 2)
+                                page.mouse.move(px, py)
+                                for _ in range(abs(n)):
+                                    page.mouse.wheel(0, 100 if n > 0 else -100)
+                                    time.sleep(0.12)
+                                log(f"енкодер {n}")
+                            elif cmd == "scroll":
+                                sec, hz, name = float(rest[0]), float(rest[1]), rest[2]
+                                px, py = to_page(w // 2, h // 2)
+                                page.mouse.move(px, py)
+                                t0, n, back, shots = time.time(), 0, False, 0
+                                while time.time() - t0 < sec:
+                                    # Довгий пробіг в один бік: інакше виділення
+                                    # тупцює між двома сусідніми пунктами, список
+                                    # не гортається і дріт лишається майже вільним.
+                                    if n % 45 == 44:
+                                        back = not back
+                                    page.mouse.wheel(0, -100 if back else 100)
+                                    n += 1
+                                    time.sleep(1.0 / hz)
+                                    # Знімок у самій гущі гортання — доказ 3.2.
+                                    if name != "-" and n % 7 == 3 and shots < 12:
+                                        pageshot(f"{name}-{shots:02d}")
+                                        shots += 1
+                                log(f"гортання {sec} с: {n} клацань, {shots} знімків, {status()}")
+                            elif cmd == "shot":
+                                shot(rest[0])
+                                log(f"знімок {rest[0]}  |  {status()}")
+                            elif cmd == "pageshot":
+                                pageshot(rest[0])
+                                log(f"знімок сторінки {rest[0]}  |  {wait_mode()}  |  {status()}")
+                            elif cmd == "burst":
+                                n, ms, name = int(rest[0]), int(rest[1]), rest[2]
+                                for i in range(n):
+                                    pageshot(f"{name}-{i:02d}")
+                                    time.sleep(ms / 1000.0)
+                                log(f"черга {name}: {n} знімків")
+                            elif cmd == "swipe":
+                                sec, name = float(rest[0]), rest[1]
+                                n, shots = swipe(sec, name)
+                                log(f"протяг {sec} с: {n} жестів, {shots} знімків, "
+                                    f"{status()}")
+                            elif cmd == "dragrule":
+                                # ⚠️ Вимикач правила протягу — прилад **сліпого**
+                                # порівняння (критерій 2.3). Кнопки в панелі він не
+                                # має навмисно: видима кнопка сказала б людині, який
+                                # режим увімкнено, а саме цього знання вона й не
+                                # повинна мати.
+                                on = rest[0] in ("on", "1", "true")
+                                got = page.evaluate(
+                                    f"() => window.remoteUiDragRule({str(on).lower()})")
+                                log(f"правило протягу: {'увімкнене' if got else 'ВИМКНЕНЕ'}"
+                                    " (лічильники обнулені)")
+                            elif cmd == "panel":
+                                log("панель:\n" + panel_text())
+                            elif cmd == "wait":
+                                time.sleep(int(rest[0]) / 1000.0)
+                            elif cmd == "info":
+                                log("стан: " + status())
+                            elif cmd == "say":
+                                log("— " + " ".join(rest))
+                            else:
+                                log(f"невідома команда: {line}")
+                        except Exception as e:  # вікно має пережити криву команду
+                            log(f"помилка на «{line}»: {e}")
+
+        # ⚠️ `finally`, а не закриття в гілці `quit`. Ctrl-C, зламана команда,
+        # обірваний Wi-Fi — усе це виходи повз `quit`, і саме вони лишали по
+        # собі живого клієнта, який мовчки ділив дріт із наступним заміром
+        # (критерій 4.1 задачі 0021). Ціна помилки несиметрична: зайве
+        # закриття коштує одного `REFRESH`, забуте з'єднання — цілого заміру.
+        try:
+            pump()
+        finally:
+            log("зачиняю вікно")
+            try:
+                browser.close()
+            except Exception as e:      # вікно могло померти раніше за нас
+                log(f"вікно вже було закрите: {e}")
 
 
 if __name__ == "__main__":
