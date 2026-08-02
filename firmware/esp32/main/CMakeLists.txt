@@ -29,6 +29,7 @@ idf_component_register(
     EMBED_FILES
         "../../../webui/index.html"
         "../../../webui/proto.js"
+        "../../../webui/wait.js"
         "../../../webui/app.js"
         "../../../webui/style.css"
 )

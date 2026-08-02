@@ -207,7 +207,12 @@ function keyByName(hello, names) {
 
 async function checkHttp() {
   console.log('\nHTTP: чи віддаються файли сторінки');
+  // ⚠️ Перелік має накривати **всі** скрипти сторінки. Пропущений файл — це
+  // `RemoteUIWait is not defined` на першому рядку `app.js`, тобто біла
+  // сторінка на телефоні при зеленому пробнику. Це єдина автоматична сторожа
+  // того, що міст справді віддає клієнт.
   for (const [name, marker] of [['/', '<canvas'], ['/proto.js', 'RemoteUI'],
+                                ['/wait.js', 'RemoteUIWait'],
                                 ['/app.js', 'RemoteUI'], ['/style.css', '#screen']]) {
     try {
       const r = await fetch(base + name);

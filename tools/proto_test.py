@@ -275,7 +275,7 @@ class SessionBehaviour(unittest.TestCase):
         self.assertEqual(
             s.frames,
             s.frames_whole + s.frames_timeout + s.frames_too_many
-            + s.frames_no_wait + s.frames_legacy,
+            + s.frames_no_wait + s.frames_drag + s.frames_legacy,
             "сума причин показу розійшлася з кількістю показаних кадрів",
         )
 
@@ -478,6 +478,93 @@ class SessionBehaviour(unittest.TestCase):
         self.assertEqual(session.frames_too_many, 0)  # 20 плиток — у межах порога
         # Не частіше ніж раз на стелю: 400 мс дають щонайбільше два покази.
         self.assertLessEqual(len(shown), 2)
+
+    def test_touch_phase_mapping(self):
+        # Три рядки, які не перевіряє більше ніхто: правила лежать у спільному
+        # автоматі, перехресна перевірка дивиться на автомат, а не на клієнта.
+        self.assertEqual(test_client.touch_phase(proto.TOUCH_DOWN), "down")
+        self.assertEqual(test_client.touch_phase(proto.TOUCH_UP), "up")
+        self.assertEqual(test_client.touch_phase(proto.TOUCH_MOVE), "move")
+
+    def test_forget_pending_clears_the_wait_streak(self):
+        # ⚠️ Знахідка рецензії 0020: браузер обривав таймер, але **не** низку
+        # очікування, і запас стелі переживав розрив — перший же неповний кадр
+        # після перепідключення йшов зшитим у лічильник «за строком».
+        # Перехресна перевірка цього не бачить за побудовою: вона моделює
+        # автомат, а не обгортку навколо нього.
+        session = self.watch(Session(wait_mode=test_client.WAIT_ALWAYS))
+        self.hello(session, 2, 1)
+        self.whole_tile(session)
+
+        session.handle(proto.PKT_FRAME_END, struct.pack("<H", 90), now=100.0)
+        self.assertTrue(session.policy.pending, "низка очікування почалась")
+
+        session.forget_pending()
+        self.assertFalse(session.policy.pending, "розрив обриває й низку")
+
+        # Після повернення запас стелі має бути цілий: кадр чекає, а не
+        # показується негайно «за строком».
+        session.handle(proto.PKT_FRAME_END, struct.pack("<H", 90), now=200.0)
+        self.assertEqual(session.frames_timeout, 0)
+        self.assertIsNotNone(session.pending_until)
+
+    def test_drag_shows_at_once_and_counts_its_own_reason(self):
+        # ⚠️ Правила показу перевіряються не тут, а в `webui/wait_test.js` і
+        # `tools/wait_crosscheck.py` — вони спільні для двох клієнтів.
+        #
+        # Тут перевіряється **під'єднання**: чи справді джерело вводу доходить
+        # від клієнта ПК до автомата й чи має причина `drag` власний лічильник.
+        # Одруківка тут лишила б обидва інші набори тестів зеленими, а на
+        # стенді клієнт ПК чекав би там, де браузер не чекає, — тобто саме та
+        # розбіжність, заради якої все це й розділялось.
+        shown = []
+        session = self.watch(Session(
+            on_frame=lambda s: shown.append(bytes(s.buf)),
+            wait_mode=test_client.WAIT_ALWAYS))
+        self.hello(session, 2, 1)
+        self.whole_tile(session)
+
+        # ⚠️ Ввід іде **справжнім шляхом клієнта** — через `Session.note_input`
+        # і через `touch_phase()`, а не прямо в автомат: правила перевіряють
+        # інші тести, а тут перевіряється саме під'єднання. Час підставлений,
+        # інакше тест миготів би від навантаження машини.
+        session.note_input(proto.SRC_TOUCH,
+                           phase=test_client.touch_phase(proto.TOUCH_DOWN),
+                           x=100, y=100, now=100.0)
+        session.note_input(proto.SRC_TOUCH,
+                           phase=test_client.touch_phase(proto.TOUCH_MOVE),
+                           x=100, y=160, now=100.0)
+
+        session.handle(proto.PKT_FRAME_END, struct.pack("<H", 90), now=100.0)
+
+        self.assertEqual(len(shown), 1, "під протягом кадр показується негайно")
+        self.assertEqual(session.frames_drag, 1)
+        self.assertEqual(session.frames_timeout, 0)
+        self.assertIsNone(session.pending_until, "нічого не відкладено")
+
+    def test_tap_without_movement_still_waits(self):
+        # Другий бік того самого під'єднання: тик пальцем протягом не є, і
+        # очікування має лишитись. Без цього тесту «дотик = не чекаємо» пройшло
+        # б непоміченим, а це вимкнуло б очікування на кожному натисканні.
+        shown = []
+        session = self.watch(Session(
+            on_frame=lambda s: shown.append(bytes(s.buf)),
+            wait_mode=test_client.WAIT_ALWAYS))
+        self.hello(session, 2, 1)
+        self.whole_tile(session)
+
+        session.note_input(proto.SRC_TOUCH,
+                           phase=test_client.touch_phase(proto.TOUCH_DOWN),
+                           x=100, y=100, now=100.0)
+        session.note_input(proto.SRC_TOUCH,
+                           phase=test_client.touch_phase(proto.TOUCH_UP),
+                           x=101, y=102, now=100.0)
+
+        session.handle(proto.PKT_FRAME_END, struct.pack("<H", 20), now=100.0)
+
+        self.assertEqual(shown, [], "тик пальцем чекає, як енкодер")
+        self.assertEqual(session.frames_drag, 0)
+        self.assertIsNotNone(session.pending_until)
 
     def test_wait_always_ignores_the_threshold(self):
         # Режим «завжди»: порога немає, тож залишок понад поріг більше не веде

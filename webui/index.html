@@ -51,8 +51,13 @@
 
 <!-- Протокол окремо від оформлення: proto.js прогоняється тестами під node
      (`node webui/proto_test.js`) тими самими еталонними векторами, що й
-     реалізації на C++ і Python. -->
+     реалізації на C++ і Python.
+
+     wait.js — політика показу кадру, теж без DOM: `node webui/wait_test.js`
+     перевіряє правила, `python3 tools/wait_crosscheck.py` — що вони збігаються
+     з клієнтом ПК. ⚠️ Порядок обов'язковий: wait.js читає сталі з proto.js. -->
 <script src="proto.js"></script>
+<script src="wait.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

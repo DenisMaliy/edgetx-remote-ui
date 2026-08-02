@@ -39,13 +39,20 @@
     tap X Y          дотик у точку **екрана пульта** (не сторінки)
     back             клавіша «назад» (RTN) — права кнопка миші
     wheel N          N клацань енкодера, додатне — вниз
-    scroll SEC HZ ІМ'Я   безперервне гортання; ІМ'Я «-» вимикає знімки
+    scroll SEC HZ ІМ'Я   безперервне гортання **енкодером**; «-» без знімків
+    swipe SEC ІМ'Я   протяг **пальцем** по списку; «-» без знімків
+    dragrule on|off  правило «не чекати під протягом» (задача 0020)
+    panel            текст панелі «Стан» — звідти числа затримки
     baud N           замовити швидкість каналу (задача 0017)
     click SELECTOR   кнопка самого клієнта: «Стан», «чек»
     shot ІМ'Я        знімок канви
     pageshot ІМ'Я    знімок сторінки цілком — з плашкою, режимом і швидкістю
     burst N MS ІМ'Я  N знімків сторінки підряд
     wait MS / info / say ТЕКСТ / quit
+
+⚠️ `scroll` і `swipe` — **різні органи керування**, і плутати їх не можна:
+перший крутить колесо миші, тобто емулює енкодер, другий веде пальцем по
+сенсору. Уся задача 0020 саме про різницю між ними.
 
 ⚠️ Для доказів беріть `pageshot`, а не `shot`: рецензія 0019 вимагає, щоб
 знімок сам казав, у якому режимі й на якій швидкості він знятий.
@@ -104,6 +111,62 @@ def main():
         def wait_mode():
             return page.evaluate(
                 "() => (document.getElementById('btn-wait')||{}).textContent")
+
+        def panel_text():
+            """Панель «Стан» текстом — звідти беруться числа затримки.
+
+            ⚠️ Панель наповнюється раз на секунду і **тільки коли відкрита**
+            (`updateInfo` виходить одразу, якщо `hidden`). Тому спершу
+            відкриваємо, потім чекаємо оновлення, і лише тоді читаємо: інакше
+            вертався б текст, зібраний хтозна-коли.
+            """
+            was_hidden = page.evaluate(
+                "() => document.getElementById('info').hidden")
+            if was_hidden:
+                page.click("#btn-info")
+            time.sleep(1.2)
+            text = page.evaluate(
+                "() => document.getElementById('info').textContent"
+                ".split('міст')[0].trim()")
+            # ⚠️ Закриваємо назад: панель лежить поверх канви, і залишена
+            # відкритою вона з'їдала б дотики наступного протягу — замір
+            # виглядав би проведеним, а міряв би тишу.
+            if was_hidden:
+                page.click("#btn-info")
+            return text
+
+        def swipe(seconds, name, hold_ms=360, steps=12, gap_ms=250):
+            """Протяг пальцем по списку — те, заради чого існує задача 0020.
+
+            ⚠️ Не те саме, що `scroll`: там колесо миші, тобто **енкодер**.
+            Тут — справжній жест сенсора: DOWN, низка MOVE, UP.
+
+            Кроки розтягнуті в часі навмисно: LVGL опитує сенсор раз на 30 мс
+            (`LV_INDEV_DEF_READ_PERIOD`), тож миттєвий перескок Playwright пульт
+            побачив би як один стрибок, а не як протяг. `gap_ms` між жестами —
+            запас на хвіст інерції, який після відпускання ще їде.
+            """
+            x = w // 2
+            y_lo, y_hi = int(h * 0.80), int(h * 0.20)
+            t0, n, shots = time.time(), 0, 0
+            while time.time() - t0 < seconds:
+                a, b = (y_lo, y_hi) if n % 2 == 0 else (y_hi, y_lo)
+                px, py = to_page(x, a)
+                page.mouse.move(px, py)
+                page.mouse.down()
+                for i in range(1, steps + 1):
+                    yy = a + (b - a) * i // steps
+                    qx, qy = to_page(x, yy)
+                    page.mouse.move(qx, qy)
+                    time.sleep(hold_ms / 1000.0 / steps)
+                page.mouse.up()
+                n += 1
+                # Знімок у гущі руху — доказ для критерію 2.
+                if name != "-" and shots < 12 and n % 2 == 1:
+                    pageshot(f"{name}-{shots:02d}")
+                    shots += 1
+                time.sleep(gap_ms / 1000.0)
+            return n, shots
 
         while True:
             with FIFO.open() as f:
@@ -184,6 +247,24 @@ def main():
                                 pageshot(f"{name}-{i:02d}")
                                 time.sleep(ms / 1000.0)
                             log(f"черга {name}: {n} знімків")
+                        elif cmd == "swipe":
+                            sec, name = float(rest[0]), rest[1]
+                            n, shots = swipe(sec, name)
+                            log(f"протяг {sec} с: {n} жестів, {shots} знімків, "
+                                f"{status()}")
+                        elif cmd == "dragrule":
+                            # ⚠️ Вимикач правила протягу — прилад **сліпого**
+                            # порівняння (критерій 2.3). Кнопки в панелі він не
+                            # має навмисно: видима кнопка сказала б людині, який
+                            # режим увімкнено, а саме цього знання вона й не
+                            # повинна мати.
+                            on = rest[0] in ("on", "1", "true")
+                            got = page.evaluate(
+                                f"() => window.remoteUiDragRule({str(on).lower()})")
+                            log(f"правило протягу: {'увімкнене' if got else 'ВИМКНЕНЕ'}"
+                                " (лічильники обнулені)")
+                        elif cmd == "panel":
+                            log("панель:\n" + panel_text())
                         elif cmd == "wait":
                             time.sleep(int(rest[0]) / 1000.0)
                         elif cmd == "info":

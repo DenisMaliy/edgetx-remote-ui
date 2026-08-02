@@ -312,6 +312,172 @@ def parse_frame_end(payload: bytes) -> int | None:
     return struct.unpack("<H", payload[:2])[0]
 
 
+# --- Політика показу кадру ---------------------------------------------------
+#
+# Дзеркало `webui/wait.js`. ⚠️ Слово «дзеркало» тут не побажання: розбіжність
+# двох клієнтів у тому, що людина бачить на екрані, вже коштувала однієї
+# проґавленої вади (рецензія 0019). Тому обидві реалізації прогоняються тими
+# самими сценаріями — `tools/wait_crosscheck.py` порівнює їхні сліди рядок у
+# рядок і падає, щойно вони розійдуться.
+#
+# Повне виведення чисел і правил — у `webui/wait.js`. Тут лишається рівно те,
+# без чого код не читається.
+
+WAIT_OFF = 0      # показ на кожному FRAME_END — поведінка до 0019
+WAIT_LIMIT = 1    # очікування, поки залишок не більший за поріг
+WAIT_ALWAYS = 2   # очікування завжди; тримає лише стеля
+
+SRC_NONE = "none"
+SRC_TOUCH = "touch"
+SRC_ENC = "enc"
+SRC_KEY = "key"
+
+# Скільки тримати «не чекати» після останнього пакета дотику. Виведено з коду
+# LVGL: інерція гасне як v ← v·0.9 на кожному опитуванні сенсора (30 мс), тож
+# найшвидший правдоподібний поштовх їде ≈900 мс. Докладно — `webui/wait.js`.
+TOUCH_NOWAIT_MS = 1000
+
+# Поріг, за яким дотик вважається протягом, а не тиком. Це `LV_INDEV_DEF_SCROLL_LIMIT`
+# самого LVGL — те саме число, яким пульт відрізняє гортання від натискання.
+TOUCH_DRAG_LIMIT_PX = 10
+
+WHY_LEGACY = "legacy"
+WHY_WHOLE = "whole"
+WHY_OFF = "off"
+WHY_DRAG = "drag"
+WHY_TOO_MANY = "toomany"
+WHY_TIMEOUT = "timeout"
+
+
+class FrameWaitPolicy:
+    """Чекати доїзду решти плиток чи показувати негайно.
+
+    ⚠️ Час скрізь у **мілісекундах** і приходить параметром — автомат не
+    дивиться на годинник сам. Так він однаково прогоняється і в тестах, і в
+    живому клієнті, і зі свого близнюка на JavaScript.
+
+    Порядок виклику:
+
+        при надсиланні вводу       → note_input(джерело, now, ...)
+        на кожному FRAME_END       → decide(dirty, now)
+        у мить, коли показали кадр → note_shown()
+    """
+
+    def __init__(self, mode: int = WAIT_ALWAYS, baud: int | None = None,
+                 drag_rule: bool = True):
+        self.mode = mode
+        self.baud = baud
+        # ⚠️ Вимикач правила протягу — прилад для **сліпого** порівняння
+        # (критерій 2.3 задачі 0020), а не налаштування. Вимкнене = поведінка
+        # рівно до 0020. Обґрунтування повністю — у `webui/wait.js`.
+        self.drag_rule = drag_rule
+
+        self.last_source = SRC_NONE
+        self.last_input_at = 0.0
+
+        self.touch_down = False
+        self.touch_dragging = False
+        self.touch_start_x = 0
+        self.touch_start_y = 0
+
+        self.pending = False
+        self.waiting_since = 0.0
+
+    def set_mode(self, mode: int) -> None:
+        self.mode = mode
+
+    def set_baud(self, baud: int | None) -> None:
+        self.baud = baud
+
+    def set_drag_rule(self, on: bool) -> None:
+        self.drag_rule = bool(on)
+
+    def tile_limit(self) -> int:
+        return frame_wait_tile_limit(self.baud)
+
+    def note_input(self, source: str, now: float,
+                   phase: str | None = None, x: int = 0, y: int = 0) -> None:
+        """Клієнт щойно надіслав ввід.
+
+        ⚠️ Тільки справжній ввід людини. Періодичний INPUT_STATE повторює
+        рівень і вводом не є: інакше утримуваний палець нескінченно подовжував
+        би вікно «не чекати» вже після того, як усе зупинилось.
+        """
+        self.last_source = source
+        self.last_input_at = now
+
+        if source != SRC_TOUCH:
+            # Енкодер або клавіша посеред жесту — жест скінчився.
+            self.touch_down = False
+            self.touch_dragging = False
+            return
+
+        if phase == "down":
+            self.touch_down = True
+            self.touch_dragging = False
+            self.touch_start_x = x
+            self.touch_start_y = y
+        elif phase == "move" and self.touch_down and not self.touch_dragging:
+            if (abs(x - self.touch_start_x) >= TOUCH_DRAG_LIMIT_PX
+                    or abs(y - self.touch_start_y) >= TOUCH_DRAG_LIMIT_PX):
+                self.touch_dragging = True
+        elif phase == "up":
+            # ⚠️ `touch_dragging` навмисно не гаситься: саме тут починається
+            # інерція, і вікно має її пережити.
+            self.touch_down = False
+
+    def dragging(self, now: float) -> bool:
+        """Чи діє зараз правило «не чекати»."""
+        if not self.drag_rule:   # прилад сліпого порівняння, див. конструктор
+            return False
+        if not self.touch_dragging:
+            return False
+        if self.touch_down:
+            return True
+        return (now - self.last_input_at) <= TOUCH_NOWAIT_MS
+
+    def decide(self, dirty: int | None, now: float) -> tuple[bool, float, str | None]:
+        """Повертає (показувати, скільки чекати мс, причина показу)."""
+        if dirty is None:
+            return self._show(WHY_LEGACY)
+
+        if dirty == 0:
+            return self._show(WHY_WHOLE)
+
+        if self.mode == WAIT_OFF:
+            return self._show(WHY_OFF)
+
+        if self.dragging(now):
+            return self._show(WHY_DRAG)
+
+        if self.mode == WAIT_LIMIT and dirty > self.tile_limit():
+            return self._show(WHY_TOO_MANY)
+
+        if not self.pending:
+            self.waiting_since = now
+
+        wait_ms = min(frame_wait_ms(dirty),
+                      self.waiting_since + FRAME_WAIT_MAX_MS - now)
+        if wait_ms <= 0:
+            return self._show(WHY_TIMEOUT)
+
+        self.pending = True
+        return (False, wait_ms, None)
+
+    def note_shown(self) -> None:
+        self.pending = False
+
+    def forget(self) -> None:
+        """Забути відкладений кадр **без показу** — з'єднання померло або
+        екран змінив розмір. Обґрунтування окремої назви — у `webui/wait.js`.
+        """
+        self.pending = False
+
+    def _show(self, why: str) -> tuple[bool, float, str | None]:
+        self.pending = False
+        return (True, 0.0, why)
+
+
 class InputMirror:
     """Дзеркало власного вводу клієнта — джерело для INPUT_STATE.
 

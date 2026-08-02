@@ -38,6 +38,8 @@ extern const uint8_t index_html_start[] asm("_binary_index_html_start");
 extern const uint8_t index_html_end[] asm("_binary_index_html_end");
 extern const uint8_t proto_js_start[] asm("_binary_proto_js_start");
 extern const uint8_t proto_js_end[] asm("_binary_proto_js_end");
+extern const uint8_t wait_js_start[] asm("_binary_wait_js_start");
+extern const uint8_t wait_js_end[] asm("_binary_wait_js_end");
 extern const uint8_t app_js_start[] asm("_binary_app_js_start");
 extern const uint8_t app_js_end[] asm("_binary_app_js_end");
 extern const uint8_t style_css_start[] asm("_binary_style_css_start");
@@ -665,6 +667,12 @@ static esp_err_t protojs_get(httpd_req_t *req)
     return send_blob(req, "application/javascript; charset=utf-8", proto_js_start, proto_js_end);
 }
 
+/* Політика показу кадру — окремий модуль клієнта, без DOM (задача 0020). */
+static esp_err_t waitjs_get(httpd_req_t *req)
+{
+    return send_blob(req, "application/javascript; charset=utf-8", wait_js_start, wait_js_end);
+}
+
 static esp_err_t appjs_get(httpd_req_t *req)
 {
     return send_blob(req, "application/javascript; charset=utf-8", app_js_start, app_js_end);
@@ -748,8 +756,9 @@ esp_err_t ws_bridge_start(void)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.stack_size = 8192; /* у обробнику лежить буфер на BRIDGE_WS_RX_MAX */
     cfg.max_open_sockets = 4;
-    /* Типова стеля — 8, а ми реєструємо рівно 8. Наступний доданий шлях
-     * упав би не при збірці, а на старті моста, у полі. */
+    /* Типова стеля — 8, а шляхів уже дев'ять (додався `/wait.js`). Число
+     * тримається з запасом навмисно: перебір упав би не при збірці, а на
+     * старті моста, у полі. ⚠️ Додаєш шлях — звір із цим числом. */
     cfg.max_uri_handlers = 12;
     cfg.lru_purge_enable = true;
     cfg.close_fn = on_sock_close;
@@ -773,6 +782,7 @@ esp_err_t ws_bridge_start(void)
         {.uri = "/", .method = HTTP_GET, .handler = index_get},
         {.uri = "/index.html", .method = HTTP_GET, .handler = index_get},
         {.uri = "/proto.js", .method = HTTP_GET, .handler = protojs_get},
+        {.uri = "/wait.js", .method = HTTP_GET, .handler = waitjs_get},
         {.uri = "/app.js", .method = HTTP_GET, .handler = appjs_get},
         {.uri = "/style.css", .method = HTTP_GET, .handler = css_get},
         {.uri = "/api/stats", .method = HTTP_GET, .handler = stats_get},

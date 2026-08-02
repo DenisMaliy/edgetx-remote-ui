@@ -11,6 +11,7 @@
  */
 
 const P = RemoteUI;
+const Wait = RemoteUIWait;
 
 const RECONNECT_MS = 1000;
 
@@ -57,7 +58,21 @@ const counters = {
   framesTimeout: 0,   // решта не доїхала за строк — показали як є
   framesTooMany: 0,   // чекати не було сенсу: залишок більший за поріг
   framesNoWait: 0,    // очікування вимкнене кнопкою — режим «як було»
+  framesDrag: 0,      // палець веде: рух важливіший за шов (задача 0020)
   framesLegacy: 0,    // прошивка без ознаки повноти (до задачі 0019)
+};
+
+/* Причина показу з автомата → лічильник. ⚠️ Таблицею, а не ланцюжком `if`:
+ * нова причина без рядка тут упаде голосно (кадр не порахується жодною
+ * причиною, і рівність «сума = кадрів» розсиплеться на очах), а не приховає
+ * себе під чужим числом. */
+const WHY_COUNTER = {
+  [Wait.WHY_WHOLE]: 'framesWhole',
+  [Wait.WHY_TIMEOUT]: 'framesTimeout',
+  [Wait.WHY_TOO_MANY]: 'framesTooMany',
+  [Wait.WHY_OFF]: 'framesNoWait',
+  [Wait.WHY_DRAG]: 'framesDrag',
+  [Wait.WHY_LEGACY]: 'framesLegacy',
 };
 
 /**
@@ -75,9 +90,11 @@ function resetFrameCounters() {
   counters.framesTimeout = 0;
   counters.framesTooMany = 0;
   counters.framesNoWait = 0;
+  counters.framesDrag = 0;
   counters.framesLegacy = 0;
   lastFrames = 0;
   lastWhole = 0;
+  latencyReset();
 }
 
 /* ⚠️ Очікування перемикається кнопкою — це **прилад**, а не налаштування.
@@ -96,12 +113,12 @@ function resetFrameCounters() {
  * `ЗАВЖДИ` — чесна протилежність до `ВИМК`: порога немає зовсім, від патології
  * лишається сама стеля очікування. Ціна заміряна: 8.8 → 6.6 показів/с на
  * гортанні за те, що жоден показаний кадр не зшитий. Що з цього краще —
- * вирішує око, і саме для цього тут три положення, а не два. */
-const WAIT_OFF = 0;      // показ на кожному FRAME_END — поведінка до 0019
-const WAIT_LIMIT = 1;    // очікування, поки залишок не більший за поріг
-const WAIT_ALWAYS = 2;   // очікування завжди; тримає лише стеля
-
-/* ⚠️ Режими описані **таблицею**, а не трьома ланцюжками `if` у трьох місцях.
+ * вирішує око, і саме для цього тут три положення, а не два.
+ *
+ * ⚠️ Самі числа режимів лежать у `wait.js` (`Wait.WAIT_OFF` і далі): тут
+ * лишились тільки написи, які бачить людина.
+ *
+ * ⚠️ Режими описані **таблицею**, а не трьома ланцюжками `if` у трьох місцях.
  * Наступна ручка (стеля очікування вже названа кандидатом) додала б четверте
  * положення, і `% 3` зламався б **мовчки**: режим просто став би недосяжним,
  * без жодної ознаки. */
@@ -133,10 +150,18 @@ const WAIT_MODES = [
  * разом зі зміною сторінки. Проміжного числа немає в даних.
  *
  * Ціна, названа людиною і записана свідомо: на протягу пальцем по сенсору
- * очікування додає ривків. Важіль, який може це розв'язати, — не число, а
- * джерело вводу (клієнт сам щойно надіслав `ENC` або `TOUCH`), і це вже
- * предмет окремої задачі. */
-let waitMode = WAIT_ALWAYS;
+ * очікування додає ривків. Важіль, який це розв'язав, — не число, а джерело
+ * вводу, і він живе в `wait.js` (задача 0020): поріг лишається як був, а
+ * протяг пальцем його просто обходить. */
+
+/* ⚠️ Автомат очікування живе в `wait.js` — окремому модулі **без DOM**. Тут
+ * лишається сама обгортка: таймер, лічильники, написи.
+ *
+ * Причина винесення названа рецензією 0019: `app.js` не покритий нічим, і
+ * дзеркальність із клієнтом ПК трималась на читанні очима. Тепер правила
+ * перевіряються двічі — `webui/wait_test.js` каже, що правило те, а
+ * `tools/wait_crosscheck.py` — що правило одне на два клієнти. */
+const policy = new Wait.FrameWaitPolicy({ mode: Wait.WAIT_ALWAYS, baud: null });
 
 /* --- скільки головний потік зайнятий нами ---------------------------------
  *
@@ -164,10 +189,87 @@ const prof = {
   last: { feed: 0, tile: 0, draw: 0, kbs: 0, busy: 0 },
 };
 
+/* --- скільки чекає палець --------------------------------------------------
+ *
+ * ⚠️ Прилад, який закриває борг 4.2 задачі 0019, і закрити його могло **лише**
+ * тут. `tools/input_check.py` міряє затримку до дроту, а очікування, яке ми
+ * щойно вимкнули для протягу, лежить **після** дроту — тобто саме те, що
+ * відчуває палець, той інструмент не бачить за побудовою.
+ *
+ * Що вважаємо затримкою: від миті, коли клієнт **надіслав** ввід, до миті,
+ * коли він **показав** наступний кадр. Береться найстаріший ввід, на який ще
+ * не відповіли кадром, а не останній: питання буквально «скільки минуло, доки
+ * моя дія з'явилась на екрані», а найсвіжіший ввід занизив би відповідь тим
+ * сильніше, чим гірше йдуть справи.
+ *
+ * Дотик і енкодер рахуються **окремо** — у них тепер різні правила показу, і
+ * зведене число ховало б рівно ту різницю, заради якої задача існує.
+ *
+ * ⚠️ **Нижня межа обов'язкова, інакше прилад систематично занижує.** Кадр,
+ * який уже був у дорозі, коли ми надіслали ввід, відповіддю на нього не є —
+ * пульт перемальовує й сам (телеметрія, таймери), і такий кадр дав би зразок у
+ * кілька мілісекунд. Зсув при цьому **несиметричний**: у режимі протягу кадри
+ * йдуть частіше, тобто хибних дешевих зразків там більше — і саме порівняння
+ * «дотик проти енкодера» отримало б домішку на свою користь.
+ *
+ * Межа не вигадана: LVGL опитує сенсор раз на 30 мс
+ * (`LV_INDEV_DEF_READ_PERIOD`, `colorlcd/lv_conf.h:105`), тож швидше за один
+ * період відповіді не буває взагалі. Усе, що прийшло раніше, — чужий кадр, і
+ * чекаємо далі, а не зараховуємо. Скільки таких відкинуто — видно в панелі:
+ * прилад, який мовчки щось викидає, довіри не вартий.
+ */
+const LATENCY_KEEP = 600;   // зразків на джерело; більше нема сенсу тримати
+const LATENCY_FLOOR_MS = 30;
+
+const latency = {
+  pendingAt: 0,
+  pendingSource: null,   // null = усі надіслані вводи вже відповіли кадром
+  early: 0,              // кадрів, відкинутих як «був у дорозі»
+  samples: { touch: [], enc: [], key: [] },
+};
+
+function latencyReset() {
+  latency.pendingSource = null;
+  latency.early = 0;
+  latency.samples = { touch: [], enc: [], key: [] };
+}
+
+function latencyNoteInput(source, now) {
+  if (latency.pendingSource !== null) return;   // вже чекаємо на старіший
+  latency.pendingSource = source;
+  latency.pendingAt = now;
+}
+
+function latencyNoteShown(now) {
+  if (latency.pendingSource === null) return;
+
+  const dt = now - latency.pendingAt;
+  // Кадр був у дорозі ще до нашого вводу — відповіддю бути не міг. Заявку
+  // **не** знімаємо: чекаємо на справжню відповідь.
+  if (dt < LATENCY_FLOOR_MS) { latency.early++; return; }
+
+  const a = latency.samples[latency.pendingSource];
+  if (a) {
+    a.push(dt);
+    if (a.length > LATENCY_KEEP) a.shift();
+  }
+  latency.pendingSource = null;
+}
+
+/** Медіана, 90-й відсоток і максимум. ⚠️ Розкид обов'язковий: середнє тут
+ *  бреше — саме хвіст і є те, що людина називає ривком. */
+function latencyStats(source) {
+  const a = latency.samples[source];
+  if (!a || !a.length) return null;
+  const s = a.slice().sort((x, y) => x - y);
+  const at = (q) => s[Math.min(s.length - 1, Math.floor(q * s.length))];
+  return { n: s.length, med: at(0.5), p90: at(0.9), max: s[s.length - 1] };
+}
+
 function resizeTo(w, h) {
   // Буфер зараз підміниться на порожній — відкладений показ малював би вже не
-  // той кадр, якого чекав.
-  cancelPendingFrame();
+  // той кадр, якого чекав. Разом із кадром помирає й низка очікування.
+  forgetPendingFrame();
 
   W = w; H = h;
   canvas.width = w;
@@ -214,13 +316,24 @@ function onTile(payload) {
 /* Кадр показуємо лише на FRAME_END: до нього картинка неповна. Саме тому
  * клієнт накопичує між кадрами — і саме тому він придатний, щоб подивитись
  * на сторінку, яка оновлюється безперервно. */
-function showFrame() {
+function showFrame(why) {
   if (!frameBuf) return;
   const t0 = performance.now();
   ctx.putImageData(frameBuf, 0, 0);
-  prof.msDraw += performance.now() - t0;
+  const t1 = performance.now();
+  prof.msDraw += t1 - t0;
+
   counters.frames++;
-  lastFrameAt = performance.now();
+  // ⚠️ Причина обов'язкова. Без цієї перевірки невідома причина дала б
+  // `counters[undefined] = NaN` — тобто рівність «сума причин = кадрів»
+  // розсипалась би мовчки, а в браузері її не стереже жоден тест.
+  const which = WHY_COUNTER[why];
+  if (!which) throw new Error('показ кадру без відомої причини: ' + why);
+  counters[which]++;
+  policy.noteShown();
+  latencyNoteShown(t1);
+
+  lastFrameAt = t1;
   veil(null);
 }
 
@@ -238,13 +351,30 @@ function showFrame() {
  * решта не доїхала за строк.
  */
 let pendingFrameTimer = null;
-let waitingSince = 0;   // мить першого FRAME_END у поточній низці з N > 0
 
+/* ⚠️ Дві різні дії, і плутати їх не можна.
+ *
+ * `cancelPendingFrame()` — тільки таймер. Кличеться в звичайному ході
+ * `onFrameEnd()`, де низка очікування **живе далі**: скинути там її запас
+ * означало б зробити стелю нескінченною.
+ *
+ * `forgetPendingFrame()` — таймер **і** низка. Кличеться там, де чекати вже
+ * нема на що: розмір екрана змінився або з'єднання померло.
+ *
+ * Другого не було, і клієнт ПК від браузера через це розходився (`forget_pending`
+ * там кликав автомат, тут — ні): `pending` переживав розрив, і перший же
+ * неповний кадр після перепідключення йшов зшитим у лічильник «за строком».
+ */
 function cancelPendingFrame() {
   if (pendingFrameTimer !== null) {
     clearTimeout(pendingFrameTimer);
     pendingFrameTimer = null;
   }
+}
+
+function forgetPendingFrame() {
+  cancelPendingFrame();
+  policy.forget();
 }
 
 function onFrameEnd(payload) {
@@ -253,81 +383,25 @@ function onFrameEnd(payload) {
   // інакше звели б таймер, який за 50–250 мс покличе показ у порожнечу.
   if (!frameBuf) return;
 
-  const dirty = P.parseFrameEnd(payload);
-
-  // Стара прошивка: ознаки повноти немає — поводимось рівно як досі.
-  if (dirty === null) {
-    cancelPendingFrame();
-    counters.framesLegacy++;
-    showFrame();
-    return;
-  }
-
-  // ⚠️ Цілий кадр показуємо **в цьому ж обробнику**, без setTimeout і без
-  // requestAnimationFrame. Будь-яке відкладання тут — це зростання затримки від
-  // дотику до зміни на екрані, а саме її задача обіцяла не чіпати.
-  if (dirty === 0) {
-    cancelPendingFrame();
-    counters.framesWhole++;
-    showFrame();
-    return;
-  }
-
-  // Очікування вимкнене кнопкою — прилад для порівняння оком, до порога
-  // стосунку не має.
-  if (waitMode === WAIT_OFF) {
-    cancelPendingFrame();
-    counters.framesNoWait++;
-    showFrame();
-    return;
-  }
-
-  // Запобіжник: залишок такий великий, що не встигне доїхати раніше, ніж пульт
-  // перемалює кадр наново. Чекати нема сенсу — те, чого ми чекаємо, застаріє
-  // швидше, ніж прийде.
-  //
-  // Поріг береться зі швидкості каналу (див. proto.js), бо швидкість тут
-  // міняється на ходу. У режимі `завжди` гілки немає зовсім — саме тим він і
-  // відрізняється, і тим його й порівнюють оком.
-  if (waitMode === WAIT_LIMIT
-      && dirty > P.frameWaitTileLimit(hello && hello.baudCurrent)) {
-    cancelPendingFrame();
-    counters.framesTooMany++;
-    showFrame();
-    return;
-  }
-
-  // ⚠️ Стеля рахується від початку **поточної низки** очікування, а не від
-  // кожного FRAME_END окремо і не від останнього показаного кадру.
-  //
-  // Від кожного FRAME_END — безперервне гортання, де dirtyTiles не спадає до
-  // нуля ніколи, відсувало б показ щоразу, і екран замерз би назавжди: рівно те,
-  // від чого стеля й існує.
-  //
-  // Від останнього показаного кадру — теж хибно, і хибно тихо: після паузи на
-  // нерухомому екрані запас уже вичерпаний, тож перший же неповний кадр
-  // показався б негайно, без очікування. А це і є головний випадок задачі —
-  // людина починає гортати список після того, як дивилась на нього.
-  const now = performance.now();
-  if (pendingFrameTimer === null) {
-    waitingSince = now;   // низка починається
-  }
-  const wait = Math.min(P.frameWaitMs(dirty),
-                        waitingSince + P.FRAME_WAIT_MAX_MS - now);
+  // ⚠️ Усе рішення — в одному виклику автомата. Розкладка правил, числа й
+  // обґрунтування живуть у `wait.js`; тут лишається виконання: скасувати
+  // старий таймер, показати або завести новий.
+  const r = policy.decide(P.parseFrameEnd(payload), performance.now());
 
   cancelPendingFrame();
 
-  if (wait <= 0) {
-    counters.framesTimeout++;
-    showFrame();
+  if (r.show) {
+    // ⚠️ Показ **у цьому ж обробнику**, без setTimeout і без
+    // requestAnimationFrame: будь-яке відкладання тут — це чисте зростання
+    // затримки від дотику до зміни на екрані.
+    showFrame(r.why);
     return;
   }
 
   pendingFrameTimer = setTimeout(() => {
     pendingFrameTimer = null;
-    counters.framesTimeout++;
-    showFrame();
-  }, wait);
+    showFrame(Wait.WHY_TIMEOUT);
+  }, r.waitMs);
 
   // Плитки тим часом як лягали у frameBuf, так і лягають: накопичення не
   // спиняється ніколи, чекає лише показ.
@@ -381,6 +455,48 @@ function send(frame) {
 let baudNonce = 0;
 let baudPending = null;   // на що чекаємо відповіді
 let baudNoteTimer = null;
+
+/* --- клієнт сам просить найшвидше, що пульт дозволяє ----------------------
+ *
+ * ⚠️ Не зручність, а лікування стабільного джерела хибних скарг. Після
+ * **кожного** перезапуску стенда пульт удома на 921 600 (запобіжник відкоту
+ * 0017 працює як має), а на цій швидкості строк очікування спрацьовує на
+ * кожному третьому кадрі й людина бачить шви. Заміряно 2026-08-02: 137 цілих
+ * кадрів зі 137 на 2 625 000 проти 75 зі 121 на 921 600. Тобто «знову рве» —
+ * це швидкість, а не регресія, і поки перемикач треба чіпати рукою, цю
+ * плутанину доводиться щоразу розплутувати наново.
+ *
+ * ⚠️ Прапорець **один**, і знімає його лише підтверджений успіх.
+ *
+ * Спокуслива пара «спробував на цьому з'єднанні» + «відмовили — більше не
+ * прошу» має дірку, і вона не теоретична: спроба може не закінчитись **жодним
+ * звітом** — обрив WebSocket, перезавантаження моста, кинутий Wi-Fi. Тоді
+ * «відмовили» не спрацьовує ніколи, а «на цьому з'єднанні» обнуляється кожним
+ * перепідключенням, тобто раз на секунду. Виходить рівно той цикл
+ * «прошу → відкат → прошу», який забороняє критерій 5.2.
+ *
+ * Тому прапорець ставиться **в мить спроби**, а не за її наслідком. Правило
+ * читається так: «одна спроба на завантаження сторінки, доки вона не
+ * вдалася». Успіх його знімає — і після наступного розриву, коли пульт знову
+ * вдома на 921 600, клієнт попросить ще раз.
+ */
+let baudAutoAsked = false;
+
+function maybeAskBestBaud(h) {
+  if (baudAutoAsked) return;
+
+  if (!h.canSwitchBaud || !h.baudList.length || !h.baudCurrent) return;
+  const best = Math.max.apply(null, h.baudList);
+  if (best <= h.baudCurrent) return;   // уже на найшвидшій — просити нічого
+
+  baudNonce = (baudNonce % 255) + 1;
+  baudPending = { target: best, nonce: baudNonce, auto: true };
+  baudAutoAsked = true;   // ⚠️ у мить спроби, а не за її наслідком — див. вище
+  send(P.encodeBaudSet(best, baudNonce));
+  // ⚠️ Автоматична спроба видима так само, як ручна: мовчазне перемикання
+  // швидкості — це число, яке людина читає з плашки й на яке спирає замір.
+  baudNote(`прошу ${baudLabel(best)} сам…`);
+}
 
 function baudLabel(v) {
   return v >= 1000000 ? `${(v / 1000000).toFixed(v % 1000000 ? 2 : 0)} Мбод`
@@ -473,6 +589,10 @@ function connect() {
   ws.onopen = () => {
     decoder.reset();
     hello = null;
+    policy.setBaud(null);   // швидкість знову невідома — і поріг разом із нею
+    // ⚠️ Протухла заявка не переживає розрив: інакше сторонній HELLO з новою
+    // швидкістю після перепідключення був би визнаний «нашим успіхом».
+    baudPending = null;
     // Поріг щойно став невідомим: без цього кнопка лишалась би з числом
     // мертвого з'єднання — на 921600 показувала б 45 замість 16.
     waitLabel();
@@ -518,8 +638,9 @@ function stopTimers() {
 
   // Відкладений неповний кадр помирає разом зі з'єднанням: решта плиток уже не
   // доїде ніколи, а показувати зшите поверх завіси «зв'язок обірвано» —
-  // брехати про те, що зв'язок є.
-  cancelPendingFrame();
+  // брехати про те, що зв'язок є. Низка очікування помирає разом із ним —
+  // інакше її запас переживе розрив і з'їсть перший кадр після повернення.
+  forgetPendingFrame();
 }
 
 /**
@@ -569,6 +690,8 @@ function onPacket(type, payload) {
         resizeTo(h.width, h.height);
       }
       hello = h;
+      // Поріг автомата рахується зі швидкості, а вона міняється на ходу.
+      policy.setBaud(h.baudCurrent);
       baudRefresh(h);
       // Поріг залежить від швидкості каналу, а вона міняється на ходу —
       // напис на кнопці має їхати за нею.
@@ -578,6 +701,17 @@ function onPacket(type, payload) {
       // швидкість у HELLO. Обіцянка в підтвердженні успіхом не була.
       if (baudPending && h.baudCurrent === baudPending.target) {
         baudNote(`швидкість каналу: ${baudLabel(h.baudCurrent)}`, 'ok');
+        // Успіх — і тільки він — знімає заборону просити знову. Після
+        // наступного розриву пульт буде вдома на базовій, і попросити треба.
+        if (baudPending.auto) baudAutoAsked = false;
+        // ⚠️ Лічильники й затримки гасяться разом зі швидкістю: критерії 3.2 і
+        // 3.3 вимагають чисел **окремо** на кожній швидкості, а панель, яка і є
+        // артефактом доказу, мовчки показала б суміш двох.
+        resetFrameCounters();
+        // ⚠️ Після зміни швидкості просимо картинку наново: плитки, що були в
+        // дорозі в мить перемикання, доїхати не могли, а пульт шле **лише
+        // зміни** — прямокутник зі старими пікселями лишився б назавжди.
+        send(P.encodeFrame(P.PKT_REFRESH));
         baudPending = null;
       }
 
@@ -589,6 +723,7 @@ function onPacket(type, payload) {
         veil('чекаю перший кадр…');
         // Тільки тепер REFRESH: до HELLO клієнт не знає, куди класти пікселі.
         send(P.encodeFrame(P.PKT_REFRESH));
+        maybeAskBestBaud(h);
       }
       break;
     }
@@ -649,11 +784,28 @@ function toRadio(ev) {
   return { x: Math.max(0, Math.min(W - 1, x)), y: Math.max(0, Math.min(H - 1, y)) };
 }
 
+/* Один вхід для всього вводу, який клієнт надсилає **сам**.
+ *
+ * ⚠️ Периодичний `INPUT_STATE` сюди не входить і входити не має: він повторює
+ * рівень, а не є новою дією людини. Інакше палець, покладений на екран і
+ * забутий там, нескінченно подовжував би вікно «не чекати» — уже після того,
+ * як усе зупинилось. Те саме про `PING` і `REFRESH`. */
+function noteInput(source, opts) {
+  const now = performance.now();
+  policy.noteInput(source, now, opts);
+  latencyNoteInput(source, now);
+}
+
 function sendTouch(event, pt) {
   // ⚠️ Спершу дзеркало, потім перехід — інакше рівень, який піде наступним
   // INPUT_STATE, суперечитиме щойно надісланому переходу.
   mirror.touch(event, pt.x, pt.y);
   send(P.encodeTouch(event, pt.x, pt.y));
+  noteInput(Wait.SRC_TOUCH, {
+    phase: event === P.TOUCH_DOWN ? 'down'
+         : event === P.TOUCH_UP ? 'up' : 'move',
+    x: pt.x, y: pt.y,
+  });
 }
 
 let pointerId = null;
@@ -713,6 +865,7 @@ function sendBack(pressed) {
   if (code === null) return;
   mirror.key(code, pressed);       // рівень — інакше повтор стану її «відпустить»
   send(P.encodeKey(code, pressed));
+  noteInput(Wait.SRC_KEY);
 }
 
 canvas.addEventListener('pointerdown', (ev) => {
@@ -770,6 +923,7 @@ canvas.addEventListener('wheel', (ev) => {
   if (ev.deltaMode !== 0 || Math.abs(ev.deltaY) >= WHEEL_NOTCH_PX) {
     wheelAcc = 0;               // зарубка перебиває недобрані пікселі тачпада
     send(P.encodeEnc(dir));
+    noteInput(Wait.SRC_ENC);
     return;
   }
 
@@ -778,6 +932,7 @@ canvas.addEventListener('wheel', (ev) => {
   if (Math.abs(wheelAcc) >= WHEEL_TRACKPAD_PX) {
     wheelAcc -= Math.sign(wheelAcc) * WHEEL_TRACKPAD_PX;
     send(P.encodeEnc(Math.sign(ev.deltaY)));
+    noteInput(Wait.SRC_ENC);
   }
 }, { passive: false });
 
@@ -815,15 +970,15 @@ function waitLabel() {
   // Але це стосується **тільки** режиму з порогом — решту двох малюємо завжди,
   // інакше після кожного розриву (hello = null) людина перестає бачити, у
   // якому режимі вона зараз.
-  const limit = hello ? P.frameWaitTileLimit(hello.baudCurrent) : null;
-  const m = WAIT_MODES[waitMode];
+  const limit = hello ? policy.tileLimit() : null;
+  const m = WAIT_MODES[policy.mode];
   btnWait.textContent = m.label(limit);
   btnWait.title = m.title(limit);
 }
 
 btnWait.addEventListener('click', () => {
   // Від типового `до N`: до N → завжди → вимк → до N.
-  waitMode = (waitMode + 1) % WAIT_MODES.length;
+  policy.setMode((policy.mode + 1) % WAIT_MODES.length);
 
   // ⚠️ Лічильники причин гасяться разом із режимом. Третє положення додане
   // саме заради **порівняння чисел** між режимами на одному прогоні (критерій
@@ -839,13 +994,31 @@ btnWait.addEventListener('click', () => {
   // інакше він висів би до строку вже в режимі, який очікування не робить.
   // ⚠️ Саме `pendingFrameTimer !== null`, а не просто showFrame(): показ без
   // причини збив би рівність «сума причин = кадрів».
-  if (waitMode === WAIT_OFF && pendingFrameTimer !== null) {
+  if (policy.mode === Wait.WAIT_OFF && pendingFrameTimer !== null) {
     cancelPendingFrame();
-    counters.framesNoWait++;
-    showFrame();
+    showFrame(Wait.WHY_OFF);
   }
   waitLabel();
 });
+
+/* ⚠️ Вимикач правила протягу — **без кнопки в панелі**, і це навмисно.
+ *
+ * Критерій 2.3 вимагає сліпого порівняння: людині не кажуть, який режим
+ * увімкнено. Видима кнопка це знання їй і дала б, а спосіб уже показав свою
+ * вартість — саме сліпа пара прогонів у 0019 підтвердила залежність від
+ * швидкості, коли зряче порівняння давало суперечливі відповіді.
+ *
+ * Тому смикає його сценарій із ПК, а стан друкується в панелі «Стан» — знімок
+ * усе одно каже, у якому режимі його знято.
+ */
+window.remoteUiDragRule = function (on) {
+  policy.setDragRule(on);
+  // Лічильники гасяться з тієї ж причини, що й при зміні режиму «чек»:
+  // накопичувальні числа двох режимів в одному прогоні довелося б віднімати в
+  // голові, а порівняння чисел — це половина сенсу вимикача.
+  resetFrameCounters();
+  return policy.dragRule;
+};
 
 const info = document.getElementById('info');
 document.getElementById('btn-info').addEventListener('click', () => {
@@ -892,6 +1065,34 @@ async function pollBridge() {
 
 setInterval(pollBridge, BRIDGE_POLL_MS);
 
+const SOURCE_NAME = {
+  [Wait.SRC_NONE]: 'вводу не було',
+  [Wait.SRC_TOUCH]: 'дотик',
+  [Wait.SRC_ENC]: 'енкодер',
+  [Wait.SRC_KEY]: 'клавіша',
+};
+
+/** Чим щойно керували і яке правило з цього діє — одним рядком. */
+function sourceLabel() {
+  const now = performance.now();
+  const name = SOURCE_NAME[policy.lastSource] || policy.lastSource;
+  if (policy.lastSource === Wait.SRC_NONE) return `${name} → чекаю`;
+
+  const ago = Math.round(now - policy.lastInputAt);
+  const kind = policy.lastSource === Wait.SRC_TOUCH
+    ? (policy.touchDragging ? ' (протяг)' : ' (тик)') : '';
+  const rule = policy.dragging(now)
+    ? `НЕ чекаю (вікно ${Wait.TOUCH_NOWAIT_MS} мс)` : 'чекаю';
+  return `${name}${kind}, ${ago} мс тому → ${rule}`;
+}
+
+function latencyLine(name, source) {
+  const s = latencyStats(source);
+  if (!s) return `  ${name.padEnd(8)} —`;
+  return `  ${name.padEnd(8)} медіана ${Math.round(s.med)}` +
+         `  90% ${Math.round(s.p90)}  макс ${Math.round(s.max)}  (n=${s.n})`;
+}
+
 async function updateInfo() {
   if (info.hidden) return;
 
@@ -909,6 +1110,7 @@ async function updateInfo() {
     `    показано за строком          ${counters.framesTimeout}`,
     `    залишок понад поріг          ${counters.framesTooMany}`,
     `    очікування вимкнене          ${counters.framesNoWait}`,
+    `    палець веде (не чекав)       ${counters.framesDrag}`,
     `    без ознаки повноти           ${counters.framesLegacy}`,
     // ⚠️ Режим — у панелі, а не лише на кнопці: панель і є артефактом доказу
     // за критеріями 3.2 і 4.1, а на знімку кнопки не видно.
@@ -916,12 +1118,28 @@ async function updateInfo() {
     // віддає запасні 45, а на 921600 правильне число 16 — і панель, яка сама
     // і є артефактом доказу, надрукувала б чуже число.
     `  очікування                     ` +
-      `${waitMode === WAIT_OFF ? 'ВИМКНЕНЕ (режим «як було»)'
-        : waitMode === WAIT_LIMIT
-          ? (hello ? `поріг ${P.frameWaitTileLimit(hello.baudCurrent)} плиток`
+      `${policy.mode === Wait.WAIT_OFF ? 'ВИМКНЕНЕ (режим «як було»)'
+        : policy.mode === Wait.WAIT_LIMIT
+          ? (hello ? `поріг ${policy.tileLimit()} плиток`
                    : 'поріг ще невідомий (не було HELLO)')
           : `ЗАВЖДИ (порога немає, стеля ${P.FRAME_WAIT_MAX_MS} мс)`}`,
+    // ⚠️ Джерело вводу — критерій 1.4 задачі 0020, і він не косметичний: без
+    // цього рядка при розборі скарги «знову смикається» не відрізнити
+    // «правило не спрацювало» від «спрацювало не те».
+    `  джерело вводу                  ${sourceLabel()}`,
+    `  правило протягу                ` +
+      `${policy.dragRule ? `увімкнене (вікно ${Wait.TOUCH_NOWAIT_MS} мс, ` +
+                           `поріг ${Wait.TOUCH_DRAG_LIMIT_PX} px)`
+                         : 'ВИМКНЕНЕ (поведінка до задачі 0020)'}`,
     `  REFRESH через втрати на мості  ${counters.autoRefresh}`,
+    '',
+    // ⚠️ Затримка міряється **тут**, а не в tools/input_check.py: той міряє до
+    // дроту, а очікування лежить після дроту (борг 4.2 задачі 0019).
+    'затримка ввід → показаний кадр, мс',
+    latencyLine('дотик', Wait.SRC_TOUCH),
+    latencyLine('енкодер', Wait.SRC_ENC),
+    latencyLine('клавіша', Wait.SRC_KEY),
+    `  відкинуто кадрів «був у дорозі» (< ${LATENCY_FLOOR_MS} мс): ${latency.early}`,
     '',
     'головний потік, мс за секунду',
     `  feed (кадрування+CRC) ${prof.last.feed.toFixed(1)}`,
@@ -996,3 +1214,25 @@ window.addEventListener('resize', fitCanvas);
 window.addEventListener('orientationchange', () => setTimeout(fitCanvas, 200));
 
 connect();
+
+/* --- ниточка для тестів ----------------------------------------------------
+ *
+ * ⚠️ У браузері `module` не існує, тож цей блок там мертвий — рівно як у
+ * `proto.js` і `wait.js`. Потрібен він тому, що цей файл **не був покритий
+ * нічим**, і саме тут жила вада, яку рецензія 0020 знайшла очима: обгортка
+ * гасила таймер, але не низку очікування в автоматі, і запас стелі переживав
+ * розрив.
+ *
+ * Автомат винесено в `wait.js` саме щоб його можна було перевіряти без DOM.
+ * Але обгортка навколо нього — теж код, і теж помиляється; `webui/app_test.js`
+ * підставляє заглушку DOM і перевіряє саме її.
+ */
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    policy, counters, latency, WHY_COUNTER,
+    showFrame, forgetPendingFrame, cancelPendingFrame, resizeTo,
+    noteInput, latencyStats, latencyReset, resetFrameCounters,
+    sourceLabel, updateInfo, onFrameEnd,
+    LATENCY_FLOOR_MS,
+  };
+}

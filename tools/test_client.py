@@ -36,7 +36,6 @@ import tkinter as tk
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from remote_ui_proto import (  # noqa: E402
-    FRAME_WAIT_MAX_MS,
     HELLO_FLAG_ENCODER,
     HELLO_FLAG_INPUT_STATE,
     HELLO_FLAG_TOUCH,
@@ -57,20 +56,28 @@ from remote_ui_proto import (  # noqa: E402
     TOUCH_DOWN,
     TOUCH_MOVE,
     TOUCH_UP,
+    SRC_ENC,
+    SRC_KEY,
+    SRC_TOUCH,
+    WHY_LEGACY,
+    WHY_OFF,
+    WHY_TIMEOUT,
+    WHY_TOO_MANY,
+    WHY_WHOLE,
     Decoder,
+    FrameWaitPolicy,
     InputMirror,
     add_transport_args,
     encode_enc,
     encode_frame,
     encode_key,
     encode_touch,
-    frame_wait_ms,
-    frame_wait_tile_limit,
     hold_packet,
     make_connector,
     parse_frame_end,
     parse_hello,
 )
+import remote_ui_proto as proto
 
 # Поріг, після якого клієнт **сам про себе** каже «я замовк». Копія
 # `BRIDGE_CLIENT_SILENCE_MS` із `firmware/esp32/main/bridge_cfg.h`.
@@ -84,13 +91,49 @@ CLIENT_SILENCE_REPORT_MS = 750.0
 # Як часто друкувати розкид пауз під час прогону.
 GAP_REPORT_PERIOD_S = 30.0
 
-# Режими очікування цілого кадру — ті самі три, що дає кнопка «чек» у браузері
-# (`webui/app.js`). Тримати назви однаковими важливіше за стислість: розбіжність
-# двох клієнтів у політиці показу неможливо помітити інакше, ніж оком.
+# Режими очікування цілого кадру — ті самі три, що дає кнопка «чек» у браузері.
+# Тут вони словами, бо це прапорець командного рядка; сам автомат знає числа.
+#
+# ⚠️ Правила показу з цього файлу **пішли**: вони живуть у `FrameWaitPolicy`
+# (`remote_ui_proto.py`), спільній із `webui/wait.js`. Дві копії правил тут і
+# були тією розбіжністю, яку рецензія 0019 назвала непомітною інакше, ніж оком.
 WAIT_OFF = "off"        # показ на кожному FRAME_END — поведінка до задачі 0019
 WAIT_LIMIT = "limit"    # очікування, поки залишок не більший за поріг
 WAIT_ALWAYS = "always"  # очікування завжди; порога немає, тримає лише стеля
 WAIT_MODES = (WAIT_OFF, WAIT_LIMIT, WAIT_ALWAYS)
+
+WAIT_MODE_NUM = {
+    WAIT_OFF: proto.WAIT_OFF,
+    WAIT_LIMIT: proto.WAIT_LIMIT,
+    WAIT_ALWAYS: proto.WAIT_ALWAYS,
+}
+
+# Причина показу з автомата → ім'я лічильника сесії. ⚠️ Таблицею, а не
+# ланцюжком `if`: нова причина без рядка тут упаде голосно, а не сховається під
+# чужим числом і не поламає рівність «сума причин = кадрів».
+WHY_COUNTER = {
+    WHY_WHOLE: "frames_whole",
+    WHY_TIMEOUT: "frames_timeout",
+    WHY_TOO_MANY: "frames_too_many",
+    WHY_OFF: "frames_no_wait",
+    proto.WHY_DRAG: "frames_drag",
+    WHY_LEGACY: "frames_legacy",
+}
+
+
+def touch_phase(kind: int) -> str:
+    """Подія дотику протоколу → фаза жесту, якою її знає автомат очікування.
+
+    ⚠️ Винесено в окрему функцію саме тому, що це єдине місце, здатне
+    помилитись мовчки: переплутані `down` і `up` не зачепили б ні правил
+    (вони в спільному автоматі), ні перехресної перевірки — і всі набори
+    тестів лишились би зеленими, поки клієнт вважав би тик протягом.
+    """
+    if kind == TOUCH_DOWN:
+        return "down"
+    if kind == TOUCH_UP:
+        return "up"
+    return "move"
 
 
 def wait_label(session) -> str:
@@ -105,8 +148,7 @@ def wait_label(session) -> str:
         return "вимк"
     if session.wait_mode == WAIT_ALWAYS:
         return "завжди"
-    baud = session.hello.get("baud_current") if session.hello else None
-    return f"до {frame_wait_tile_limit(baud)}" if session.hello else "до ?"
+    return f"до {session.policy.tile_limit()}" if session.hello else "до ?"
 
 # --- Пікселі --------------------------------------------------------------
 
@@ -223,8 +265,11 @@ class Session:
         # наближається до розміру сітки в жодному режимі керування (максимуми
         # 83 / 94 / 89 при сітці 135), тож режими не розділяються порогом —
         # будь-який поріг від 100 тотожний `always`, менший ріже гортання.
-        # Виведення повністю — у `webui/app.js` над `waitMode`.
+        # Виведення повністю — у `webui/wait.js`.
         self.wait_mode = wait_mode
+        # ⚠️ Самі правила показу тут більше не лежать. Автомат спільний із
+        # браузером, і `tools/wait_crosscheck.py` падає, щойно вони розійдуться.
+        self.policy = FrameWaitPolicy(mode=WAIT_MODE_NUM[wait_mode])
         # Тестова підміна: викинути біт3 з прийнятого HELLO і тим самим вдати
         # стару прошивку. Підмінюється саме байт на дроті, а не рішення клієнта,
         # тому запасний шлях вибирає той самий код, що й у житті.
@@ -255,8 +300,8 @@ class Session:
         self.frames_timeout = 0  # решта не доїхала за строк
         self.frames_too_many = 0  # чекати не було сенсу: залишок понад поріг
         self.frames_no_wait = 0  # очікування вимкнене прапорцем — режим «як було»
+        self.frames_drag = 0  # палець веде: рух важливіший за шов (задача 0020)
         self.frames_legacy = 0  # прошивка без ознаки повноти
-        self.pending_since = None  # початок поточної низки очікування
         self.pending_until = None  # коли показати неповний кадр як є
         self.logs = 0
         self.hello_at = None  # час останнього HELLO — відповідь на PING
@@ -280,6 +325,8 @@ class Session:
                 payload = bytes(payload)
             hello = parse_hello(payload)
             self.hello = hello
+            # Поріг автомата рахується зі швидкості, а вона міняється на ходу.
+            self.policy.set_baud(hello.get("baud_current"))
             # HELLO приходить на кожен PING, тобто раз на дві секунди. Кадр
             # перестворюється лише коли справді змінився розмір, інакше екран
             # блимав би порожнім двічі на секунду.
@@ -330,74 +377,43 @@ class Session:
     def _frame_end(self, dirty, now=None):
         """FRAME_END прийшов. `dirty` — скільки плиток ще в дорозі, або None.
 
-        Дзеркало правила з `webui/app.js`: цілий кадр показуємо негайно,
-        неповний — чекаємо доїзду решти зі строком. Клієнти не мають права
-        розходитись у тому, що людина бачить на екрані: саме цим вікном знімали
-        доказ розламу (дві рамки виділення в одному кадрі), ним же його й
-        знімають назад.
+        ⚠️ Правил тут немає — усі вони в `FrameWaitPolicy`, спільній із
+        браузерним клієнтом. Два клієнти не мають права розходитись у тому, що
+        людина бачить на екрані: саме цим вікном знімали доказ розламу (дві
+        рамки виділення в одному кадрі), ним же його й знімають назад.
         """
         if now is None:
             now = time.monotonic()
 
         self.frame_ends += 1
 
-        if dirty is None:
-            # Стара прошивка: ознаки повноти немає — поводимось як досі.
-            self.frames += 1
-            self.frames_legacy += 1
-            self.pending_since = None
-            self._show()
+        show, wait_ms, why = self.policy.decide(dirty, now * 1000.0)
+        if show:
+            self._show_counted(why)
             return
 
-        if dirty == 0:
-            self.frames += 1
-            self.frames_whole += 1
-            self.pending_since = None
-            self._show()
-            return
+        self.pending_until = now + wait_ms / 1000.0
 
-        # Очікування вимкнене прапорцем — прилад для порівняння оком, до порога
-        # стосунку не має.
-        if self.wait_mode == WAIT_OFF:
-            self.frames += 1
-            self.frames_no_wait += 1
-            self.pending_since = None
-            self._show()
-            return
+    def note_input(self, source, phase=None, x=0, y=0, now=None):
+        """Клієнт щойно надіслав ввід — автомат має знати, чим керують.
 
-        # Запобіжник: залишок не встигне доїхати раніше, ніж пульт перемалює
-        # кадр наново, тож чекати нема сенсу — те, чого ми чекаємо, застаріє
-        # швидше, ніж прийде. Правило дослівно те саме, що в `webui/app.js`:
-        # два клієнти не мають права показувати різне.
-        baud = self.hello.get("baud_current") if self.hello else None
-        if self.wait_mode == WAIT_LIMIT and dirty > frame_wait_tile_limit(baud):
-            self.frames += 1
-            self.frames_too_many += 1
-            self.pending_since = None
-            self._show()
-            return
+        ⚠️ Періодичний INPUT_STATE сюди не йде: він повторює рівень, а не є
+        новою дією людини.
 
-        # Низка очікування починається з першого неповного кадру, і стеля
-        # рахується від неї — не від кожного FRAME_END окремо (екран замерз би)
-        # і не від останнього показаного кадру (після паузи запас був би вже
-        # вичерпаний, тобто саме на гортанні після зупинки очікування не було б
-        # зовсім).
-        if self.pending_since is None:
-            self.pending_since = now
+        `now` (секунди) підставляється тестами — з тієї ж причини, що й у
+        `handle()`: інакше перевірки правил довелося б писати зі справжніми
+        паузами.
+        """
+        if now is None:
+            now = time.monotonic()
+        self.policy.note_input(source, now * 1000.0, phase=phase, x=x, y=y)
 
-        wait_s = min(
-            frame_wait_ms(dirty),
-            FRAME_WAIT_MAX_MS - (now - self.pending_since) * 1000.0,
-        ) / 1000.0
-
-        if wait_s <= 0:
-            self.frames += 1
-            self.frames_timeout += 1
-            self.pending_since = None
-            self._show()
-            return
-
-        self.pending_until = now + wait_s
+    def _show_counted(self, why):
+        """Показати кадр і порахувати причину. Рівно одна причина на кадр."""
+        self.frames += 1
+        setattr(self, WHY_COUNTER[why], getattr(self, WHY_COUNTER[why]) + 1)
+        self.policy.note_shown()
+        self._show()
 
     def forget_pending(self):
         """Забути відкладений кадр **без показу** — дзеркало `cancelPendingFrame()`.
@@ -408,7 +424,9 @@ class Session:
         пікселями й накрутив би лічильник причини, якої не сталося.
         """
         self.pending_until = None
-        self.pending_since = None
+        # ⚠️ Той самий іменований виклик, що й у браузері
+        # (`forgetPendingFrame`): низка обірвана, запас стелі теж.
+        self.policy.forget()
 
     def _show(self):
         self.last_frame_tiles = self.tiles_in_frame
@@ -425,16 +443,13 @@ class Session:
         """
         # 1. Кадр неповний, і решта плиток не доїхала за строк.
         if self.pending_until is not None and now >= self.pending_until:
-            self.frames += 1
-            self.frames_timeout += 1
-            self.pending_since = None
-            self._show()
+            self._show_counted(WHY_TIMEOUT)
             return
 
         # 2. Плитки прийшли, а FRAME_END так і не прийшов узагалі.
         if self.tiles_in_frame and now - self.last_tile_at > FORCE_SHOW_S:
             self.forced += 1
-            self.pending_since = None
+            self.policy.forget()
             self._show()
 
 
@@ -745,15 +760,18 @@ class Link(threading.Thread):
     def send_key(self, code: int, pressed: bool) -> None:
         self.mirror.key(code, pressed)
         self.send(encode_key(code, pressed), "key")
+        self.session.note_input(SRC_KEY)
 
     def send_touch(self, kind: int, x: int, y: int) -> None:
         self.mirror.touch(kind, x, y)
         self.send(encode_touch(kind, x, y), "touch")
+        self.session.note_input(SRC_TOUCH, phase=touch_phase(kind), x=x, y=y)
 
     def send_enc(self, steps: int) -> None:
         # Енкодера в дзеркалі немає: він накопичувальний, і рівня в нього
         # просто не існує (docs/03-protocol.md, правило 5).
         self.send(encode_enc(steps), "enc")
+        self.session.note_input(SRC_ENC)
 
     def _hold_packet(self, session):
         """Обгортка над спільним `hold_packet()`: гілку вибирає біт3 у HELLO.
@@ -1137,6 +1155,7 @@ class Window:
                 f"цілих {session.frames_whole}  за строком {session.frames_timeout}  "
                 f"понад поріг {session.frames_too_many}  "
                 f"без очікування {session.frames_no_wait}  "
+                f"палець веде {session.frames_drag}  "
                 f"без ознаки {session.frames_legacy}  "
                 f"чек: {wait_label(session)}  "
                 f"без FRAME_END {session.forced}  "
