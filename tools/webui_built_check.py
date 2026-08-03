@@ -72,6 +72,7 @@ Playwright робити проти зібраної сторінки, а не п
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -285,11 +286,19 @@ MEASURE_JS = r"""
       right: look(g('#pad-right-toggle')),
     },
     canvas: box(g('#screen')),
+    // Задача 0025: місце під зображення й вікно, яке в ньому стоїть, поки
+    // кадру немає. `wrap` — сама зарезервована площа, `veil` — напис із
+    // кнопками, тобто те, що бос бачить замість екрана.
+    wrap: box(g('#screen-wrap')),
+    veil: box(g('#veil')),
     keysL: list('#pad-left-body button.key'),
     keysR: list('#pad-right-body button.key'),
     stick: [...document.querySelectorAll('.stick-btn')].map(
         (el) => Object.assign({cls: el.className}, box(el))),
     color: {
+      // Тло під полотном: поки кадру немає, полотно прозоре, і рівність тла
+      // видно саме тут (задача 0025, критерій 1.4).
+      wrap: css(g('#screen-wrap'), 'backgroundColor'),
       padL: css(g('#pad-left'), 'backgroundColor'),
       padR: css(g('#pad-right'), 'backgroundColor'),
       bar: css(bar, 'backgroundColor'),
@@ -1658,6 +1667,239 @@ def check_queue(browser, url, chk):
         a_ctx.close()
 
 
+# --------------------------------------- місце під екран до першого кадру ---
+#
+# ⚠️ Стан «кадру ще немає» відтворюється підміною самого `WebSocket` у вікні, а
+# не глушінням цілі: міст має лишатись живим для інших перевірок, а сторінка
+# має чесно пройти весь свій початок і зупинитись рівно там, де зупиняється в
+# боса, — на очікуванні `HELLO`.
+BLIND_WS = """
+  window.WebSocket = function (url) {
+    this.url = url;
+    this.readyState = 0;
+    this.send = () => {};
+    this.close = () => {};
+  };
+  window.WebSocket.OPEN = 1;
+"""
+
+# Пам'ять про **інший** пульт: квадратний екран, якого в нас на столі немає.
+# ⚠️ Числа описують удаваний чужий пульт, а не наш клієнт: перевіряється саме
+# те, що справжній `HELLO` за них старший.
+OTHER_RADIO = (200, 200)
+
+
+def open_blind(ctx, url):
+    """Вікно, яке до пульта не достукається: місце тримається, кадру немає."""
+    page = ctx.new_page()
+    errors = []
+    page.on("pageerror", lambda e: errors.append(str(e)))
+    page.on("console", lambda m: errors.append(f"console.error: {m.text}")
+            if m.type == "error" else None)
+    page.add_init_script(BLIND_WS)
+    page.goto(url, wait_until="load", timeout=25000)
+    time.sleep(1.0)
+    return page, errors
+
+
+def wait_ready_soft(page):
+    """Дочекатись кадру — але не падати тайм-аутом Playwright.
+
+    ⚠️ За тайм-аутом причини не видно взагалі: чи пульт зайнятий, чи клієнт
+    зламаний. Мутація «пригадане старше за HELLO» провалилась саме так, доки
+    цього не було, — і замість червоної перевірки прогін дав стек.
+    """
+    try:
+        wait_ready(page)
+        return True
+    except Exception:
+        return False
+
+
+def edges(b):
+    return (round(b["l"], 1), round(b["t"], 1), round(b["r"], 1), round(b["b"], 1))
+
+
+def check_reserve(browser, url, chk, viewport, where):
+    """Місце під екран тримається до першого кадру (задача 0025).
+
+    ⚠️ Власний контекст, тобто **порожнє сховище**: перший у житті візит
+    інакше не відтворити — усі попередні перевірки вже щось у ньому лишили.
+
+    ⚠️ Обидві орієнтації, і це не повнота заради повноти: до задачі 0025 гілка
+    `portrait()` у `fitCanvas` до `HELLO` не виконувалась **жодного разу**, а
+    саме в ній рахуються `margin-top` полотна й `margin-bottom` ряду панелей —
+    та сама арифметика, яка в 0023 коштувала окремого кола відгуку. Телефон
+    боса за замовчуванням книжковий.
+    """
+    ctx = browser.new_context(viewport=dict(viewport))
+    errors = []
+    try:
+        # --- 1.2 перший у житті візит ------------------------------------
+        p0, e0 = open_blind(ctx, url)
+        errors += e0
+        first = measure(p0)
+        p0.close()
+
+        # --- ті самі числа, але з пультом --------------------------------
+        p1 = ctx.new_page()
+        p1.on("pageerror", lambda e: errors.append(str(e)))
+        p1.goto(url, wait_until="load", timeout=25000)
+        live_ok = wait_ready_soft(p1)
+        time.sleep(1.0)
+        live = measure(p1)
+        p1.close()
+        why = "" if live_ok else "; кадру в чистому вікні не дочекались"
+
+        # ⚠️ Вісь залежить від орієнтації, і це не причісування: в альбомній
+        # вільне місце — те, що лишили панелі **збоку**, у книжковій — те, що
+        # вони лишили **знизу**. Порівнювати не ту вісь означало б перевіряти
+        # ширину вікна саму по собі.
+        if where == "альбомна":
+            free = first["stage"]["w"] - first["padL"]["w"] - first["padR"]["w"]
+            got = first["canvas"]["w"]
+        else:
+            rows = [first["padL"]["h"], first["padR"]["h"], first["bar"]["h"]]
+            free = first["stage"]["h"] - max(rows)
+            got = first["canvas"]["h"]
+
+        chk(f"1.2 перший візит: панелі мають ту саму ширину, що й з пультом ({where})",
+            live_ok and near(first["padL"]["w"], live["padL"]["w"])
+            and near(first["padR"]["w"], live["padR"]["w"]),
+            f'до {first["padL"]["w"]}/{first["padR"]["w"]}, '
+            f'після {live["padL"]["w"]}/{live["padR"]["w"]}{why}')
+        chk(f"1.2 перший візит: під зображення віддано все вільне місце ({where})",
+            near(got, free) and free > 0,
+            f"зарезервовано {got} з вільних {free}")
+        # ⚠️ Порівнюються **краї**, а не центри. Центр обох областей — це
+        # середина вікна за будь-якої розкладки колонки (панелі рівні за
+        # побудовою), тобто перевірка центрів справджувалась би сама собою:
+        # рецензія коду назвала це прямо.
+        chk(f"1.2 перший візит: вікно очікування накриває зарезервоване місце ({where})",
+            edges(first["veil"]) == edges(first["wrap"]),
+            f'вікно {edges(first["veil"])}, місце {edges(first["wrap"])}')
+
+        # --- 1.1 друге відкриття: розмір пригадується --------------------
+        p2, e2 = open_blind(ctx, url)
+        errors += e2
+        again = measure(p2)
+        # ⚠️ Однорідність береться з самого полотна, а не з вигляду: «рівне
+        # тло» — це коли всі точки однакові, і жодна стара картинка крізь
+        # нього не проступає (критерій 1.4).
+        flat = p2.evaluate("""() => {
+          const c = document.getElementById('screen');
+          const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+          for (let i = 4; i < d.length; i += 4) {
+            if (d[i] !== d[0] || d[i+1] !== d[1] || d[i+2] !== d[2]) return null;
+          }
+          return [d[0], d[1], d[2], d[3]];
+        }""")
+        p2.close()
+
+        chk(f"1.1 друге відкриття: місце під екран те саме, що з пультом ({where})",
+            live_ok and near(again["canvas"]["w"], live["canvas"]["w"])
+            and near(again["canvas"]["h"], live["canvas"]["h"]),
+            f'до з\'єднання {again["canvas"]["w"]}×{again["canvas"]["h"]}, '
+            f'з пультом {live["canvas"]["w"]}×{live["canvas"]["h"]}{why}')
+        # ⚠️ Місце — окремо від розміру, і межа тут **20 px**, а не «краї до
+        # країв». Причина названа числом: пам'ять тримає розмір екрана, але не
+        # вміст панелей — його приносить `HELLO`, і до нього панель порожня,
+        # тобто нижча. У книжковій це зсуває зарезервоване місце на 11 px
+        # угору. Вимагати збігу край у край означало б вимагати пам'яті про
+        # перелік клавіш чужого пульта, а це вже вигадка про нього.
+        #
+        # ⚠️ Перевірка не справджується сама собою: з поверненим раннім
+        # виходом із `fitCanvas` (тобто з тією самою вадою, заради якої задача
+        # існує) центр стояв на 118 замість 450.
+        seat = ((again["canvas"]["l"] + again["canvas"]["r"]) / 2,
+                (again["canvas"]["t"] + again["canvas"]["b"]) / 2)
+        seen = ((live["canvas"]["l"] + live["canvas"]["r"]) / 2,
+                (live["canvas"]["t"] + live["canvas"]["b"]) / 2)
+        chk(f"1.1 друге відкриття: місце стоїть там, де буде екран ({where})",
+            live_ok and near(seat[0], seen[0], 20) and near(seat[1], seen[1], 20),
+            f"вікно на {seat}, екран буде на {seen}{why}")
+        chk(f"1.1 друге відкриття: вікно очікування накриває зарезервоване місце ({where})",
+            edges(again["veil"]) == edges(again["wrap"]),
+            f'вікно {edges(again["veil"])}, місце {edges(again["wrap"])}')
+        # ⚠️ Однорідності полотна тут **замало**, і це знайшов сам прогін:
+        # незаймане полотно віддає `[0, 0, 0, 0]`, тобто прозоре. Видно крізь
+        # нього тло `#screen-wrap`, і саме воно й має бути рівним чорним —
+        # інакше «рівне тло» трималося б на тому, чим браузер заповнює
+        # прозорість.
+        # ⚠️ Колір названий, а не «аби однорідний»: буквально виконана
+        # пропозиція боса «заповнити буфер чорним», де переплутали колір, дала
+        # б однорідний червоний прямокутник — і мовчазно пройшла б.
+        chk(f"1.4 у зарезервованому місці — рівне тло, а не стара картинка ({where})",
+            flat is not None and flat[:3] == [0, 0, 0]
+            and again["color"]["wrap"] == BLACK,
+            f'точки полотна: {flat}, тло під ним {again["color"]["wrap"]}')
+
+        # --- 1.5 пульт із іншим екраном старший за пригадане --------------
+        p3 = ctx.new_page()
+        p3.on("pageerror", lambda e: errors.append(str(e)))
+        p3.add_init_script(
+            f"localStorage.setItem('remoteui.screen.w', '{OTHER_RADIO[0]}');"
+            f"localStorage.setItem('remoteui.screen.h', '{OTHER_RADIO[1]}');")
+        p3.goto(url, wait_until="load", timeout=25000)
+        got_frame = wait_ready_soft(p3)
+        time.sleep(1.0)
+        other = measure(p3)
+        kept = p3.evaluate("""() => {
+          const c = document.getElementById('screen');
+          return {w: +localStorage['remoteui.screen.w'],
+                  h: +localStorage['remoteui.screen.h'],
+                  cw: c.width, ch: c.height};
+        }""")
+        p3.close()
+
+        chk(f"1.5 HELLO старший за пригадане: розкладка під справжній пульт ({where})",
+            got_frame and live_ok and near(other["canvas"]["w"], live["canvas"]["w"])
+            and near(other["canvas"]["h"], live["canvas"]["h"]),
+            f'{other["canvas"]["w"]}×{other["canvas"]["h"]} проти '
+            f'{live["canvas"]["w"]}×{live["canvas"]["h"]} у чистому вікні'
+            + ("" if got_frame else "; кадру так і не дочекались") + why)
+        chk(f"1.5 і пригадане оновилось під нього ({where})",
+            got_frame and kept["w"] == kept["cw"] and kept["h"] == kept["ch"]
+            and (kept["w"], kept["h"]) != OTHER_RADIO,
+            f'у сховищі {kept["w"]}×{kept["h"]}, пульт віддає '
+            f'{kept["cw"]}×{kept["ch"]}')
+
+        chk_no_page_errors(
+            chk, f"сторінка без помилок JS (місце під екран, {where})", errors)
+    finally:
+        ctx.close()
+
+
+def check_no_radio_numbers(chk, built_dir):
+    """Критерій 1.3: у тому, що їде у флеш, немає розміру нашого пульта.
+
+    ⚠️ Дивимось у **зібране**, а не в джерело. У `js` і `css` коментарі там уже
+    зрізані, тож згадка «літерал 480 тут = помилка» за порушення не рахується,
+    а справжнє число — рахується. `index.html` мініфікатор лише копіює
+    (`webui/minify.mjs`), тобто його коментарі теж поїдуть у флеш і теж
+    рахуються — і це правильно, місце вони займають так само.
+
+    ⚠️ Кінець числа стережеться `(?!\\d)`, а не `(?![\\d.])`: у JS `480.0` — те
+    саме число, що `480`, і мініфікатор його не чіпає. З суворішим хвостом
+    головна пастка задачі проходила б повз перевірку, щойно її записали з
+    крапкою. Знайдено рецензією коду, не прогоном.
+    """
+    bad = []
+    for name in sorted(os.listdir(built_dir)):
+        if not name.endswith((".js", ".css", ".html", ".webmanifest")):
+            continue
+        with open(os.path.join(built_dir, name), encoding="utf-8",
+                  errors="replace") as f:
+            text = f.read()
+        # Шістнадцяткові кольори прибираються з тексту заздалегідь: `#a480ff`
+        # містить «480», але про роздільність не каже нічого.
+        text = re.sub(r"#[0-9a-fA-F]{3,8}\b", "", text)
+        for num in ("480", "272"):
+            if re.search(r"(?<![\d.])" + num + r"(?!\d)", text):
+                bad.append(f"{name}: {num}")
+    chk("1.3 у клієнті немає роздільності нашого пульта", not bad, "; ".join(bad))
+
+
 def check_no_fullscreen(browser, url, chk):
     """Критерій 1.5, друга половина: де браузер не вміє, кнопки немає.
 
@@ -1822,6 +2064,11 @@ def run_checks(url, log_path, chk):
             # чужі вікна, що лишились від попередніх перевірок, зробили б її
             # числа неправдою.
             check_queue(br, url, chk)
+            # ⚠️ Одразу за чергою й теж у власному контексті: перевірка
+            # починається з **порожнього** сховища, і чуже вікно, що лишилось
+            # від сусідньої перевірки, забрало б у неї пульт посеред заміру.
+            check_reserve(br, url, chk, LANDSCAPE, "альбомна")
+            check_reserve(br, url, chk, PORTRAIT, "книжкова")
 
             check_default_bar(br, url, chk, LANDSCAPE, "альбомна")
             check_default_bar(br, url, chk, PORTRAIT, "книжкова")
@@ -1890,6 +2137,7 @@ def main():
             print("збираю клієнта для звірки…")
             build(built)
             check_icon_reproducible(chk, built)
+            check_no_radio_numbers(chk, built)
             print(f"перевіряю живу ціль: {args.url}")
             assert_serving_built(args.url, built)
             print("на тому кінці справді наш зібраний клієнт\n")
@@ -1901,6 +2149,7 @@ def main():
             print("збираю клієнта…")
             build(built)
             check_icon_reproducible(chk, built)
+            check_no_radio_numbers(chk, built)
             log_path = os.path.join(tmp, "input.jsonl")
             print("піднімаю стенд без заліза (двійник пульта + віддача зібраного)…")
 

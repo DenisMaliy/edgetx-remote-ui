@@ -34,7 +34,14 @@ function check(cond, msg) {
 // Рівно стільки DOM, скільки чіпає `app.js`. Свідомо тупа: якщо клієнт почне
 // вимагати більше, тест упаде голосно, а не мовчки перевірятиме порожнечу.
 
-function makeApp() {
+/**
+ * Свіжий примірник клієнта на заглушці DOM.
+ *
+ * @param keep сховище з попереднього примірника — тобто «та сама людина
+ *        відкрила сторінку вдруге». Без нього сховище порожнє: перший у
+ *        житті візит (задача 0025).
+ */
+function makeApp(keep) {
   const els = {};
   const el = (id) => {
     if (!els[id]) {
@@ -42,6 +49,11 @@ function makeApp() {
         id, hidden: false, textContent: '', innerHTML: '', title: '',
         className: '', dataset: {}, style: {}, value: '', type: '',
         width: 16, height: 9, clientWidth: 800, clientHeight: 500,
+        // ⚠️ Панелі мають ненульовий розмір: `fitCanvas` читає саме
+        // `offsetWidth`/`offsetHeight`, і без них уся її арифметика — `NaN`.
+        // Доти це нікому не заважало (вона виходила одразу, поки немає
+        // розміру екрана), а від задачі 0025 вона працює й до `HELLO`.
+        offsetWidth: 110, offsetHeight: 44,
         classList: { add() {}, remove() {}, toggle() {} },
         contains: () => false,
         focus() {},
@@ -57,7 +69,7 @@ function makeApp() {
     return els[id];
   };
 
-  const store = new Map();
+  const store = keep || new Map();
 
   const g = {
     document: { getElementById: el, createElement: () => el('_tmp'),
@@ -389,6 +401,73 @@ console.log('черга: витіснений чекає, а не вертаєт
   check(!/resume=1/.test(urls[urls.length - 1]),
         'і не прикидається поверненням свого');
   check(queueState().queued === false, 'із черги вийшли');
+}
+
+// ------------------------- 9. місце під екран до першого кадру -------------
+//
+// ⚠️ Перевіряється обчислення, а не стилі. Стилі тут однаково нічого не
+// доводять — заглушка DOM віддає ті самі числа всім елементам, — а розкладка
+// стоїть або падає саме на цих числах: скільки місця під зображення й звідки
+// воно взялось. Геометрію живої сторінки міряє `tools/webui_built_check.py`.
+
+console.log('місце під екран тримається до першого кадру (задача 0025)');
+{
+  const ctx = makeApp();
+  const { screenBox, knownSize, resizeTo } = ctx.app;
+
+  check(knownSize().w === 0 && knownSize().h === 0,
+        'перший у житті візит: пульта ще не бачили');
+
+  // ⚠️ Пропорція не вигадується: беремо все вільне місце. Вигадана виглядала
+  // б як правда — і на чужому пульті була б неправдою (критерій 1.3).
+  const first = screenBox(600, 300);
+  check(first.w === 600 && first.h === 300,
+        `без пригаданого — усе вільне місце: ${first.w}×${first.h}`);
+
+  // Пульт привітався. Тепер розмір справжній, і він же лягає в сховище.
+  resizeTo(320, 240);
+  const live = screenBox(600, 300);
+  check(live.w === 400 && live.h === 300,
+        `з HELLO працює пропорція пульта: ${live.w}×${live.h}`);
+  check(ctx.g.__store.get('remoteui.screen.w') === '320'
+        && ctx.g.__store.get('remoteui.screen.h') === '240',
+        'розмір записано в сховище');
+
+  // Друге відкриття сторінки: те саме сховище, з'єднання ще немає.
+  const again = makeApp(ctx.g.__store);
+  check(again.app.knownSize().w === 320 && again.app.knownSize().h === 240,
+        'розмір пригадано з минулого сеансу');
+  const before = again.app.screenBox(600, 300);
+  check(before.w === live.w && before.h === live.h,
+        `до з'єднання місце те саме, що після: ${before.w}×${before.h} `
+        + `проти ${live.w}×${live.h}`);
+
+  // ⚠️ Пригадане — не істина, а здогад про **той самий** пульт. Прийшов
+  // HELLO з іншими числами — старшим є він (критерій 1.5).
+  again.app.resizeTo(128, 72);
+  const other = again.app.screenBox(600, 300);
+  check(other.w === 533 && other.h === 300,
+        `інший пульт перебудував розкладку під себе: ${other.w}×${other.h}`);
+  check(again.g.__store.get('remoteui.screen.w') === '128'
+        && again.g.__store.get('remoteui.screen.h') === '72',
+        'і пригадане оновилось під нього');
+}
+
+/* ⚠️ Сміття у сховищі — не вигадка про зловмисника, а вада, яку знайшла
+ * рецензія коду й заміряла на живій сторінці: `parseInt` брав префікс, і
+ * «999999999999» давало колонку на 33 мільйони пікселів — чорна порожнеча без
+ * панелей і без напису. Найгірше, що з неї **не було виходу**: значення
+ * лишається у сховищі, і кожне наступне відкриття дає те саме, доки не
+ * почистити дані сайту. На телефоні наосліп цього не роблять. */
+console.log('сміття у сховищі не ламає розкладки (рецензія 0025)');
+for (const [w, h] of [['999999999999', '1'], ['12abc', '9'], ['-480', '272'],
+                      ['480.5', '272'], ['', ''], ['0', '0']]) {
+  const store = new Map([['remoteui.screen.w', w], ['remoteui.screen.h', h]]);
+  const ctx = makeApp(store);
+  const box = ctx.app.screenBox(600, 300);
+  check(ctx.app.knownSize().w === 0 && ctx.app.knownSize().h === 0
+        && box.w === 600 && box.h === 300,
+        `«${w}»×«${h}» не пригадується: ${box.w}×${box.h}`);
 }
 
 // ----------------------------------------------------------------------------
