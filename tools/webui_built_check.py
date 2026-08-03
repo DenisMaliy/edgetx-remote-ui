@@ -222,6 +222,12 @@ def assert_serving_built(url, built_dir):
 LANDSCAPE = {"width": 900, "height": 420}
 PORTRAIT = {"width": 420, "height": 860}
 
+# `--gap` зі `style.css` — те саме «мінімально» з критеріїв 7.4 і 8.4. ⚠️ Число
+# тут не незалежне: воно повторює сталу оформлення, і при її зміні цей рядок
+# треба міняти разом із нею. Заводити його змінною CSS і читати з живої
+# сторінки означало б перевіряти сторінку нею ж самою.
+GAP = 4
+
 # Кольори з `webui/style.css`, записані так, як їх вертає `getComputedStyle`.
 NEON = "rgb(255, 125, 26)"
 WIDE_BG = "rgb(194, 98, 15)"
@@ -236,6 +242,13 @@ MEASURE_JS = r"""
     return {w: b.width, h: b.height, l: b.left, r: b.right, t: b.top, b: b.bottom};
   };
   const css = (el, prop) => el ? getComputedStyle(el)[prop] : null;
+  // «Однаковий вигляд» із критерію 8.2 — це перелік чисел, а не враження.
+  const look = (el) => {
+    if (!el) return null;
+    const s = getComputedStyle(el);
+    return {bg: s.backgroundColor, color: s.color, radius: s.borderRadius,
+            font: s.fontSize + '/' + s.fontFamily};
+  };
   const list = (sel) => [...document.querySelectorAll(sel)].map((el) => Object.assign(
       {label: el.textContent.trim(), wide: el.classList.contains('key-wide')}, box(el)));
   const bar = g('#bar');
@@ -248,12 +261,25 @@ MEASURE_JS = r"""
     stage: box(g('#stage')),
     bar: box(bar),
     barCollapsed: bar.classList.contains('collapsed'),
+    padsCollapsed: {
+      l: g('#pad-left').classList.contains('collapsed'),
+      r: g('#pad-right').classList.contains('collapsed'),
+    },
     padL: box(g('#pad-left')),
     padR: box(g('#pad-right')),
     rail: box(g('#pad-left .pad-rail')),
     bodyL: box(g('#pad-left-body')),
     padToggle: box(g('#pad-left-toggle')),
     barToggle: box(g('#bar-toggle-left')),
+    // Розділ 8: ряд ручок згортання міряється цілком, а не з одного боку.
+    padToggleR: box(g('#pad-right-toggle')),
+    railR: box(g('#pad-right .pad-rail')),
+    barToggleR: box(g('#bar-toggle-right')),
+    look: {
+      left: look(g('#pad-left-toggle')),
+      mid: look(g('.bar-own-toggle')),
+      right: look(g('#pad-right-toggle')),
+    },
     canvas: box(g('#screen')),
     keysL: list('#pad-left-body button.key'),
     keysR: list('#pad-right-body button.key'),
@@ -324,6 +350,24 @@ def set_bar(page, collapsed):
     if measure(page)["barCollapsed"] != collapsed:
         page.click(bar_toggle(page))
         time.sleep(0.35)
+
+
+def set_pad(page, side, collapsed):
+    """Одна бічна панель у потрібний стан, не більш ніж одним клацом.
+
+    ⚠️ Стан читається, а не припускається: клієнт пам'ятає його між
+    завантаженнями (`localStorage`, задача 0022), тож «клацнути двічі, щоб
+    напевно» дало б рівно протилежне тому, що потрібно.
+    """
+    if measure(page)["padsCollapsed"][side[0]] != collapsed:
+        page.click(f"#pad-{side}-toggle")
+        time.sleep(0.35)
+
+
+def set_pads(page, collapsed):
+    """Обидві бічні панелі в один і той самий стан."""
+    for side in ("left", "right"):
+        set_pad(page, side, collapsed)
 
 
 def gaps(keys):
@@ -553,10 +597,15 @@ def check_default_bar(browser, url, chk, viewport, where):
             # мутація «показати згорнуту смужку цілком» лишалась зеленою.
             # Тому міряється те, що справді стверджується: у згорнутій видно
             # **саму ручку й нічого більше**.
+            # ⚠️ Допуск тут — рівно два пікселі на округлення, і не більше.
+            # Доти стояло `own_h + 2 * 4 + 2`, де вісімка була вертикальними
+            # полями ручки; розділ 8 їх прибрав (`margin: 0 …`), і десять
+            # пікселів мертвого запасу тихо лишились: смужка з `padding: 8px`
+            # проходила б зеленою.
             own_h = m["barOwn"]["h"] if m["barOwn"] else 0
             chk("1.1 у згорнутій смужці видно саму ручку (книжкова)",
                 not m["barRowVisible"] and own_h > 0
-                and m["bar"]["h"] <= own_h + 2 * 4 + 2,
+                and m["bar"]["h"] <= own_h + 2,
                 f"смужка {round(m['bar']['h'])} px, ручка {round(own_h)} px, "
                 f"чипи видно: {m['barRowVisible']}")
 
@@ -660,9 +709,13 @@ def check_landscape(page, chk):
     ratio = m["padToggle"]["h"] / m["barToggle"]["h"] if m["barToggle"]["h"] else 0
     chk("2.6 ручка смужки — чверть висоти ручки панелі", near(ratio, 3, 0.15),
         f"панель {round(m['padToggle']['h'], 1)}, смужка {round(m['barToggle']['h'], 1)}")
+    # ⚠️ `+ GAP` тут з'явився разом із критерієм 8.4: між частинами бруска
+    # тепер мінімальний відступ, інакше межу між ними видно лише в мить
+    # натискання. Сума частин через це на чотири пікселі менша за брусок, і
+    # перевірка про це знає — а не тримається на послабленому допуску.
     chk("2.6 обидві частини заповнюють ручку",
-        near(m["padToggle"]["h"] + m["barToggle"]["h"], m["rail"]["h"], 2),
-        f"сума {round(m['padToggle']['h'] + m['barToggle']['h'], 1)}, "
+        near(m["padToggle"]["h"] + m["barToggle"]["h"] + GAP, m["rail"]["h"], 2),
+        f"сума {round(m['padToggle']['h'] + m['barToggle']['h'], 1)} + проміжок {GAP}, "
         f"ручка {round(m['rail']['h'], 1)}")
 
 
@@ -703,9 +756,22 @@ def check_portrait(page, chk):
     """Розділ 3 — книжкова орієнтація."""
     m = check_height_back(page, chk, "книжкова")
 
-    # 3.1 — упритул до зображення, вільне місце над ним.
-    chk("3.1 панель упритул до зображення знизу", near(m["padL"]["t"], m["canvas"]["b"]),
-        f"проміжок {round(m['padL']['t'] - m['canvas']['b'], 1)} px")
+    # 3.1 у редакції критерію 8.1.
+    #
+    # ⚠️ «Упритул» більше **не правило, а наслідок**: панель тіснить зображення
+    # рівно тоді, коли їй бракує місця. Тому безумовне «упритул завжди» тут
+    # стояти не може — і не тому, що ослабло, а тому, що воно неправда: варто
+    # чужому пульту віддати в `HELLO` на одну клавішу менше, і панелі
+    # перестануть діставати до центру. Стверджується сама диз'юнкція: або по
+    # центру сцени, або низом упритул до панелі, третього стану немає.
+    want = (m["stage"]["h"] - m["canvas"]["h"]) / 2
+    top = m["canvas"]["t"] - m["stage"]["t"]
+    centered = near(top, want, 2)
+    squeezed = near(m["canvas"]["b"], m["padL"]["t"], 1.5) and top <= want + 2
+    chk("3.1 зображення або по центру, або впритул до панелі — третього немає",
+        centered or squeezed,
+        f"згори {round(top, 1)} px при центрі {round(want, 1)}, "
+        f"до панелі {round(m['padL']['t'] - m['canvas']['b'], 1)} px")
     chk("3.1 над зображенням лишається вільне місце",
         m["canvas"]["t"] > m["stage"]["t"] + 1,
         f"{round(m['canvas']['t'] - m['stage']['t'], 1)} px")
@@ -733,6 +799,164 @@ def check_portrait(page, chk):
         f"{round(m['padR']['w'], 1)} = {round(total, 1)} при {m['win']['w']}")
     chk("3.5 смужка стоїть між панелями",
         near(m["bar"]["l"], m["padL"]["r"]) and near(m["bar"]["r"], m["padR"]["l"]))
+
+
+def check_portrait_centering(page, chk):
+    """Критерій 8.1 — у книжковій зображення стоїть по центру вікна.
+
+    ⚠️ Це не нова вимога, а **невиконаний критерій 3.1**: доказом його
+    виконання були числа з альбомної орієнтації, де правило й так працювало.
+    Тому вирішальний стан тут — **усі панелі згорнуті**. Доки вони розгорнуті,
+    місця й справді бракує, зображення тісниться вгору — і «по центру» від
+    «притиснуте до панелей» не відрізнити жодним числом.
+    """
+    set_bar(page, True)
+    set_pads(page, True)
+    time.sleep(0.4)
+    m = measure(page)
+
+    # ⚠️ Спершу — що сцена й вікно це одне й те саме. Без цього рядка відступ,
+    # який з'явився б у `body` (а на iPhone `safe-area-inset-top` не нуль),
+    # мовчки поглинувся б різницею між ними, і «по центру вікна» насправді
+    # означало б «по центру сцени».
+    chk("8.1 сцена займає все вікно",
+        near(m["stage"]["t"], 0) and near(m["stage"]["h"], m["win"]["h"], 2),
+        f"сцена {round(m['stage']['t'], 1)}…{round(m['stage']['b'], 1)} "
+        f"при вікні {m['win']['h']}")
+
+    top = round(m["canvas"]["t"], 1)
+    bottom = round(m["win"]["h"] - m["canvas"]["b"], 1)
+    chk("8.1 усі панелі згорнуті — відступи згори й знизу рівні",
+        near(top, bottom, 2) and top > 1,
+        f"згори {top} px, знизу {bottom} px")
+
+    # ⚠️ Незалежне твердження, а не переказ попереднього: рівні відступи
+    # кажуть, що картинка **симетрична**, і мовчать про те, чи вона відліпилась
+    # від панелей. Стара вада давала рівно це — картинка внизу, — і при
+    # згорнутих панелях відступи в неї теж могли б зійтись, якби ряд панелей
+    # був вищий. Тут стверджується сам відрив.
+    chk("8.1 згорнута панель зображення більше не тримає",
+        m["padL"]["t"] - m["canvas"]["b"] > 1,
+        f"проміжок до панелі {round(m['padL']['t'] - m['canvas']['b'], 1)} px")
+
+    # Друга половина правила: посунути зображення має право **лише** панель,
+    # якій бракує місця.
+    #
+    # ⚠️ Вікно тут навмисно нижче за звичайне. При 860 місця бракує лише на
+    # 29 пікселів — тобто перевірка міряла б не правило, а те, скільки клавіш
+    # віддав `HELLO` двійника: чужий пульт із коротшою панеллю зробив би її
+    # червоною на цілком справному коді. При 620 бракує на півтори сотні.
+    page.set_viewport_size({"width": 420, "height": 620})
+    set_pads(page, False)
+    time.sleep(0.5)
+    m = measure(page)
+    mid = (m["canvas"]["t"] + m["canvas"]["b"]) / 2
+    chk("8.1 розгорнута панель тіснить зображення вгору",
+        mid < m["win"]["h"] / 2 - 2 and near(m["canvas"]["b"], m["padL"]["t"]),
+        f"центр картинки {round(mid, 1)} проти {m['win']['h'] / 2}, "
+        f"проміжок до панелі {round(m['padL']['t'] - m['canvas']['b'], 1)} px")
+    page.set_viewport_size(dict(PORTRAIT))
+    time.sleep(0.4)
+
+
+def check_toggle_row(page, chk):
+    """Критерії 8.2–8.4 у книжковій — ряд із трьох ручок згортання.
+
+    ⚠️ Кожне число знімається **тричі**: обидві згорнуті, обидві розгорнуті і
+    **одна згорнута, друга ні**. Перші два стани — сама скарга боса: ручка
+    згорнутої панелі всихала до ширини власної стрілки рівно тоді, коли по ній
+    треба влучити, щоб панель повернути. Третій — найризикованіший для «в один
+    ряд»: висоту ряду задає розгорнута сусідка, а брусок згорнутої мусить
+    лишитись угорі, а не поїхати за нею.
+    """
+    widths = {}
+    for state, left, right, bar in (("згорнуті", True, True, True),
+                                    ("розгорнуті", False, False, False),
+                                    ("одна згорнута", True, False, True)):
+        set_bar(page, bar)
+        set_pad(page, "left", left)
+        set_pad(page, "right", right)
+        time.sleep(0.4)
+        m = measure(page)
+        trio = [("ліва", m["padToggle"], m["padL"]),
+                ("смужка", m["barOwn"], m["bar"]),
+                ("права", m["padToggleR"], m["padR"])]
+
+        # ⚠️ 8.2 виконується з точністю до видимої межі з 8.4, і це названо
+        # вголос: панелі стоять упритул одна до одної (критерій 3.5), тож
+        # проміжок між ручками може взятися лише з їхньої ж ширини. «Ширина
+        # ручки = ширина панелі» і «між ручками є відступ» разом буквально
+        # нездійсненні — вибрано видиму межу ціною чотирьох пікселів.
+        bad = [f"{name}: ручка {round(t['w'], 1)}, панель {round(p['w'], 1)}"
+               for name, t, p in trio if not near(t["w"] + GAP, p["w"], 1.5)]
+        chk(f"8.2 кожна ручка завширшки зі свою панель ({state})", not bad,
+            "; ".join(bad) if bad else
+            f"ручки {[round(t['w']) for _, t, _ in trio]} при панелях "
+            f"{[round(p['w']) for _, _, p in trio]}")
+
+        tops = [round(t["t"], 1) for _, t, _ in trio]
+        heights = [round(t["h"], 1) for _, t, _ in trio]
+        chk(f"8.2 три ручки стоять в один ряд ({state})",
+            max(tops) - min(tops) <= 1.5 and max(heights) - min(heights) <= 1.5,
+            f"верх {tops}, висота {heights}")
+
+        between = [round(m["barOwn"]["l"] - m["padToggle"]["r"], 1),
+                   round(m["padToggleR"]["l"] - m["barOwn"]["r"], 1)]
+        chk(f"8.4 між ручками мінімальний відступ ({state})",
+            all(0 < g <= 8 for g in between), f"{between} px")
+
+        widths[state] = [round(t["w"], 1) for _, t, _ in trio]
+
+    chk("8.3 ширина ручок не залежить від того, згорнута панель",
+        len({tuple(v) for v in widths.values()}) == 1,
+        "; ".join(f"{k}: {v}" for k, v in widths.items()))
+
+    look = measure(page)["look"]
+    chk("8.2 три ручки мають однаковий вигляд",
+        look["left"] == look["mid"] == look["right"],
+        f"ліва {look['left']}, смужка {look['mid']}, права {look['right']}")
+
+    # ⚠️ Стан повертаємо самі, а не покладаємось на те, що ця перевірка
+    # остання: «останньою» вона лишається рівно до наступної правки прогону.
+    set_pads(page, False)
+    set_bar(page, True)
+
+
+def check_toggle_row_landscape(page, chk):
+    """Критерії 8.3 і 8.4 в альбомній.
+
+    ⚠️ Ряду з трьох тут немає **за задумом**: власної ручки смужка в альбомній
+    не має (критерій 2.6), а бічні поділені по висоті на панель і смужку. Тому
+    міряється те, що в цій орієнтації взагалі має сенс, — видима межа між
+    частинами бруска (8.4 прямо каже «в обох орієнтаціях») і незмінна ширина
+    ручки при згортанні панелі (8.3).
+    """
+    widths = {}
+    for state, collapsed in (("згорнуті", True), ("розгорнуті", False)):
+        set_pads(page, collapsed)
+        time.sleep(0.4)
+        m = measure(page)
+        between = [round(m["barToggle"]["t"] - m["padToggle"]["b"], 1),
+                   round(m["barToggleR"]["t"] - m["padToggleR"]["b"], 1)]
+        chk(f"8.4 між частинами ручки мінімальний відступ (альбомна, {state})",
+            all(0 < g <= 8 for g in between), f"{between} px")
+        # ⚠️ Тут ручка дорівнює бруску **побудовою flexbox** (розтяг у
+        # колонковій смузі), тож сама по собі рівність нічого не доводить —
+        # і обіцяти доказ було б неправдою. Перевірка ловить інше й одне:
+        # витік бічних полів ручки з `@media (orientation: portrait)` в
+        # альбомну, де сусідів по горизонталі немає й межу відбирати нема в
+        # кого. Мутація «прибрати `@media` в правила полів» валить саме її.
+        chk(f"8.2 ручка завширшки з брусок панелі (альбомна, {state})",
+            near(m["padToggle"]["w"], m["rail"]["w"], 1.5)
+            and near(m["padToggleR"]["w"], m["railR"]["w"], 1.5),
+            f"ручки {round(m['padToggle']['w'], 1)}/{round(m['padToggleR']['w'], 1)}, "
+            f"бруски {round(m['rail']['w'], 1)}/{round(m['railR']['w'], 1)}")
+        widths[state] = (round(m["padToggle"]["w"], 1), round(m["padToggleR"]["w"], 1))
+
+    chk("8.3 ширина ручок не залежить від стану панелі (альбомна)",
+        widths["згорнуті"] == widths["розгорнуті"],
+        f"згорнуті {widths['згорнуті']}, розгорнуті {widths['розгорнуті']}")
+    set_pads(page, False)
 
 
 def check_look_7(page, chk, where):
@@ -786,8 +1010,11 @@ def check_look_7(page, chk, where):
 
         # 7.3 — ручка панелі більше не ділиться: вона займає весь бічний брусок.
         m = measure(page)
+        # ⚠️ По ширині ручка менша за брусок рівно на видиму межу з критерію
+        # 8.4 — і це записано числом, а не послабленим допуском. Сам критерій
+        # 7.3 про **висоту**: «чверті в неї більше не забирають».
         chk("7.3 ручка бічної панелі ціла, чверті в неї не забирають",
-            near(m["padToggle"]["w"], m["rail"]["w"], 2)
+            near(m["padToggle"]["w"] + GAP, m["rail"]["w"], 1.5)
             and near(m["padToggle"]["h"], m["rail"]["h"], 2),
             f"ручка {round(m['padToggle']['w'])}×{round(m['padToggle']['h'])}, "
             f"брусок {round(m['rail']['w'])}×{round(m['rail']['h'])}")
@@ -1109,12 +1336,21 @@ def run_checks(url, log_path, chk):
             check_colors(page, chk, "альбомна")
             check_look_7(page, chk, "альбомна")
             check_centering(page, chk)
+            check_toggle_row_landscape(page, chk)
 
             page.set_viewport_size(dict(PORTRAIT))
             time.sleep(0.5)
             check_portrait(page, chk)
             check_colors(page, chk, "книжкова")
             check_look_7(page, chk, "книжкова")
+            # ⚠️ Розділ 8 згортає **всі** панелі й міняє висоту вікна, тобто
+            # лишає по собі стан, якого решта перевірок не чекає. Тримається це
+            # не порядком, а тим, що кожна його частина повертає стан сама
+            # (`set_pads(page, False)`, повернення вікна в `PORTRAIT`) — саме
+            # тому альбомна частина може стояти всередині прогону. Книжкова
+            # йде останньою просто тому, що вона тут остання за орієнтацією.
+            check_portrait_centering(page, chk)
+            check_toggle_row(page, chk)
 
             chk("сторінка без помилок JS (у кінці)", not errors, "; ".join(errors[:3]))
         finally:

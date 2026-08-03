@@ -339,15 +339,39 @@ function fitCanvas() {
   if (!stage || !padL || !padR) return;
 
   if (portrait()) {
-    // Книжкова: зображення на всю ширину ряду, панелі під ним. Зсувати нічого
-    // не треба — упритул тут дає сам ряд сітки, а CSS притискає картинку вниз.
+    // Книжкова: зображення на всю ширину ряду, панелі під ним. По ширині
+    // зсувати нічого не треба — упритул тут дає сам ряд сітки.
     setStyle(padL, 'marginLeft', '');
     setStyle(wrap, 'width', '');
-    const k = Math.max(0.1, Math.min(wrap.clientWidth / W, wrap.clientHeight / H));
-    setStyle(canvas, 'width', Math.floor(W * k) + 'px');
-    setStyle(canvas, 'height', Math.floor(H * k) + 'px');
+
+    // ⚠️ Те саме правило, що в альбомній, лише вісь інша (критерій 8.1, він же
+    // невиконаний 3.1): бажане — картинка по центру **вікна**, дозволене — не
+    // залізти на панелі. Раніше тут стояло `align-items: flex-end` у CSS, і
+    // зображення падало вниз, щойно панелі згортали: воно притискалось до
+    // панелей, а не стояло по центру. Різниця видна саме в згорнутому стані,
+    // бо в розгорнутому панелі й так з'їдають увесь надлишок.
+    const availW = wrap.clientWidth;
+    const availH = wrap.clientHeight;
+    const k = Math.max(0.1, Math.min(availW / W, availH / H));
+    const iw = Math.floor(W * k);
+    const ih = Math.floor(H * k);
+    setStyle(canvas, 'width', iw + 'px');
+    setStyle(canvas, 'height', ih + 'px');
+
+    // ⚠️ `want` рахується від висоти **сцени**, `room` — від висоти ряду над
+    // панелями. Два різні числа: перше каже, де центр вікна, друге — скільки
+    // місця лишили панелі. Панель тіснить зображення рівно тоді, коли друге
+    // менше за перше.
+    const want = Math.round((stage.clientHeight - ih) / 2);
+    const room = availH - ih;
+    setStyle(canvas, 'marginTop', Math.max(0, Math.min(want, room)) + 'px');
     return;
   }
+
+  // Альбомна зсуває картинку по горизонталі, тож вертикальний зсув книжкової
+  // треба зняти: телефон повертають у руках, і стилі лишаються від попередньої
+  // орієнтації.
+  setStyle(canvas, 'marginTop', '');
 
   // ⚠️ Ширини панелей читаються **до** того, як ми чіпаємо колонку екрана, і
   // тримається це не на самому лише `--key-w`, а на `min-width: max-content`
