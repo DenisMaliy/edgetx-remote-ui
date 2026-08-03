@@ -40,7 +40,7 @@ Playwright робити проти зібраної сторінки, а не п
 
 **Шар другий — вигляд і розкладка (задача 0023), у двох орієнтаціях:**
 
-* смужка стану згорнута **за замовчуванням** і не займає нічого;
+* смужка стану згорнута **за замовчуванням** і не займає власного ряду;
 * панелі однакові, стоять упритул до зображення, зображення по центру;
 * подвійні відступи, ширина кнопок джойстика, чверть ручки під смужку;
 * книжкова: одна колонка, три панелі в сумі дорівнюють ширині вікна;
@@ -251,6 +251,7 @@ MEASURE_JS = r"""
     padL: box(g('#pad-left')),
     padR: box(g('#pad-right')),
     rail: box(g('#pad-left .pad-rail')),
+    bodyL: box(g('#pad-left-body')),
     padToggle: box(g('#pad-left-toggle')),
     barToggle: box(g('#bar-toggle-left')),
     canvas: box(g('#screen')),
@@ -269,6 +270,24 @@ MEASURE_JS = r"""
       stickText: css(g('.stick-btn'), 'color'),
     },
     hasFullscreenButton: !!g('#btn-full'),
+    // Розділ 7. `barOwnVisible` — власна ручка смужки, яка є лише в книжковій.
+    barOwn: box(g('.bar-own-toggle')),
+    barRowVisible: (() => {
+      const el = g('#bar-row');
+      return !!(el && el.getClientRects().length);
+    })(),
+    barOwnVisible: (() => {
+      const el = g('.bar-own-toggle');
+      return !!(el && el.getClientRects().length);
+    })(),
+    railBarToggleVisible: (() => {
+      const el = g('#bar-toggle-left');
+      return !!(el && el.getClientRects().length);
+    })(),
+    focusRing: css(g('#screen-wrap'), 'boxShadow'),
+    focusOutline: css(g('#screen-wrap'), 'outlineStyle'),
+    focusChip: (g('#focus') || {}).textContent || '',
+    focused: document.activeElement === g('#screen-wrap'),
     chipsSeen: {
       heap: seen('heap'), fps: seen('fps'), focus: seen('focus'),
       baud: seen('baud-wrap'),
@@ -286,10 +305,24 @@ def near(a, b, eps=1.5):
     return abs(a - b) <= eps
 
 
+def bar_toggle(page):
+    """Ручка смужки, **видима зараз**.
+
+    ⚠️ Їх три, і видимі різні: в альбомній — дві бічні (чверть від ручок
+    панелей, критерій 2.6), у книжковій — власна ручка смужки (критерій 7.2).
+    Клацати по схованій не можна: Playwright чекав би її появи до тайм-ауту.
+    """
+    for sel in ("#bar-toggle-mid", "#bar-toggle-left", "#bar-toggle-right"):
+        el = page.query_selector(sel)
+        if el and el.is_visible():
+            return sel
+    raise AssertionError("жодної видимої ручки смужки стану немає")
+
+
 def set_bar(page, collapsed):
     """Згорнути або розгорнути смужку стану — рівно одним торканням ручки."""
     if measure(page)["barCollapsed"] != collapsed:
-        page.click("#bar-toggle-left")
+        page.click(bar_toggle(page))
         time.sleep(0.35)
 
 
@@ -409,7 +442,7 @@ def check_heap_watchdog(browser, url, chk):
         # ⚠️ Друга половина правила, і без неї перша шкідлива: смужку, яку
         # відчиняють щосекунди, закрити неможливо саме тоді, коли людина
         # дивиться на пульт.
-        page.click("#bar-toggle-left")
+        page.click(bar_toggle(page))
         for _ in range(6):
             page.wait_for_timeout(500)
         chk("сторож: відчиняється раз на подію, а не щосекунди",
@@ -451,7 +484,7 @@ def check_heap_watchdog(browser, url, chk):
         # мутаційний прогін показав, що прибрати його можна, і всі перевірки
         # лишаються зеленими. У житті нескинутий лічильник повз би вгору за
         # години роботи на хиткому Wi-Fi і тихо повернув би ваду з блиманням.
-        page.click("#bar-toggle-left")
+        page.click(bar_toggle(page))
         page.wait_for_timeout(500)
         page.unroute("**/api/stats")
         page.route("**/api/stats", lambda r: r.abort())
@@ -508,8 +541,24 @@ def check_default_bar(browser, url, chk, viewport, where):
     try:
         m = measure(page)
         chk(f"1.1 смужка згорнута за замовчуванням ({where})", m["barCollapsed"])
-        chk(f"1.1 згорнута смужка не має висоти ({where})", near(m["bar"]["h"], 0),
-            f"висота {m['bar']['h']} px")
+        if where == "альбомна":
+            chk("1.1 згорнута смужка не має висоти (альбомна)",
+                near(m["bar"]["h"], 0), f"висота {m['bar']['h']} px")
+        else:
+            # ⚠️ У книжковій згорнута смужка **не нульова**: у ній лишається
+            # власна ручка (критерій 7.2). Але ряду вона не додає — стоїть у
+            # тому самому, що й панелі, і нижча за них. Саме це й міряється:
+            # «не займає окремого ряду», а не «дорівнює нулю».
+            # ⚠️ Порівняння з висотою панелі — заслабке: запас там 287 px, і
+            # мутація «показати згорнуту смужку цілком» лишалась зеленою.
+            # Тому міряється те, що справді стверджується: у згорнутій видно
+            # **саму ручку й нічого більше**.
+            own_h = m["barOwn"]["h"] if m["barOwn"] else 0
+            chk("1.1 у згорнутій смужці видно саму ручку (книжкова)",
+                not m["barRowVisible"] and own_h > 0
+                and m["bar"]["h"] <= own_h + 2 * 4 + 2,
+                f"смужка {round(m['bar']['h'])} px, ручка {round(own_h)} px, "
+                f"чипи видно: {m['barRowVisible']}")
 
         # ⚠️ «Не займає окремого ряду» доводиться в двох орієнтаціях **різними
         # числами**, бо ряду в них два різні.
@@ -523,7 +572,7 @@ def check_default_bar(browser, url, chk, viewport, where):
                 near(m["padL"]["b"], m["stage"]["b"]),
                 f"низ панелі {round(m['padL']['b'], 1)}, "
                 f"низ сцени {round(m['stage']['b'], 1)}")
-            page.click("#bar-toggle-left")
+            page.click(bar_toggle(page))
             time.sleep(0.4)
             opened = measure(page)
             gain = m["canvas"]["h"] - opened["canvas"]["h"]
@@ -684,6 +733,115 @@ def check_portrait(page, chk):
         f"{round(m['padR']['w'], 1)} = {round(total, 1)} при {m['win']['w']}")
     chk("3.5 смужка стоїть між панелями",
         near(m["bar"]["l"], m["padL"]["r"]) and near(m["bar"]["r"], m["padR"]["l"]))
+
+
+def check_look_7(page, chk, where):
+    """Розділ 7 — дописане за відгуком боса після проходу на стенді."""
+    m = measure(page)
+
+    # 7.4 — мінімальний відступ від країв і між кнопками.
+    keys = m["keysL"]
+    if not keys:
+        # ⚠️ Мовчазний пропуск тут був би тим самим шаблоном, що й скрізь:
+        # порожня панель — це вже вада, а не привід не перевіряти.
+        chk(f"7.4 мінімальний відступ від країв і між кнопками ({where})",
+            False, "жодної кнопки в лівій панелі")
+    else:
+        # ⚠️ Відступ міряється від **тіла** панелі, а не від її коробки: над
+        # тілом у книжковій лежить брусок ручки, і відстань до нього — це не
+        # відступ від краю, а сусідній елемент. Спершу міряв від коробки й
+        # отримав 38 px замість 4.
+        left = round(keys[0]["l"] - m["bodyL"]["l"], 1)
+        top = round(keys[0]["t"] - m["bodyL"]["t"], 1)
+        # Найменший проміжок, а не крайній: крайній міг би виявитись
+        # подвійним на пульті з іншим порядком клавіш.
+        between = min(gaps(keys)) if len(keys) > 1 else None
+        # ⚠️ Не «дорівнює нулю» і не «на око малий»: відступ має бути **малим,
+        # але не нульовим** — кнопка, приклеєна до краю вікна, ловить край
+        # долоні, а приклеєна до сусідньої зливається з нею.
+        ok = (0 < left <= 8 and 0 < top <= 8 and between is not None
+              and 0 < between <= 8 and abs(left - between) <= 1)
+        chk(f"7.4 мінімальний відступ від країв і між кнопками ({where})", ok,
+            f"від краю панелі {left} / {top} px, між кнопками {between} px")
+
+    if where == "книжкова":
+        # 7.2 — власна ручка смужки, і вона видима **при згорнутій** смужці,
+        # інакше розгортати не було б чим.
+        set_bar(page, True)
+        m = measure(page)
+        chk("7.2 у книжковій смужка має власну ручку", m["barOwnVisible"],
+            f"кнопка є: {m['barOwnVisible']}, згорнута: {m['barCollapsed']}")
+        chk("7.2 бічні ручки смужки в книжковій прибрані",
+            not m["railBarToggleVisible"])
+        # ⚠️ Під охороною: якщо ручки не видно, клац дав би 30-секундний
+        # тайм-аут Playwright зі стеком замість чесного «ПАД».
+        if m["barOwnVisible"]:
+            page.click("#bar-toggle-mid")
+            time.sleep(0.4)
+            chk("7.2 власна ручка справді розгортає смужку",
+                not measure(page)["barCollapsed"])
+        else:
+            chk("7.2 власна ручка справді розгортає смужку", False,
+                "ручки не видно — тиснути нічого")
+
+        # 7.3 — ручка панелі більше не ділиться: вона займає весь бічний брусок.
+        m = measure(page)
+        chk("7.3 ручка бічної панелі ціла, чверті в неї не забирають",
+            near(m["padToggle"]["w"], m["rail"]["w"], 2)
+            and near(m["padToggle"]["h"], m["rail"]["h"], 2),
+            f"ручка {round(m['padToggle']['w'])}×{round(m['padToggle']['h'])}, "
+            f"брусок {round(m['rail']['w'])}×{round(m['rail']['h'])}")
+        # ⚠️ Абсолютне число, а не лише «ручка = брусок»: критерій каже
+        # «нормального розміру», і без підлоги брусок на 8 px проходив би
+        # зеленим. 44 px — та сама ціль для пальця, що вже стоїть у `.key`.
+        own_h = m["barOwn"]["h"] if m["barOwn"] else 0
+        chk("7.3 обидві ручки не дрібніші за ціль для пальця",
+            m["padToggle"]["h"] >= 43.5 and own_h >= 43.5,
+            f"ручка панелі {round(m['padToggle']['h'])} px, "
+            f"ручка смужки {round(own_h)} px, межа 44")
+    else:
+        # ⚠️ Смужку тут відчиняємо **навмисно**: у згорнутій власну ручку
+        # ховає `#bar.collapsed { display: none }`, і твердження «в альбомній
+        # її немає» справджувалось би саме тому, а не тому, що її не роблять.
+        # Спіймано мутацією: без цього рядка зняття `display: none` з
+        # `.bar-own-toggle` лишалось непоміченим.
+        set_bar(page, False)
+        m = measure(page)
+        chk("7.2 в альбомній власної ручки немає — 2.6 лишається чинним",
+            not m["barOwnVisible"] and m["railBarToggleVisible"],
+            f"власна: {m['barOwnVisible']}, бічна: {m['railBarToggleVisible']}, "
+            f"згорнута: {m['barCollapsed']}")
+
+
+def check_focus_ring(page, chk):
+    """Критерій 7.1 — рамки навколо зображення немає, а фокус усе одно видно.
+
+    ⚠️ Фокус ставиться викликом, а не клацанням по канві: клацання — це
+    **дотик до екрана пульта**, і проти живого моста воно тицяло б у меню.
+    """
+    page.evaluate("() => document.getElementById('screen-wrap').focus()")
+    time.sleep(0.4)
+    m = measure(page)
+    chk("7.1 фокус справді на зображенні", m["focused"])
+    chk("7.1 рамки навколо зображення немає",
+        m["focusRing"] in ("none", "") and m["focusOutline"] in ("none", ""),
+        f"тінь {m['focusRing']!r}, обведення {m['focusOutline']!r}")
+    # ⚠️ Вимога 5.4 задачі 0022 не скасована — вона переїхала в смужку.
+    chk("7.1 плашка каже, що клавіатура слухає", "✓" in m["focusChip"],
+        m["focusChip"])
+
+    # ⚠️ Фокус знімається `blur()`, а не переведенням на кнопку смужки: та
+    # лежить у смужці, яка згорнута за замовчуванням, і `focus()` на схованому
+    # елементі не робить нічого. Перевірка тоді залежала б від того, встиг
+    # хтось раніше відчинити смужку чи ні, — і на живому мості вона впала
+    # рівно через це.
+    page.evaluate("() => document.getElementById('screen-wrap').blur()")
+    time.sleep(0.4)
+    m = measure(page)
+    chk("7.1 фокус пішов — плашка це показує",
+        not m["focused"] and "✓" not in m["focusChip"], m["focusChip"])
+    page.evaluate("() => document.getElementById('screen-wrap').focus()")
+    time.sleep(0.3)
 
 
 def check_colors(page, chk, where):
@@ -946,14 +1104,17 @@ def run_checks(url, log_path, chk):
             time.sleep(2)
 
             check_fullscreen(page, chk)
+            check_focus_ring(page, chk)
             check_landscape(page, chk)
             check_colors(page, chk, "альбомна")
+            check_look_7(page, chk, "альбомна")
             check_centering(page, chk)
 
             page.set_viewport_size(dict(PORTRAIT))
             time.sleep(0.5)
             check_portrait(page, chk)
             check_colors(page, chk, "книжкова")
+            check_look_7(page, chk, "книжкова")
 
             chk("сторінка без помилок JS (у кінці)", not errors, "; ".join(errors[:3]))
         finally:
