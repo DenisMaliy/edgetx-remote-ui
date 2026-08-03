@@ -24,7 +24,9 @@ HTTP, приймає WebSocket на `/ws` і перекладає байти м�
 | Подія | Що робить | Як у мості |
 |---|---|---|
 | сокет закрився | відпустити ввід, забути клієнта | `client_drop` |
-| витіснення новим клієнтом | відпустити ввід, вигнати старого | `client_attach` |
+| прибулець на зайнятий пульт | сказати «зайнято» й закрити сокет | `client_arrived` |
+| переймання (`take=1`) | відпустити ввід, вигнати старого | `client_arrived` |
+| повернення свого (`resume=1`) | те саме, але окремим лічильником | `client_arrived` |
 | мовчання понад 750 мс | відпустити ввід, **сокет лишити** | `ws_bridge_release_if_silent` |
 
 ⚠️ Це **інструмент розробки**. Він слухає всі інтерфейси, бо на нього
@@ -50,6 +52,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import remote_ui_proto as proto  # noqa: E402
@@ -85,6 +88,11 @@ CLIENT_SILENCE_S = 0.750
 WATCHDOG_PERIOD_S = 0.1
 
 
+def bridge_lost_name(taken):
+    """Причина втрати сеансу тими самими словами, що `bridge_lost_name` у мості."""
+    return "керування перейняв інший телефон" if taken else "господар повернувся на свій слот"
+
+
 class Stats:
     """Лічильники, названі так само, як у `/api/stats` справжнього моста."""
 
@@ -98,6 +106,9 @@ class Stats:
             "client_bytes": 0, "client_packets": 0, "client_input": 0,
             "clients_seen": 0, "clients_lost": 0,
             "input_releases": 0, "silence_timeouts": 0,
+            # Черга (задача 0024) — ті самі назви, що в `/api/stats` моста.
+            "busy_refused": 0, "takeovers": 0, "resumes": 0, "status_polls": 0,
+            "lost_evicted": 0, "lost_resumed": 0,
         }
 
     def bump(self, key, by=1):
@@ -138,6 +149,17 @@ class Stats:
             "session": {
                 "seen": d["clients_seen"], "lost": d["clients_lost"],
                 "releases": d["input_releases"], "silence_timeouts": d["silence_timeouts"],
+                # ⚠️ Двійник рахує лише сокети WebSocket: решта з'єднань тут
+                # живе в потоках `http.server`, і числа, порівнянного з
+                # `httpd_get_client_list` моста, з них не вийде.
+                "sockets": BRIDGE.socket_count(),
+            },
+            "queue": {
+                "busy_refused": d["busy_refused"], "takeovers": d["takeovers"],
+                "resumes": d["resumes"], "status_polls": d["status_polls"],
+            },
+            "lost_by": {
+                "evicted": d["lost_evicted"], "resumed": d["lost_resumed"],
             },
             # ⚠️ Прилад купи двійник має віддавати **об'єктом**, а не рискою:
             # плашка пам'яті в клієнті з'являється рівно тоді, коли в `/api/stats`
@@ -173,6 +195,7 @@ class Session:
             Session._next_id += 1
             self.id = Session._next_id
         self.sock = sock
+        self.since = time.monotonic()   # коли з'явився: свіжий ще не мав коли заговорити
         self.send_lock = threading.Lock()
         self.stop = threading.Event()
         self.scan = proto.Decoder()
@@ -199,28 +222,69 @@ class Bridge:
         self.radio = radio
         self.lock = threading.Lock()
         self.current = None
+        self.current_id = ""
+        self.sessions = 0          # живих сокетів WebSocket, включно з чергою
         self.stop = threading.Event()
 
     # --- клієнт ---------------------------------------------------------
 
-    def attach(self, session):
-        """Новий клієнт витісняє попереднього — як `client_attach` у мості."""
+    def attach(self, session, claim):
+        """Пустити, віддати керування на вимогу або сказати «зайнято».
+
+        Те саме рішення, що `client_arrived` у мості, і в тому самому порядку:
+        усе під одним замком, дії — після нього.
+
+        :return: True, якщо клієнт став господарем.
+        """
         with self.lock:
             old = self.current
-            self.current = session
+            busy = old is not None and old is not session
+            # ⚠️ «Це знову я» діє лише коли того господаря вже не чути — те саме
+            # правило, що в мості, і з тієї самої причини: ім'я живе одне
+            # завантаження сторінки, тож збіг при **живому** господарі означає
+            # наш власний другий сокет, і «повернення свого» стало б
+            # витісненням самого себе.
+            heard = old.last_input if (busy and old.last_input) else (
+                old.since if busy else None)
+            ghost = busy and (time.monotonic() - heard > CLIENT_SILENCE_S)
+            mine = busy and ghost and claim["resume"] and claim["id"] != "" \
+                and claim["id"] == self.current_id
+            allow = (not busy) or claim["take"] or mine
+            if allow:
+                self.current = session
+                self.current_id = claim["id"]
+
+        if not allow:
+            STATS.bump("busy_refused")
+            print(f"  клієнт {session.id} прийшов на зайнятий пульт — кажу «зайнято»")
+            return False
+
+        if claim["take"]:
+            STATS.bump("takeovers")
+        elif claim["resume"]:
+            STATS.bump("resumes")
 
         STATS.bump("clients_seen")
 
-        if old is not None:
+        if busy:
             # ⚠️ Саме те, чого двійник не робив: справді вигнати старого і
             # відпустити ввід. Старий міг щось утримувати, а новий заявить
             # власний стан не пізніше ніж за 250 мс.
-            print(f"  клієнт {session.id} витісняє клієнта {old.id}")
+            taken = claim["take"]
+            what = ("керування перейнято" if taken else "господар повернувся на свій слот")
+            print(f"  {what} (клієнт {old.id} → {session.id})")
             old.kick()
             STATS.bump("clients_lost")
-            self.release_input("витіснення")
+            STATS.bump("lost_evicted" if taken else "lost_resumed")
+            # Слова ті самі, що в мості: журнали двійника й моста звіряються.
+            self.release_input(bridge_lost_name(taken))
 
         print(f"  клієнт {session.id} під'єднався")
+        return True
+
+    def socket_count(self):
+        with self.lock:
+            return self.sessions
 
     def detach(self, session, reason):
         """Клієнт зник: забути його й відпустити ввід."""
@@ -228,6 +292,9 @@ class Bridge:
             if self.current is not session:
                 return   # нас уже витіснив новіший — він і відпустив ввід
             self.current = None
+            # Ім'я гасне разом із сокетом: інакше `resume` пускав би до
+            # чужого слота. Те саме правило, що в `client_drop` моста.
+            self.current_id = ""
 
         STATS.bump("clients_lost")
         self.release_input(reason)
@@ -381,6 +448,13 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_ws()
             return
 
+        if path == "/api/status":
+            # Найдешевша відповідь моста: нею живе клієнт, що стоїть у черзі.
+            STATS.bump("status_polls")
+            self._json({"busy": 1 if BRIDGE.peek() is not None else 0,
+                        "sockets": BRIDGE.socket_count()})
+            return
+
         if path == "/api/stats":
             self._json(STATS.snapshot(BRIDGE.peek() is not None))
             return
@@ -438,17 +512,49 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Sec-WebSocket-Accept", accept)
         self.end_headers()
         self.wfile.flush()
+        # Після переходу на WebSocket наступного запиту HTTP у цьому з'єднанні
+        # не буде ніколи: лишений відкритим, обробник читав би кадри WebSocket
+        # як заголовки запиту.
+        self.close_connection = True
 
         session = Session(self.connection)
-        BRIDGE.attach(session)
-
-        reason = "розрив"
+        with BRIDGE.lock:
+            BRIDGE.sessions += 1
         try:
-            reason = self.pump(session)
-        except (OSError, struct.error):
-            pass
+            if not BRIDGE.attach(session, self.claim()):
+                # ⚠️ Слово, а не мовчазний розрив: клієнт має відрізнити
+                # «зайнято» від обриву, інакше він повернеться через секунду —
+                # і гойдалка, заради якої все робилось, повернеться з ним.
+                try:
+                    session.send_frame(b'{"busy":1}', OP_TEXT)
+                except OSError:
+                    pass
+                session.kick()
+                return
+
+            reason = "розрив"
+            try:
+                reason = self.pump(session)
+            except (OSError, struct.error):
+                pass
+            finally:
+                BRIDGE.detach(session, reason)
         finally:
-            BRIDGE.detach(session, reason)
+            with BRIDGE.lock:
+                BRIDGE.sessions -= 1
+
+    def claim(self):
+        """Чим назвався прибулець у рядку запиту `/ws` — як `read_claim` у мості."""
+        query = parse_qs(urlparse(self.path).query)
+        name = query.get("id", [""])[0]
+        return {
+            "take": query.get("take", ["0"])[0] == "1",
+            "resume": query.get("resume", ["0"])[0] == "1",
+            # ⚠️ Задовге ім'я тут **відкидається**, а не обрізається — рівно як
+            # у мості (`WS_CLIENT_ID_MAX`): обрізані імена двох різних клієнтів
+            # злилися б в одне, і `resume` пускав би чужого.
+            "id": name if len(name) <= 16 else "",
+        }
 
     def pump(self, session):
         """Браузер → пульт. Пересилаємо як є; типи дивимось лише для живості."""

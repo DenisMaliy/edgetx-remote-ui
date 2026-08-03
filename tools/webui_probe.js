@@ -191,7 +191,11 @@ class Probe {
   }
 }
 
-const wsUrl = () => base.replace(/^http/, 'ws') + '/ws';
+/**
+ * Адреса потоку. `claim` — заявка, з якою приходимо (задача 0024): без неї
+ * зайнятий міст відповість `{"busy":1}` і закриє сокет.
+ */
+const wsUrl = (claim) => base.replace(/^http/, 'ws') + '/ws' + (claim ? '?' + claim : '');
 const stats = async () => (await fetch(base + '/api/stats', { cache: 'no-store' })).json();
 
 /** Клавіша з переліку HELLO за назвою; жорсткого списку в клієнті бути не може. */
@@ -228,7 +232,10 @@ async function checkHttp() {
 async function checkStream() {
   console.log('\nWebSocket: рукостискання, кадри, ввід');
 
-  const p = new Probe(wsUrl());
+  /* ⚠️ `take=1` — свідома заявка, як натискання кнопки в клієнті. Проба
+   * запускається руками й саме для того, щоб поговорити з пультом; чекати в
+   * черзі їй нема сенсу, а мовчазного витіснення після 0024 більше немає. */
+  const p = new Probe(wsUrl('id=probe-stream&take=1'));
   await p.open();
 
   const greeted = await p.handshake();
@@ -320,7 +327,7 @@ async function checkSafety(hello) {
   const key = keyByName(hello, ['RTN', 'EXIT']);
 
   const holdThenLeave = async (how) => {
-    const p = new Probe(wsUrl());
+    const p = new Probe(wsUrl('id=probe-safety&take=1'));
     await p.open();
     if (!await p.handshake()) throw new Error('пульт не привітався');
 
@@ -364,7 +371,7 @@ async function checkSafety(hello) {
 }
 
 /**
- * Витіснення: другий телефон виганяє першого.
+ * Переймання керування: другий телефон забирає пульт **на вимогу**.
  *
  * ⚠️ Ця перевірка з'явилась через рецензію: двійник моста **стверджував**, що
  * витісняє клієнта, а насправді лишав потоки старого — тобто пункт «кілька
@@ -372,19 +379,49 @@ async function checkSafety(hello) {
  * Діра була не в мості, а в доказовій базі, і це найгірший вид дірки: вона
  * мовчить.
  *
- * Чому витіснення взагалі має бути: клієнт **шле ввід**, і два джерела
- * натискань на пульт із розбитим екраном — спосіб зробити щось несподіване,
- * не побачивши цього.
+ * ⚠️ **Після задачі 0024 перевірка стала двома.** Мовчазного витіснення
+ * більше немає: прибулець без заявки чує «зайнято» й іде в чергу, а забирає
+ * пульт лише той, хто сказав `take=1`. Обидва випадки тут, бо саме на межі
+ * між ними живе вся вада: клієнт **шле ввід**, і два джерела натискань на
+ * пульт із розбитим екраном — спосіб зробити щось несподіване, не побачивши
+ * цього.
+ *
+ * ⚠️ Це заразом єдиний прилад під критерій 2.5 задачі 0024 — «ввід
+ * відпускається, коли керування переходить». Він тримає клавішу першим
+ * клієнтом і звіряє `session.releases` після переходу.
  */
-async function checkEviction(hello) {
-  console.log('\nвитіснення: другий телефон виганяє першого');
+async function checkTakeover(hello) {
+  console.log('\nчерга й переймання керування');
 
   const key = keyByName(hello, ['RTN', 'EXIT']);
 
-  const first = new Probe(wsUrl());
+  const first = new Probe(wsUrl('id=probe1'));
   await first.open();
   if (!await first.handshake()) { ok(false, 'перший клієнт не привітався'); return; }
 
+  // --- прибулець без заявки: йому кажуть «зайнято» -------------------------
+  const busyBefore = await stats();
+  const idle = new Probe(wsUrl('id=probe-idle'));
+  await idle.open();
+  let busySaid = null;
+  idle.ws.addEventListener('message', (ev) => {
+    if (typeof ev.data === 'string') busySaid = ev.data;
+  });
+  const idleGreeted = await idle.handshake();
+  await sleep(700);
+  const busyAfter = await stats();
+
+  ok(!idleGreeted, 'прибулець без заявки HELLO не отримує — пульт зайнятий');
+  ok(busySaid !== null && busySaid.includes('busy'),
+     `міст сказав словом, а не мовчазним розривом: ${busySaid}`);
+  ok(busyAfter.queue.busy_refused > busyBefore.queue.busy_refused,
+     `відмов «зайнято»: ${busyBefore.queue.busy_refused} → ${busyAfter.queue.busy_refused}`);
+  ok(busyAfter.lost_by.evicted === busyBefore.lost_by.evicted,
+     '⚠️ і головне: першого при цьому НЕ витіснили — це й була гойдалка');
+  idle.close();
+  await sleep(200);
+
+  // --- переймання на вимогу ------------------------------------------------
   // Перший щось утримує — саме це не можна лишити натиснутим.
   first.mirror.key(key.code, true);
   first.send(P.encodeKey(key.code, true));
@@ -396,19 +433,19 @@ async function checkEviction(hello) {
 
   const before = await stats();
 
-  const second = new Probe(wsUrl());
+  const second = new Probe(wsUrl('id=probe2&take=1'));
   await second.open();
   const greeted = await second.handshake();
   await sleep(700);
   const after = await stats();
 
-  ok(greeted, 'другий клієнт привітався й дістав HELLO');
+  ok(greeted, 'другий клієнт із заявкою привітався й дістав HELLO');
   ok(firstClosed, `перший клієнт вигнаний: сокет ${firstClosed ? 'закрито' : 'ЛИШИВСЯ ВІДКРИТИМ'}`);
   ok(after.session.releases > before.session.releases,
-     `витіснення відпустило ввід: releases ${before.session.releases} → ` +
+     `переймання відпустило ввід: releases ${before.session.releases} → ` +
      `${after.session.releases}`);
 
-  // І головне: після витіснення працює саме другий.
+  // І головне: після переймання працює саме другий.
   const framesBefore = second.frames;
   second.send(P.encodeFrame(P.PKT_REFRESH));
   await sleep(1200);
@@ -425,7 +462,7 @@ async function main() {
 
   await checkHttp();
   const hello = await checkStream();
-  if (hello) await checkEviction(hello);
+  if (hello) await checkTakeover(hello);
   if (hello) await checkSafety(hello);
 
   console.log('\n' + (failed ? `ПОМИЛКА: невдалих перевірок ${failed}` : 'усе гаразд'));

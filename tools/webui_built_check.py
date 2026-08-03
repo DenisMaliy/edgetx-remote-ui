@@ -386,16 +386,22 @@ def gaps(keys):
 # перевірка, а не панелі, — і шукати треба тут, а не в `panels.js`.
 
 
-"""Помилки сторінки, спричинені **витісненням клієнта мостом**.
-
-⚠️ Міст обслуговує рівно одного клієнта: нове вікно витісняє попереднє, і те
-бачить обрив рукостискання WebSocket. Це його штатна поведінка, а не вада
-клієнта — клієнт на це відповідає перепідключенням, як і має.
-
-⚠️ Мовчки вони не зникають. `real_errors` вертає ще й скільки їх було, і це
-число друкується в діагностиці кожної такої перевірки: сховати обрив, який
-став масовим, цей фільтр не дає.
-"""
+# Помилки сторінки, спричинені **втратою пульта**, а не вадою клієнта.
+#
+# ⚠️ Міст обслуговує рівно одного клієнта, і той, у кого пульт забрали, бачить
+# обрив сокета. Це його штатна поведінка, а не вада сторінки.
+#
+# ⚠️ Мовчки вони не зникають. `real_errors` вертає ще й скільки їх було, і це
+# число друкується в діагностиці кожної такої перевірки: сховати обрив, який
+# став масовим, цей фільтр не дає.
+#
+# ⚠️ **Після задачі 0024 витіснення без вимоги більше немає**, тож більшість
+# цих обривів мала б зникнути. Фільтр лишається на два випадки, які нікуди не
+# поділись: сокет, що його міст гасить услід за словом «зайнято», і той, у
+# кого керування перейняли кнопкою. ⚠️ Ціна фільтра названа прямо: він глушить
+# і `Failed to load resource`, тобто заразом сховав би невдале опитування
+# `/api/status`. Помітно це стане в іншому місці: клієнт, який не бачить, що
+# пульт звільнився, не пройде перевірок 2.3 і 2.4.
 EVICTION_MARKS = (
     "Error during WebSocket handshake",
     "net::ERR_CONNECTION_RESET",
@@ -416,6 +422,61 @@ def chk_no_page_errors(chk, name, errors):
         "; ".join(ours[:3]) + (f" (обривів від витіснення: {evicted})" if evicted else ""))
 
 
+def bridge_stats(url):
+    """Лічильники цілі — прямо з мережі, повз браузер.
+
+    ⚠️ Повз браузер навмисно: питати їх зі сторінки, яка стоїть у черзі,
+    означало б самому додати той трафік, відсутність якого міряємо.
+    """
+    import gzip
+    import urllib.request
+
+    req = urllib.request.Request(url.rstrip("/") + "/api/stats",
+                                 headers={"Accept-Encoding": "gzip"})
+    with urllib.request.urlopen(req, timeout=6) as r:
+        body = r.read()
+        if (r.headers.get("Content-Encoding") or "").lower() == "gzip":
+            body = gzip.decompress(body)
+    return json.loads(body.decode("utf-8"))
+
+
+def gate_shown(page):
+    """Чи стоїть на сторінці вікно черги."""
+    return page.evaluate("() => !document.getElementById('veil-buttons').hidden")
+
+
+def screen_ready(page):
+    return page.evaluate("() => document.getElementById('screen').width > 100")
+
+
+def wait_ready(page, timeout=25000):
+    """Дочекатись картинки, а на зайнятому пульті — свідомо перейняти керування.
+
+    ⚠️ З'явилось у задачі 0024, і без нього прилад тепер не працює взагалі:
+    доти новий клієнт витісняв попереднього мовчки, і прилад цим користувався,
+    сам того не називаючи. Тепер зайнятий пульт відповідає «зайнято», і вікно
+    приладу мусить натиснути ті самі дві кнопки, що й бос.
+
+    ⚠️ Очікування спільне на два наслідки — картинка **або** вікно черги, — а
+    не два очікування поспіль: інакше на вільному пульті кожне вікно платило б
+    тайм-аутом за чергу, якої немає.
+
+    :return: True, якщо керування довелось переймати.
+    """
+    page.wait_for_function(
+        "() => document.getElementById('screen').width > 100"
+        " || !document.getElementById('veil-buttons').hidden", timeout=timeout)
+    if not gate_shown(page):
+        return False
+
+    page.click("#btn-take")
+    page.wait_for_selector("#btn-take-yes:visible", timeout=5000)
+    page.click("#btn-take-yes")
+    page.wait_for_function(
+        "() => document.getElementById('screen').width > 100", timeout=timeout)
+    return True
+
+
 def open_page(browser, url, viewport, tries=3):
     """Свіже вікно з ловцем помилок сторінки.
 
@@ -430,6 +491,11 @@ def open_page(browser, url, viewport, tries=3):
     вікні, — тоді як одиничне вікно отримувало `HELLO` за 0.3 с. На стенді без
     заліза повтор не спрацьовує жодного разу: двійник пульта вітається одразу.
 
+    ⚠️ **Після задачі 0024 повтор лишається, але на інший випадок.** Слот, який
+    ще тримає мертве вікно, тепер не витісняється мовчки — на нього кажуть
+    «зайнято», і `wait_ready` переймає керування кнопкою. Повтор потрібен там,
+    де вікно черги не з'явилось і картинка теж (міст щойно піднявся).
+
     ⚠️ Якщо `HELLO` не приходить **зовсім**, повтор нічого не ховає: після
     останньої спроби виняток іде далі, і прогін падає, як падав.
     """
@@ -442,8 +508,7 @@ def open_page(browser, url, viewport, tries=3):
     page.goto(url, wait_until="load", timeout=25000)
     for attempt in range(tries):
         try:
-            page.wait_for_function(
-                "() => document.getElementById('screen').width > 100", timeout=25000)
+            wait_ready(page)
             break
         except Exception:
             if attempt == tries - 1:
@@ -1390,6 +1455,209 @@ def check_fullscreen(page, chk):
         time.sleep(0.4)
 
 
+"""Скільки секунд два вікна стоять поруч у короткій пробі гойдалки.
+
+⚠️ Це **не** доказ критерію 1.1 — той просить шістдесят секунд і робиться
+руками на живому мості. Тут коротка проба, яка ловить регресію: при старій
+поведінці витіснення приходили пачками щосекунди, тож восьми вистачить, щоб
+різниця лічильника перестала бути нулем.
+"""
+QUEUE_QUIET_S = 8
+
+
+def check_queue(browser, url, chk):
+    """Черга: господар один, решта чекають і нічого не споживають (0024).
+
+    ⚠️ Два справжні вікна, а не підміна відповідей: уся вада була саме у
+    взаємодії двох клієнтів із мостом, і жодна половина сама по собі її не
+    показує.
+    """
+    a_ctx, a_page, a_err = open_page(browser, url, LANDSCAPE)
+    b_ctx = browser.new_context(viewport=dict(LANDSCAPE))
+    b_page = b_ctx.new_page()
+    b_err = []
+    b_page.on("pageerror", lambda e: b_err.append(str(e)))
+    b_page.on("console", lambda m: b_err.append(f"console.error: {m.text}")
+              if m.type == "error" else None)
+
+    # ⚠️ Прилад під критерій 1.2 — самі кадри WebSocket, які отримало друге
+    # вікно. Лічильники клієнта тут не годяться: у браузері вони не винесені
+    # назовні, а лічильники моста не розділяють клієнтів.
+    b_frames = []
+    b_page.on("websocket",
+              lambda w: w.on("framereceived", lambda payload: b_frames.append(payload)))
+
+    try:
+        before = bridge_stats(url)
+        b_page.goto(url, wait_until="load", timeout=25000)
+
+        # ⚠️ Через `try`, а не голим очікуванням: коли вікна черги немає
+        # (тобто вада повернулась), прогін має сказати це **червоною
+        # перевіркою**, а не тайм-аутом Playwright, за яким причини не видно.
+        gated = True
+        try:
+            b_page.wait_for_selector("#btn-take:visible", timeout=20000)
+        except Exception:
+            gated = False
+
+        chk("2.1 другий клієнт бачить «Є активне підключення» і кнопку",
+            gated and "Є активне підключення" in b_page.text_content("#veil-text")
+            and b_page.is_visible("#btn-take"),
+            b_page.text_content("#veil-text"))
+        chk("2.1 екрана пульта другому клієнтові не показують",
+            not screen_ready(b_page))
+        chk("2.1 перший клієнт нічого не помітив", screen_ready(a_page))
+
+        time.sleep(QUEUE_QUIET_S)
+        after = bridge_stats(url)
+        evicted = (after["lost_by"]["evicted"] - before["lost_by"]["evicted"])
+        refused = (after["queue"]["busy_refused"] - before["queue"]["busy_refused"])
+
+        # ⚠️ Одного `lost_evicted` тут **замало**, і це знайдено мутацією, не
+        # оком: при мовчазному витісненні витіснений вертається за секунду й
+        # забирає своє назад, тож у мить заміру пульт знову в нього — картинка
+        # ціла, знімок стану зелений. Гойдалку видно не станом, а рухом:
+        # скільки **сеансів** міст завів і згубив за ці секунди. У черзі — нуль.
+        seen = after["session"]["seen"] - before["session"]["seen"]
+        lost = after["session"]["lost"] - before["session"]["lost"]
+
+        chk(f"1.1 два клієнти поруч {QUEUE_QUIET_S} с — жодного витіснення",
+            evicted == 0 and seen == 0 and lost == 0,
+            f"нових сеансів {seen}, втрат {lost}, витіснень {evicted}, "
+            f"відмов «зайнято» {refused}")
+        chk("1.1 перший клієнт не втратив пульта", screen_ready(a_page)
+            and not gate_shown(a_page))
+
+        binary = [f for f in b_frames if not isinstance(f, str)]
+        text = [f for f in b_frames if isinstance(f, str)]
+        chk("1.2 клієнт у черзі не отримав жодного кадру пікселів",
+            not binary, f"двійкових кадрів {len(binary)}, слів моста {len(text)}: {text[:2]}")
+
+        # ⚠️ Окрема перевірка, і без неї попередня майже нічого не варта: клієнт,
+        # який стукає в двері щосекунди, кадрів теж не отримує — а гойдалка при
+        # цьому ціла, просто її тримає вже не міст. Тут її видно двома числами:
+        # рівно один сокет за весь час очікування і рівно одна відмова.
+        chk(f"1.2 клієнт у черзі не стукає повторно ({QUEUE_QUIET_S} с)",
+            len(text) == 1 and refused <= 1,
+            f"слів «зайнято» {len(text)}, відмов на мості {refused}")
+
+        # ⚠️ Число має сенс лише проти **живого моста**: там воно з
+        # `httpd_get_client_list`, тобто рахує всі сокети сервера. Двійник
+        # рахує самі лише WebSocket, і різниця в нього завжди нуль — тобто на
+        # стенді без заліза ця перевірка нічого не доводить, і в «Результаті»
+        # число береться з мосту. Очікуємо **нуль**: `/api/status` віддається з
+        # `Connection: close`, тож між опитуваннями черга не тримає нічого.
+        # ⚠️ Мінімум із трьох знімків, а не один: опитування черги теж бере
+        # сокет на кілька мілісекунд, і випадковий збіг дав би червону
+        # перевірку на справному коді — рівно та крихкість, від якої лікує ця
+        # задача.
+        def fewest_sockets(tries=3):
+            got = [bridge_stats(url)["session"].get("sockets") for _ in range(tries)]
+            got = [g for g in got if g is not None]
+            return min(got) if got else None
+
+        sockets_now = fewest_sockets()
+        chk("1.3 черга не лишає за собою жодного сокета",
+            sockets_now is None or before["session"].get("sockets") is None
+            or sockets_now - before["session"]["sockets"] <= 0,
+            f"сокетів було {before['session'].get('sockets')}, стало {sockets_now}")
+
+        if not gated:
+            # Далі кожен крок починається з натискання кнопки, якої немає.
+            for name in ("2.2 попередження називає наслідок і дає дві кнопки",
+                         "2.2 «Скасувати» лишає клієнта в черзі, пульта не чіпає",
+                         "2.3 після «Підключитись» другий клієнт отримує кадри",
+                         "2.3 у першого клієнта — те саме вікно очікування з кнопкою",
+                         "2.4 переймання працює в обидва боки без перезавантаження"):
+                chk(name, False, "вікна черги не було — перевіряти нічим")
+        else:
+            # --- 2.2 переймання питає, а «Скасувати» лишає в черзі -----------
+            b_page.click("#btn-take")
+            b_page.wait_for_selector("#btn-take-yes:visible", timeout=5000)
+            chk("2.2 попередження називає наслідок і дає дві кнопки",
+                "буде відключений" in b_page.text_content("#veil-text")
+                and b_page.is_visible("#btn-take-yes") and b_page.is_visible("#btn-take-no"),
+                b_page.text_content("#veil-text"))
+            b_page.click("#btn-take-no")
+            time.sleep(1.0)
+            chk("2.2 «Скасувати» лишає клієнта в черзі, пульта не чіпає",
+                gate_shown(b_page) and not screen_ready(b_page) and screen_ready(a_page))
+
+            # --- 2.3 і 2.4 переймання в обидва боки --------------------------
+            b_page.click("#btn-take")
+            b_page.wait_for_selector("#btn-take-yes:visible", timeout=5000)
+            b_page.click("#btn-take-yes")
+            b_page.wait_for_function(
+                "() => document.getElementById('screen').width > 100", timeout=25000)
+            chk("2.3 після «Підключитись» другий клієнт отримує кадри",
+                screen_ready(b_page))
+
+            back = True
+            try:
+                a_page.wait_for_selector("#btn-take:visible", timeout=20000)
+            except Exception:
+                back = False
+            chk("2.3 у першого клієнта — те саме вікно очікування з кнопкою",
+                back and gate_shown(a_page)
+                and "Є активне підключення" in a_page.text_content("#veil-text"))
+
+            # ⚠️ Назад — тими самими кнопками й **без перезавантаження
+            # сторінки**: саме це критерій 2.4 і просить, бо перезавантаження
+            # ховало б будь-яку ваду стану, що лишився від попереднього сеансу.
+            if back:
+                a_page.click("#btn-take")
+                a_page.wait_for_selector("#btn-take-yes:visible", timeout=5000)
+                a_page.click("#btn-take-yes")
+                a_page.wait_for_function(
+                    "() => document.getElementById('screen').width > 100", timeout=25000)
+                b_page.wait_for_selector("#btn-take:visible", timeout=20000)
+            chk("2.4 переймання працює в обидва боки без перезавантаження",
+                back and screen_ready(a_page) and not gate_shown(a_page)
+                and gate_shown(b_page))
+
+            # --- 1.1 подвійне натискання не заводить гойдалки з одного клієнта -
+            #
+            # ⚠️ Цей випадок знайшла рецензія, не прилад, і жодна перевірка
+            # вище його не бачила: два сокети з тим самим іменем витісняли одне
+            # одного нескінченно, а лічильник казав `lost_resumed` — не
+            # `lost_evicted`, за яким дивиться критерій 1.1. Тому тут
+            # звіряються **всі** ознаки руху сеансів.
+            if back and gate_shown(b_page):
+                b_page.click("#btn-take")
+                b_page.wait_for_selector("#btn-take-yes:visible", timeout=5000)
+                two = bridge_stats(url)
+                # ⚠️ Обидва натискання **в один такт**, через сам обробник, а
+                # не мишею: після першого кнопка ховається (`gate(null)`), і
+                # Playwright просто чекав би на видимість — тобто перевіряв би
+                # не те. Тут відтворюється саме те, що робить палець, який
+                # тицьнув двічі, поки сторінка ще не перемалювалась.
+                b_page.evaluate("() => { const b = document.getElementById('btn-take-yes');"
+                                " b.click(); b.click(); }")
+                b_page.wait_for_function(
+                    "() => document.getElementById('screen').width > 100", timeout=25000)
+                time.sleep(QUEUE_QUIET_S)
+                three = bridge_stats(url)
+                moved = {
+                    "сеансів": three["session"]["seen"] - two["session"]["seen"],
+                    "втрат": three["session"]["lost"] - two["session"]["lost"],
+                    "витіснень": three["lost_by"]["evicted"] - two["lost_by"]["evicted"],
+                    "повернень": three["lost_by"]["resumed"] - two["lost_by"]["resumed"],
+                }
+                chk("1.1 подвійне «Підключитись» не заводить гойдалки",
+                    moved["сеансів"] <= 2 and moved["повернень"] == 0
+                    and screen_ready(b_page),
+                    ", ".join(f"{k} {v}" for k, v in moved.items()))
+            else:
+                chk("1.1 подвійне «Підключитись» не заводить гойдалки", False,
+                    "не було з чого починати — попередній крок не пройшов")
+
+        chk_no_page_errors(chk, "сторінка без помилок JS (черга, перший клієнт)", a_err)
+        chk_no_page_errors(chk, "сторінка без помилок JS (черга, другий клієнт)", b_err)
+    finally:
+        b_ctx.close()
+        a_ctx.close()
+
+
 def check_no_fullscreen(browser, url, chk):
     """Критерій 1.5, друга половина: де браузер не вміє, кнопки немає.
 
@@ -1409,8 +1677,7 @@ def check_no_fullscreen(browser, url, chk):
             if m.type == "error" else None)
     try:
         page.goto(url, wait_until="load", timeout=25000)
-        page.wait_for_function(
-            "() => document.getElementById('screen').width > 100", timeout=25000)
+        wait_ready(page)
         time.sleep(1.0)
         chk("1.5 браузер не вміє — кнопки немає, а не мертва",
             page.evaluate("() => !document.getElementById('btn-full')"))
@@ -1454,9 +1721,14 @@ def run_checks(url, log_path, chk):
                     if m.type == "error" else None)
 
             page.goto(url, wait_until="load", timeout=25000)
-            page.wait_for_function(
-                "() => document.getElementById('screen').width > 100", timeout=25000)
+            took = wait_ready(page)
             time.sleep(3)
+
+            # ⚠️ Не прикраса: якщо на пульті хтось був, далі йдуть перевірки
+            # вигляду, а не поведінки черги, і знати, з чого починався прогін,
+            # треба саме тут.
+            if took:
+                print("   пульт був зайнятий — керування перейнято кнопкою")
 
             chk_no_page_errors(chk, "сторінка без помилок JS", errors)
 
@@ -1545,6 +1817,12 @@ def run_checks(url, log_path, chk):
             # Тому свіжі вікна працюють, поки головне стоїть на `about:blank`.
             page.goto("about:blank", wait_until="load", timeout=10000)
 
+            # ⚠️ Черга — перша серед вікон, які відкриваються після
+            # відпускання головного: вона єдина міряє **два** клієнти поруч, і
+            # чужі вікна, що лишились від попередніх перевірок, зробили б її
+            # числа неправдою.
+            check_queue(br, url, chk)
+
             check_default_bar(br, url, chk, LANDSCAPE, "альбомна")
             check_default_bar(br, url, chk, PORTRAIT, "книжкова")
             check_resize_sweep(br, url, chk)
@@ -1553,8 +1831,7 @@ def run_checks(url, log_path, chk):
 
             page.set_viewport_size(dict(LANDSCAPE))
             page.goto(url, wait_until="load", timeout=25000)
-            page.wait_for_function(
-                "() => document.getElementById('screen').width > 100", timeout=25000)
+            wait_ready(page)
             time.sleep(2)
 
             check_fullscreen(page, chk)

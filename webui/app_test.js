@@ -72,7 +72,12 @@ function makeApp() {
     },
     fetch: async () => { throw new Error('моста немає'); },
     setInterval: () => 0, clearInterval: () => {},
-    setTimeout: () => 1, clearTimeout: () => {},
+    // ⚠️ Затримки записуються, а не викидаються: питання «чи клієнт узагалі
+    // збирається повертатись» інакше не поставити — таймер тут не спрацьовує
+    // ніколи, і про намір говорить лише сам факт його заведення.
+    setTimeout: (fn, ms) => { g.__timers.push(ms); return 1; },
+    clearTimeout: () => {},
+    __timers: [],
     TextDecoder: require('util').TextDecoder,
     console,
     __now: 1000,
@@ -296,6 +301,94 @@ console.log('намір бере клавішу або енкодер — за �
   check(held.size === 1, 'клавішу тримають');
   buildPanels(Object.assign({}, hello, { keys: hello.keys.slice(0, 3) }));
   check(held.size === 0, 'перебудова панелі відпустила все');
+}
+
+// ------------------------------------- 8. черга: господар один -------------
+//
+// ⚠️ Вада, від якої стереже цей розділ, — **гойдалка** (задача 0024): клієнт
+// після будь-якого закриття сокета вертався через секунду, зокрема й після
+// того, як його свідомо витіснили. Разом із витісненням на боці моста це
+// давало двох клієнтів, що по черзі виганяють одне одного без кінця.
+//
+// Тут перевіряється саме те, що вирішує обгортка: з чим вона приходить до
+// моста і чи збирається повертатись.
+
+console.log('черга: витіснений чекає, а не вертається сам (задача 0024)');
+{
+  const ctx = makeApp();
+
+  // Свій WebSocket, який запам'ятовує адресу й дає дотягтись до обробників.
+  const urls = [];
+  global.WebSocket = function (url) {
+    urls.push(url);
+    this.readyState = 1;      // OPEN: вітання клієнта має куди піти
+    this.close = () => {};
+    this.send = () => {};
+    global.__ws = this;
+  };
+  global.WebSocket.OPEN = 1;
+
+  const { connect, onBridgeSays, gate, queueState } = ctx.app;
+
+  connect();
+  const first = urls[urls.length - 1];
+  check(/[?&]id=[a-z0-9]+/.test(first), `перше під'єднання називає себе: ${first}`);
+  check(!/take=1|resume=1/.test(first),
+        'і нічого не вимагає: звичайне відкриття сторінки');
+
+  // --- були господарем, сокет помер: вертаємось і забираємо своє ------------
+  global.__ws.onopen();
+  global.__ws.onclose();
+  check(queueState().wasOwner === true, 'ми були господарем — це запам’ятано');
+  const timersAfterLoss = ctx.g.__timers.filter((ms) => ms === 1000).length;
+  check(timersAfterLoss >= 1, 'після справжнього обриву клієнт збирається назад');
+
+  connect();
+  check(/resume=1/.test(urls[urls.length - 1]),
+        `повернення заявлене як своє: ${urls[urls.length - 1]}`);
+
+  // --- сказали «зайнято»: чекаємо мовчки ------------------------------------
+  global.__ws.onopen();
+  onBridgeSays('{"busy":1}');
+  const st = queueState();
+  check(st.queued === true, 'слово моста «зайнято» ставить нас у чергу');
+  check(st.wasOwner === false,
+        '⚠️ і знімає право забрати своє: свого слота в нас більше немає');
+  check(ctx.el('veil-buttons').hidden === false, 'вікно черги з кнопкою видно');
+  check(/Є активне підключення/.test(ctx.el('veil-text').textContent),
+        `напис називає причину: «${ctx.el('veil-text').textContent}»`);
+
+  const before = ctx.g.__timers.filter((ms) => ms === 1000).length;
+  global.__ws.onclose();
+  check(ctx.g.__timers.filter((ms) => ms === 1000).length === before,
+        '⚠️ і головне: перепідключення НЕ заводиться — це й була гойдалка');
+
+  // --- дві кнопки, і забирає тільки друга ------------------------------------
+  gate('confirm');
+  check(/буде відключений/.test(ctx.el('veil-text').textContent),
+        `попередження називає наслідок: «${ctx.el('veil-text').textContent}»`);
+  check(ctx.el('btn-take-yes').hidden === false && ctx.el('btn-take').hidden === true,
+        'на другому кроці видно «Підключитись», а не «Перейняти керування»');
+
+  gate('ask');
+  check(queueState().queued === true, '«Скасувати» лишає нас у черзі');
+
+  // ⚠️ Подвійне натискання «Підключитись» не має лишати двох живих сокетів:
+  // із тим самим іменем вони витісняли б одне одного через міст без кінця —
+  // гойдалка з **одного** клієнта, знайдена рецензією.
+  const stale = global.__ws;
+  let staleClosed = false;
+  stale.close = () => { staleClosed = true; };
+
+  connect({ take: true });
+  check(staleClosed === true, 'нове під’єднання гасить попередній сокет');
+  check(stale.onclose === null,
+        '⚠️ і знімає з нього обробники — інакше його ж onclose завів би ще одне');
+  check(/take=1/.test(urls[urls.length - 1]),
+        `переймання заявлене прямо: ${urls[urls.length - 1]}`);
+  check(!/resume=1/.test(urls[urls.length - 1]),
+        'і не прикидається поверненням свого');
+  check(queueState().queued === false, 'із черги вийшли');
 }
 
 // ----------------------------------------------------------------------------
