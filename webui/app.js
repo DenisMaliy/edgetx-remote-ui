@@ -73,6 +73,48 @@ const wrap = document.getElementById('screen-wrap');
 let W = 0, H = 0;
 let frameBuf = null;   // ImageData на весь екран, накопичується між кадрами
 
+/* --- місце під екран тримається до першого кадру (задача 0025) -------------
+ *
+ * ⚠️ Розмір екрана приходить у `HELLO`, тобто до з'єднання його немає взагалі.
+ * Доти колонка зображення дорівнювала полотну з розмітки, і сцена схлопувалась:
+ * панелі збивались до краю, а вікно черги («Є активне підключення до пульта»)
+ * висіло у вузькій смужці збоку. Задача 0024 зробила цей стан довгим — доти
+ * дивитись без з'єднання все одно не було на що.
+ *
+ * Розмір **пригадується, а не припускається**: зашити роздільність тут не
+ * можна, клієнт має працювати з пультом, якого ми не бачили. Пригадане живе в
+ * `localStorage` і оновлюється кожним `HELLO`, що приніс інші числа.
+ *
+ * ⚠️ Коли не пригадали нічого (перший у житті візит), пропорція не
+ * вигадується: під зображення береться все вільне місце, яке лишили панелі.
+ * Вигадана пропорція гірша за її відсутність — вона виглядає як правда.
+ */
+const SCREEN_W_KEY = 'screen.w';
+const SCREEN_H_KEY = 'screen.h';
+/* Стеля правдоподібності, а не специфіка пульта: ширина й висота приходять у
+ * `HELLO` полями `uint16`, більшого числа звідти не буває за побудовою. */
+const MAX_SCREEN = 65535;
+let knownW = 0, knownH = 0;
+
+/* ⚠️ Читається одразу, а не при першому перерахунку: `fitCanvas` кличуть уже
+ * налаштування панелей на початку сторінки, тобто задовго до `HELLO`.
+ *
+ * ⚠️ Приймаються **рівно цифри**, і це не причісування. `parseInt` бере
+ * префікс, тобто «12abc» дало б екран 12 пікселів завширшки, а
+ * «999999999999» — колонку на 33 мільйони пікселів, порожній чорний екран без
+ * панелей і без напису. З останнього немає виходу: значення лишається у
+ * сховищі, і кожне наступне відкриття дає те саме, доки не почистити дані
+ * сайту, — а це на телефоні наосліп не роблять. Знайдено рецензією коду.
+ */
+(function loadKnownSize() {
+  const num = (s) => (/^\d{1,5}$/.test(s) ? +s : 0);
+  const w = num(storeGet(SCREEN_W_KEY, '0'));
+  const h = num(storeGet(SCREEN_H_KEY, '0'));
+  if (w > 0 && h > 0 && w <= MAX_SCREEN && h <= MAX_SCREEN) {
+    knownW = w; knownH = h;
+  }
+})();
+
 const counters = {
   tiles: 0,
   badTiles: 0,
@@ -326,7 +368,49 @@ function resizeTo(w, h) {
   const d = frameBuf.data;
   for (let i = 3; i < d.length; i += 4) d[i] = 255;
 
+  // Розмір запам'ятовується, щоб наступне відкриття сторінки тримало під
+  // зображення місце ще до `HELLO` (задача 0025). Пишемо лише коли число
+  // справді нове: пульт вітається постійно, а сховище — не журнал.
+  //
+  // ⚠️ **Після** створення буфера, а не до нього: `createImageData` з нульовим
+  // боком кидає виняток, і при зворотному порядку у сховище осіло б число, за
+  // яким сторінка не піднімається. Знайдено рецензією коду.
+  if (w !== knownW || h !== knownH) {
+    knownW = w; knownH = h;
+    storeSet(SCREEN_W_KEY, String(w));
+    storeSet(SCREEN_H_KEY, String(h));
+  }
+
   fitCanvas();
+}
+
+/* ⚠️ Присвоєння лише коли число справді змінилось.
+ *
+ * `fitCanvas` кличе й спостерігач розміру (`ResizeObserver` на `#screen-wrap`),
+ * а сама вона тому ж елементу ширину й ставить. Безумовне присвоєння тієї
+ * самої ширини — це запрошення до зайвого кола «змінив → мене покликали →
+ * змінив», за яке Chrome ще й лається в журнал сторінки. */
+function setStyle(el, prop, value) {
+  if (el.style[prop] !== value) el.style[prop] = value;
+}
+
+/**
+ * Розміри області зображення при заданому вільному місці.
+ *
+ * Три джерела розміру, у порядку правдивості: справжній із `HELLO`, потім
+ * пригаданий із минулого сеансу, потім — жодного.
+ *
+ * ⚠️ Коли жодного немає, місце береться **все вільне**, без співвідношення
+ * сторін: пропорція чужого пульта нам невідома, і вигадана виглядала б як
+ * правда (задача 0025, критерій 1.3). Щойно прийде `HELLO`, розкладка
+ * перерахується під справжні числа.
+ */
+function screenBox(availW, availH) {
+  const lw = W || knownW;
+  const lh = H || knownH;
+  if (!lw || !lh) return { w: availW, h: availH };
+  const k = Math.max(0.1, Math.min(availW / lw, availH / lh));
+  return { w: Math.floor(lw * k), h: Math.floor(lh * k) };
 }
 
 /**
@@ -346,20 +430,11 @@ function resizeTo(w, h) {
  * зображення поїхало б убік на пів різниці — при цілком вільному місці.
  * Симетричні розпірки дають те саме. Тому зсув рахується числом і кладеться
  * в `margin-left` лівої панелі.
- */
-/* ⚠️ Присвоєння лише коли число справді змінилось.
  *
- * `fitCanvas` кличе й спостерігач розміру (`ResizeObserver` на `#screen-wrap`),
- * а сама вона тому ж елементу ширину й ставить. Безумовне присвоєння тієї
- * самої ширини — це запрошення до зайвого кола «змінив → мене покликали →
- * змінив», за яке Chrome ще й лається в журнал сторінки. */
-function setStyle(el, prop, value) {
-  if (el.style[prop] !== value) el.style[prop] = value;
-}
-
+ * ⚠️ Працює й **до** `HELLO` (задача 0025): скільки місця тримати, каже
+ * `screenBox`, і раннього виходу тут більше немає.
+ */
 function fitCanvas() {
-  if (!W || !H) return;
-
   const stage = document.getElementById('stage');
   const padL = document.getElementById('pad-left');
   const padR = document.getElementById('pad-right');
@@ -390,9 +465,7 @@ function fitCanvas() {
     const padsH = Math.max(padL.offsetHeight, padR.offsetHeight,
                            bar ? bar.offsetHeight : 0);
     const availH = Math.max(1, stage.clientHeight - padsH);
-    const k = Math.max(0.1, Math.min(availW / W, availH / H));
-    const iw = Math.floor(W * k);
-    const ih = Math.floor(H * k);
+    const { w: iw, h: ih } = screenBox(availW, availH);
     setStyle(canvas, 'width', iw + 'px');
     setStyle(canvas, 'height', ih + 'px');
 
@@ -446,9 +519,7 @@ function fitCanvas() {
   const availW = Math.max(1, stageW - leftW - rightW);
   const availH = Math.max(1, stageH - barH);
 
-  const k = Math.max(0.1, Math.min(availW / W, availH / H));
-  const iw = Math.floor(W * k);
-  const ih = Math.floor(H * k);
+  const { w: iw, h: ih } = screenBox(availW, availH);
   setStyle(canvas, 'width', iw + 'px');
   setStyle(canvas, 'height', ih + 'px');
   // Колонка сітки = рівно картинка, тож між нею й панеллю не лишається нічого.
@@ -2182,5 +2253,10 @@ if (typeof module !== 'undefined' && module.exports) {
     // «повертатись після закриття сокета чи ні» ухвалюється в цьому файлі.
     connect, onBridgeSays, gate,
     queueState: () => ({ queued, wasOwner }),
+    // Місце під екран до першого кадру (0025). ⚠️ Перевіряється саме
+    // обчислення, а не стилі: числа з нього однакові до й після `HELLO`, і
+    // це і є критерій 1.1. Пригадане віддається окремо — без нього не
+    // відрізнити «пам'ятаємо» від «випадково збіглось».
+    screenBox, knownSize: () => ({ w: knownW, h: knownH }),
   };
 }
