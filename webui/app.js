@@ -14,10 +14,38 @@ const P = RemoteUI;
 const Wait = RemoteUIWait;
 const Panels = RemoteUIPanels;
 
+/* ⚠️ Мусить лишатись **більшим** за `BRIDGE_CLIENT_SILENCE_MS` моста (750 мс),
+ * і запас тут 250 мс — один період `INPUT_STATE`. Міст пускає нас назад на
+ * власний слот лише коли попереднього господаря (тобто нас-таки) не чути
+ * довше за свій поріг; повернемось раніше — і замість тихого повернення
+ * побачимо «Є активне підключення до пульта» з кнопкою, тобто ручну дію
+ * після кожного обриву. */
 const RECONNECT_MS = 1000;
 
 /** Як часто повторювати вітальний `PING`, доки пульт не відповів `HELLO`. */
 const GREET_RETRY_MS = 500;
+
+/* --- черга: господар один, решта чекають ----------------------------------
+ *
+ * ⚠️ Доти клієнт після будь-якого розриву просто вертався через секунду. Разом
+ * із витісненням на боці моста це давало не одного господаря, а **гойдалку**:
+ * витіснений повертався й витісняв того, хто щойно витіснив його (задача 0024).
+ *
+ * Тепер клієнт називає себе й каже, з чим прийшов:
+ *
+ *  - нічого не сказав — звичайне відкриття сторінки, і якщо пульт зайнятий,
+ *    міст відповість «зайнято»; ми покажемо вікно черги й **замовкнемо**;
+ *  - `take=1` — бос натиснув «Перейняти керування» і підтвердив;
+ *  - `resume=1` — ми були господарем, наш сокет помер, і ми забираємо своє.
+ *
+ * Ім'я живе рівно одне завантаження сторінки. Довше не треба: воно потрібне
+ * тільки щоб міст упізнав нас **у межах** одного обірваного сеансу.
+ */
+const QUEUE_POLL_MS = 2000;
+/* ⚠️ Довжина добивається навмисно: `Math.random()` іноді дає короткий рядок
+ * (0.5 → «5»), а нуль — узагалі порожній. Наслідок був би м'який — `resume`
+ * просто перестав би діяти, — але мовчазний. */
+const MY_ID = (Math.random().toString(36).slice(2) + '00000000').slice(0, 8);
 
 /* --- лікування плиток, які відкинув міст ---------------------------------
  *
@@ -567,7 +595,13 @@ let lastRefreshAt = 0;
 
 function veil(text) {
   const el = document.getElementById('veil');
-  if (text === null) { el.hidden = true; return; }
+  if (text === null) {
+    el.hidden = true;
+    // Кнопки черги живуть усередині завіси; лишити їх видимими означало б
+    // покласти «Перейняти керування» поверх живої картинки.
+    document.getElementById('veil-buttons').hidden = true;
+    return;
+  }
   el.hidden = false;
   document.getElementById('veil-text').textContent = text;
 }
@@ -717,17 +751,58 @@ function onBaudReport(payload) {
   }
 }
 
-function connect() {
+/**
+ * Під'єднатися до моста.
+ *
+ * @param opts.take  свідоме переймання керування (бос натиснув і підтвердив).
+ */
+function connect(opts) {
   clearTimeout(reconnectTimer);
   reconnectTimer = null;
+  stopQueuePoll();
+  queued = false;
 
+  /* ⚠️ Старий сокет знеструмлюємо й гасимо — блокер, знайдений рецензією.
+   *
+   * Доти `connect()` мав рівно одного викликача (перепідключення після
+   * `onclose`), тобто сокета вже не існувало. Тепер їх троє: ще кнопка
+   * «Підключитись» і опитування черги. Подвійне натискання лишало **два живі
+   * сокети з тим самим іменем**, міст витісняв наш же перший, той бачив
+   * розрив, вертався з `resume` і витісняв другий — гойдалка з одного
+   * клієнта. Вона навіть не потрапляла в `lost_evicted`, тобто повз усі
+   * критерії задачі.
+   *
+   * Обробники знімаються **до** закриття: інакше власне `onclose` завело б
+   * ще одне перепідключення поверх того, що зараз починається.
+   *
+   * ⚠️ Одне справжнє витіснення подвійний дотик усе одно коштує: перший сокет
+   * встигає завершити рукостискання й стати господарем, і другий забирає в
+   * нього пульт законним `take=1`. Це видно в `lost_evicted` як одиниця й
+   * нічим не шкодить — гойдалки, тобто нескінченного обміну, більше немає. */
+  if (ws) {
+    ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
+    try { ws.close(); } catch (e) { /* уже мертвий */ }
+    ws = null;
+  }
+
+  gate(null);
   veil("під'єднуюсь…");
   chip('link', 'канал…', 'warn');
 
-  ws = new WebSocket('ws://' + location.host + '/ws');
+  /* ⚠️ `resume` заявляється лише тоді, коли ми справді були господарем на мить
+   * розриву. Заявити його «про всяк випадок» означало б повернути гойдалку з
+   * іншого боку: клієнт, якому щойно сказали «зайнято», стукав би назад із
+   * правом забрати своє — а свого в нього вже немає. */
+  const how = opts || {};
+  const q = ['id=' + MY_ID];
+  if (how.take) q.push('take=1');
+  else if (wasOwner) q.push('resume=1');
+
+  ws = new WebSocket('ws://' + location.host + '/ws?' + q.join('&'));
   ws.binaryType = 'arraybuffer';
 
   ws.onopen = () => {
+    wasOwner = true;
     decoder.reset();
     hello = null;
     policy.setBaud(null);   // швидкість знову невідома — і поріг разом із нею
@@ -747,6 +822,10 @@ function connect() {
    * потоці. Поки цей обробник виконується, браузер сокет не вичитує — тому
    * час, витрачений тут, безпосередньо звужує вікно TCP. Саме це й міряємо. */
   ws.onmessage = (ev) => {
+    // ⚠️ Рядок — це слово **моста**, а не пакет пульта: наш протокол іде
+    // виключно двійковими кадрами. Так домовленість «хто господар» живе поруч
+    // із потоком, не залазячи в жоден пакет до пульта (обмеження задачі 0024).
+    if (typeof ev.data === 'string') { onBridgeSays(ev.data); return; }
     const data = new Uint8Array(ev.data);
     const t0 = performance.now();
     decoder.feed(data, onPacket);
@@ -755,8 +834,6 @@ function connect() {
   };
 
   ws.onclose = () => {
-    chip('link', 'немає зв’язку', 'bad');
-    veil('зв’язок обірвано, перепідключаюсь…');
     stopTimers();
     // Ввід відпускаємо в себе; пульту про це вже сказав міст обнуленим
     // INPUT_STATE — негайно, не чекаючи тайм-ауту. Спершу знімаємо утримання
@@ -765,6 +842,13 @@ function connect() {
     releaseAllHeld();
     mirror.clear();
     pointerId = null;
+
+    // ⚠️ Сокет, закритий мостом услід за словом «зайнято», — не обрив. Саме
+    // тут і жила гойдалка: повернення через секунду виганяло господаря.
+    if (queued) { chip('link', 'пульт зайнятий', 'warn'); return; }
+
+    chip('link', 'немає зв’язку', 'bad');
+    veil('зв’язок обірвано, перепідключаюсь…');
     scheduleReconnect();
   };
 
@@ -772,7 +856,123 @@ function connect() {
 }
 
 function scheduleReconnect() {
-  if (!reconnectTimer) reconnectTimer = setTimeout(connect, RECONNECT_MS);
+  if (!reconnectTimer) reconnectTimer = setTimeout(() => connect(), RECONNECT_MS);
+}
+
+/* --- черга ---------------------------------------------------------------- */
+
+/** Ми стоїмо в черзі: пульт зайнятий іншим клієнтом. */
+let queued = false;
+
+/** Ми були господарем на мить розриву — тоді наступна спроба каже `resume`. */
+let wasOwner = false;
+
+let queueTimer = null;
+
+/** Слово моста: поки що воно одне — «зайнято». */
+function onBridgeSays(text) {
+  let said = null;
+  try { said = JSON.parse(text); } catch (e) { said = null; }
+  if (said && said.busy) enterQueue();
+}
+
+/**
+ * Стати в чергу: пульт зайнятий, і ми чекаємо — без сокета й без трафіку.
+ *
+ * ⚠️ Права `resume` при цьому втрачаються: свого слота в нас більше немає, і
+ * заявляти його — значить забирати пульт мовчки, тобто рівно те, від чого ця
+ * задача й лікує.
+ */
+function enterQueue() {
+  queued = true;
+  wasOwner = false;
+  /* ⚠️ Опитування заводиться **першим**, до будь-якого дотику до сторінки.
+   * Знайдено рецензією: виняток десь у DOM лишав би клієнта з `queued = true`,
+   * без опитування і без перепідключення (те й те вимкнене саме прапорцем
+   * черги) — тобто ні пульта, ні кнопки, ні шляху назад. */
+  startQueuePoll();
+  try { if (ws) ws.close(); } catch (e) { /* міст його вже гасить */ }
+  chip('link', 'пульт зайнятий', 'warn');
+  gate('ask');
+}
+
+/**
+ * Вікно черги: `ask` — хто зайняв і кнопка переймання; `confirm` —
+ * попередження й дві кнопки; `null` — сховати кнопки.
+ */
+function gate(step) {
+  const box = document.getElementById('veil-buttons');
+  const take = document.getElementById('btn-take');
+  const yes = document.getElementById('btn-take-yes');
+  const no = document.getElementById('btn-take-no');
+
+  if (!step) { box.hidden = true; return; }
+
+  veil(step === 'confirm'
+    ? 'Інший клієнт буде відключений від пульта. Підключитись?'
+    : 'Є активне підключення до пульта');
+  box.hidden = false;
+  take.hidden = (step !== 'ask');
+  yes.hidden = (step !== 'confirm');
+  no.hidden = (step !== 'confirm');
+}
+
+/**
+ * Опитування, поки чекаємо.
+ *
+ * ⚠️ Це вся ціна очікування: один запит на `/api/status` (три десятки байтів
+ * відповіді) раз на дві секунди, і жодного — поки вкладку не видно. Забута
+ * вкладка на іншому пристрої не коштує мостові нічого, і саме заради цього
+ * все й робилось.
+ *
+ * Потрібне воно рівно для одного: помітити, що господар пішов сам, і зайти
+ * без жодної дії боса. Без опитування забутий клієнт лишався б із кнопкою
+ * «Перейняти керування» назавжди — навіть коли переймати вже нема в кого.
+ */
+function startQueuePoll() {
+  stopQueuePoll();
+  queueTimer = setInterval(queuePoll, QUEUE_POLL_MS);
+}
+
+function stopQueuePoll() {
+  clearInterval(queueTimer);
+  queueTimer = null;
+}
+
+/** Запит уже в дорозі — другого не пускаємо. */
+let queuePolling = false;
+
+async function queuePoll() {
+  /* ⚠️ Засувка й строк — обидва знайдені рецензією, і обидва не про
+   * охайність. Без засувки два опитування, що завершились поруч, дають два
+   * `connect()`: перший займає пульт, другому кажуть «зайнято», і клієнт стає
+   * в чергу **сам до себе** — показує «Є активне підключення», сам його й
+   * тримаючи. Без строку `fetch` до мовчазного моста висить хвилинами, а нові
+   * запити стартують кожні дві секунди — тобто рівно те накопичення з'єднань,
+   * від якого ця задача лікує. */
+  if (!queued || document.hidden || queuePolling) return;
+  queuePolling = true;
+
+  let free = false;
+  try {
+    const stop = new AbortController();
+    const timer = setTimeout(() => stop.abort(), QUEUE_POLL_MS - 500);
+    try {
+      const r = await fetch('/api/status', { cache: 'no-store', signal: stop.signal });
+      const s = await r.json();
+      free = !s.busy;
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch (e) {
+    return;   // міст мовчить або не встиг — спитаємо наступного разу
+  } finally {
+    queuePolling = false;
+  }
+
+  // ⚠️ Перевіряємо `queued` ще раз: поки відповідь їхала, бос міг натиснути
+  // «Перейняти керування», і ми вже під'єднуємось.
+  if (free && queued) connect();
 }
 
 function stopTimers() {
@@ -1572,6 +1772,11 @@ btnInfo.addEventListener('click', () => {
  * бо саме він її й викинув.
  */
 async function pollBridge() {
+  /* ⚠️ У черзі ми мовчимо цілком. Повний стан — 2.5 КБ JSON раз на секунду,
+   * тобто на порядок дорожче за саме очікування; клієнт, який «просто чекає»,
+   * коштував би мостові більше, ніж той, що працює. */
+  if (queued) return;
+
   try {
     const r = await fetch('/api/stats', { cache: 'no-store' });
     bridgeStats = await r.json();
@@ -1925,6 +2130,25 @@ if (typeof ResizeObserver !== 'undefined') {
   try { new ResizeObserver(fitCanvas).observe(wrap); } catch (e) { /* нехай */ }
 }
 
+/* --- кнопки черги ---------------------------------------------------------
+ *
+ * ⚠️ Два кроки, а не один: «Перейняти керування» лише питає, і тільки
+ * «Підключитись» справді відбирає пульт в іншого. Одна кнопка означала б, що
+ * випадковий дотик по чужому телефону забирає керування посеред роботи.
+ */
+document.getElementById('btn-take')
+        .addEventListener('click', () => gate('confirm'));
+document.getElementById('btn-take-no')
+        .addEventListener('click', () => gate('ask'));
+document.getElementById('btn-take-yes')
+        .addEventListener('click', () => connect({ take: true }));
+
+/* Повернулись до вкладки, яка стоїть у черзі, — питаємо одразу, не чекаючи
+ * періоду: інакше екран пульта з'являвся б із затримкою на рівному місці. */
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && queued) queuePoll();
+});
+
 // Клавіатура має працювати одразу, без клацання по екрану.
 focusScreen();
 
@@ -1953,5 +2177,10 @@ if (typeof module !== 'undefined' && module.exports) {
     // тримача і що перебудова панелі нічого не лишає натиснутим.
     held, holdBegin, holdEnd, releaseAllHeld, intentHold, buildPanels,
     getIntents: () => intents,
+    // Черга (0024). ⚠️ Перевіряється саме тут, бо вся вада жила в обгортці:
+    // автомат «показувати кадр чи чекати» до неї стосунку не має, а рішення
+    // «повертатись після закриття сокета чи ні» ухвалюється в цьому файлі.
+    connect, onBridgeSays, gate,
+    queueState: () => ({ queued, wasOwner }),
   };
 }

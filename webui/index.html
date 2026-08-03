@@ -62,7 +62,19 @@
   <div id="screen-wrap" tabindex="0">
     <!-- Розмір полотна виставляється з HELLO, а не тут. -->
     <canvas id="screen" width="16" height="9"></canvas>
-    <div id="veil"><span id="veil-text">під'єднуюсь…</span></div>
+    <!-- Завіса: стан з'єднання, а при зайнятому пульті — черга й переймання
+         керування (0024). Кнопки лежать тут-таки, бо це те саме місце, куди
+         людина вже дивиться, коли картинки немає. -->
+    <div id="veil">
+      <div id="veil-box">
+        <span id="veil-text">під'єднуюсь…</span>
+        <div id="veil-buttons" hidden>
+          <button id="btn-take" type="button">Перейняти керування</button>
+          <button id="btn-take-no" type="button" hidden>Скасувати</button>
+          <button id="btn-take-yes" type="button" hidden>Підключитись</button>
+        </div>
+      </div>
+    </div>
   </div>
 
   <div id="pad-right" class="pad">

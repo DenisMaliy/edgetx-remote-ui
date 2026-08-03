@@ -29,7 +29,8 @@ const char *bridge_lost_name(bridge_lost_t reason)
 {
     switch (reason) {
     case BRIDGE_LOST_BOOT:      return "старт моста";
-    case BRIDGE_LOST_EVICTED:   return "витіснений новим телефоном";
+    case BRIDGE_LOST_EVICTED:   return "керування перейняв інший телефон";
+    case BRIDGE_LOST_RESUMED:   return "господар повернувся на свій слот";
     case BRIDGE_LOST_SEND_FAIL: return "відправлення не проходять";
     case BRIDGE_LOST_OVERSIZED: return "кадр понад стелю";
     case BRIDGE_LOST_WS_CLOSE:  return "штатне прощання";
@@ -123,8 +124,11 @@ size_t bridge_stats_json(char *out, size_t cap)
         "\"last\":%d,\"errno_last\":%d,\"ms_max\":%u,"
         "\"partial\":%u,\"truncated\":%u},"
         "\"client_to_radio\":{\"bytes\":%u,\"packets\":%u,\"input\":%u},"
-        "\"session\":{\"seen\":%u,\"lost\":%u,\"releases\":%u,\"silence_timeouts\":%u},"
-        "\"lost_by\":{\"evicted\":%u,\"send_fail\":%u,\"oversized\":%u,"
+        "\"session\":{\"seen\":%u,\"lost\":%u,\"releases\":%u,\"silence_timeouts\":%u,"
+        "\"sockets\":%d},"
+        "\"queue\":{\"busy_refused\":%u,\"takeovers\":%u,\"resumes\":%u,"
+        "\"status_polls\":%u},"
+        "\"lost_by\":{\"evicted\":%u,\"resumed\":%u,\"send_fail\":%u,\"oversized\":%u,"
         "\"ws_close\":%u,\"socket\":%u,\"socket_silent\":%u,\"wifi\":%u},"
         "\"input_gap\":{\"max_ms\":%u,\"le300\":%u,\"le500\":%u,\"le750\":%u,"
         "\"over\":%u,\"after_release_ms\":%u},"
@@ -144,7 +148,10 @@ size_t bridge_stats_json(char *out, size_t cap)
         U(s->send_ms_max), U(s->send_partial), U(s->send_truncated),
         U(s->client_bytes), U(s->client_packets), U(s->client_input),
         U(s->clients_seen), U(s->clients_lost), U(s->input_releases), U(s->silence_timeout),
-        U(s->lost_evicted), U(s->lost_send_fail), U(s->lost_oversized), U(s->lost_ws_close),
+        ws_bridge_open_sockets(),
+        U(s->busy_refused), U(s->takeovers), U(s->resumes), U(s->status_polls),
+        U(s->lost_evicted), U(s->lost_resumed), U(s->lost_send_fail), U(s->lost_oversized),
+        U(s->lost_ws_close),
         U(s->lost_socket), U(s->lost_socket_silent), U(s->lost_wifi), U(s->gap_max_ms),
         U(s->gap_le_300),
         U(s->gap_le_500), U(s->gap_le_750), U(s->gap_over), U(s->gap_after_release_ms),

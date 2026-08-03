@@ -195,6 +195,55 @@ body {
 
 #veil[hidden] { display: none; }
 
+/*
+  Вікно черги (0024): напис і кнопки одним стовпчиком посеред завіси.
+
+  ⚠️ Кольори й породи кнопок ті самі, що в панелях: «Підключитись» —
+  помаранчева, як `SYS`/`MDL`, бо це дія; «Скасувати» — темна ребриста, як
+  звичайна клавіша. Заводити тут третій вигляд означало б, що те саме
+  торкання виглядає по-різному залежно від того, де воно.
+*/
+#veil-box {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 0 12px;
+  text-align: center;
+}
+
+#veil-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+}
+
+#veil-buttons[hidden] { display: none; }
+
+#veil-buttons button {
+  min-height: 44px;   /* ціль для пальця, як у клавіш панелі */
+  padding: 8px 16px;
+  border: 0;
+  border-radius: 7px;
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+  color: #000;
+  background: var(--wide-bg);
+  box-shadow: inset 0 -2px 0 rgba(0, 0, 0, .35);
+}
+
+#veil-buttons button:active { background: #8f4708; }
+
+#veil-buttons #btn-take-no {
+  color: var(--neon);
+  background: var(--key-bg);
+  box-shadow: inset 0 -2px 0 rgba(0, 0, 0, .5);
+}
+
+#veil-buttons #btn-take-no:active { background: var(--key-down); }
+
 /* --- бокові панелі ------------------------------------------------------- */
 
 /*
