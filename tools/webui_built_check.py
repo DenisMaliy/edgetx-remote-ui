@@ -706,8 +706,25 @@ def check_colors(page, chk, where):
 
 def check_manifest(page, url, chk):
     """Критерій 1.4 — сторінка вміє запускатися без браузерної обгортки."""
+    import gzip
     import urllib.parse
     import urllib.request
+
+    def fetch(u):
+        """⚠️ Розпакувати, якщо треба.
+
+        Справжній міст ставить `Content-Encoding: gzip` **безумовно**
+        (`ws_bridge.c`, `send_blob`), а `urllib` сам не розпаковує. Стенд без
+        заліза віддає нестиснене — тому перевірка була зелена там і падала на
+        живому мості з `'utf-8' codec can't decode byte 0x8b`. Той самий
+        обхід уже стоїть в `assert_serving_built`; тут його бракувало.
+        """
+        req = urllib.request.Request(u, headers={"Accept-Encoding": "gzip"})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            body = r.read()
+            enc = (r.headers.get("Content-Encoding") or "").lower()
+            ctype = (r.headers.get("Content-Type") or "").split(";")[0]
+        return (gzip.decompress(body) if enc == "gzip" else body), ctype
 
     href = page.evaluate("() => { const l = document.querySelector('link[rel=manifest]');"
                          " return l ? l.href : null; }")
@@ -715,9 +732,8 @@ def check_manifest(page, url, chk):
     if not href:
         return
     try:
-        with urllib.request.urlopen(href, timeout=5) as r:
-            man = json.loads(r.read().decode("utf-8"))
-            ctype = (r.headers.get("Content-Type") or "").split(";")[0]
+        body, ctype = fetch(href)
+        man = json.loads(body.decode("utf-8"))
     except Exception as e:
         chk("1.4 опис застосунку віддається й розбирається", False, str(e))
         return
@@ -733,8 +749,7 @@ def check_manifest(page, url, chk):
     if icons:
         icon_url = urllib.parse.urljoin(href, icons[0].get("src", ""))
         try:
-            with urllib.request.urlopen(icon_url, timeout=5) as r:
-                ok = r.read(8).startswith(b"\x89PNG")
+            ok = fetch(icon_url)[0].startswith(b"\x89PNG")
         except Exception:
             ok = False
     # ⚠️ Значок не оздоблення: без нього Chrome на Android робить не застосунок,
@@ -909,10 +924,27 @@ def run_checks(url, log_path, chk):
             # вікно. Зворотний порядок зробив би перевірки поведінки
             # залежними від того, чим скінчилась розкладка.
             check_manifest(page, url, chk)
+
+            # ⚠️ Головну сторінку тут **відпускаємо**, і це не причісування.
+            # Міст обслуговує рівно одного клієнта: новий WebSocket витісняє
+            # попередній, той перепідключається й витісняє новий — і жоден не
+            # доживає до `HELLO`. На стенді без заліза це не видно (двійник
+            # відповідає миттєво), а проти живого моста прилад падав саме тут.
+            # Тому свіжі вікна працюють, поки головне стоїть на `about:blank`.
+            page.goto("about:blank", wait_until="load", timeout=10000)
+
             check_default_bar(br, url, chk, LANDSCAPE, "альбомна")
             check_default_bar(br, url, chk, PORTRAIT, "книжкова")
             check_resize_sweep(br, url, chk)
             check_heap_watchdog(br, url, chk)
+            check_no_fullscreen(br, url, chk)
+
+            page.set_viewport_size(dict(LANDSCAPE))
+            page.goto(url, wait_until="load", timeout=25000)
+            page.wait_for_function(
+                "() => document.getElementById('screen').width > 100", timeout=25000)
+            time.sleep(2)
+
             check_fullscreen(page, chk)
             check_landscape(page, chk)
             check_colors(page, chk, "альбомна")
@@ -924,8 +956,6 @@ def run_checks(url, log_path, chk):
             check_colors(page, chk, "книжкова")
 
             chk("сторінка без помилок JS (у кінці)", not errors, "; ".join(errors[:3]))
-
-            check_no_fullscreen(br, url, chk)
         finally:
             br.close()
 
